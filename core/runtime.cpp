@@ -94,6 +94,8 @@ struct Runtime::Impl {
     std::vector<float>    mtp_logits;
     int                   mtp_past = 0;             // MTP KV write position
     ggml_gallocr_t        mtp_galloc = nullptr;
+    // 2-token verify outputs (logits + hidden for both positions)
+    std::vector<float>    vL1, vL2, vh1, vh2;
 
     int n_ctx  = 0;
     int n_past = 0;
@@ -180,9 +182,13 @@ struct Runtime::Impl {
                             ggml_tensor * h, ggml_tensor * tok, ggml_tensor * pos, ggml_tensor * mask);
     const std::vector<float> & mtp_draft(int32_t token);
     void capture_main_hidden(ggml_cgraph * gf, int col);
+    void decode_verify(int32_t a, int32_t b);       // 2-token forward -> vL1/vL2/vh1/vh2
+    void generate_mtp(const std::vector<int32_t> & prompt, int max_new,
+                      const std::function<bool(int32_t)> & on_token);
 
     // ---- Phase B v2 dynamic-cache decode (single token) ----
     void init_cache();
+    void init_state_backup();
     void backup_states();
     void restore_states();
     const std::vector<float> & decode_cached_fast(int32_t token);
@@ -322,6 +328,7 @@ void Runtime::Impl::init() {
     if (capture_hidden) {
         mtp_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         mtp_hidden.assign(model.hparams().n_embd, 0.0f);
+        init_state_backup();   // MTP reject needs GDN rollback even without the cache
     }
     zero_states();
 }
@@ -375,24 +382,7 @@ void Runtime::Impl::init_cache() {
 
     if (getenv("QWEN_FASTCACHE")) cache_fast_enabled = true;   // experimental single-graph path
 
-    // recurrent-state backup buffers (rollback a speculative miss on GDN models)
-    if (hp.has_gdn) {
-        ggml_init_params bp{};
-        bp.mem_size = ggml_tensor_overhead() * hp.n_layer * 2 + 256;
-        bp.no_alloc = true;
-        bak_ctx = ggml_init(bp);
-        conv_bak.assign(hp.n_layer, nullptr);
-        ssm_bak.assign(hp.n_layer, nullptr);
-        for (int il = 0; il < (int) hp.n_layer; ++il) {
-            if (!conv_state[il]) continue;
-            conv_bak[il] = ggml_new_tensor(bak_ctx, conv_state[il]->type,
-                                           ggml_n_dims(conv_state[il]), conv_state[il]->ne);
-            ssm_bak[il]  = ggml_new_tensor(bak_ctx, ssm_state[il]->type,
-                                           ggml_n_dims(ssm_state[il]), ssm_state[il]->ne);
-        }
-        bak_buf = ggml_backend_alloc_ctx_tensors(bak_ctx, backend);
-        if (!bak_buf) throw std::runtime_error("init_cache: failed to alloc state backup");
-    }
+    init_state_backup();   // GDN rollback buffers (speculative miss / MTP reject)
 
     // warm restart: pre-fill VRAM slots from a saved hot-expert profile
     if (!cfg.cache_profile.empty()) {
@@ -887,6 +877,118 @@ const std::vector<float> & Runtime::Impl::mtp_draft(int32_t token) {
     ggml_free(ctx);
     mtp_past += 1;
     return mtp_logits;
+}
+
+// Verify forward: run the main model on two tokens [a,b] at the current position,
+// exposing per-position logits (vL1,vL2) and hidden (vh1,vh2). Advances n_past+=2.
+void Runtime::Impl::decode_verify(int32_t a, int32_t b) {
+    const auto & hp = model.hparams();
+    const int n_tokens = 2;
+    const int n_kv = n_past + n_tokens;
+
+    ggml_init_params gp{};
+    gp.mem_size = ggml_tensor_overhead() * GRAPH_SIZE + ggml_graph_overhead_custom(GRAPH_SIZE, false);
+    gp.no_alloc = true;
+    ggml_context * ctx = ggml_init(gp);
+    ggml_cgraph * gf = build_graph(ctx, n_tokens, n_kv);
+    if (!ggml_gallocr_alloc_graph(galloc, gf))
+        throw std::runtime_error("decode_verify: gallocr alloc failed");
+
+    ggml_tensor * inp_tokens = ggml_graph_get_tensor(gf, "inp_tokens");
+    ggml_tensor * inp_pos    = ggml_graph_get_tensor(gf, "inp_pos");
+    ggml_tensor * inp_mask   = ggml_graph_get_tensor(gf, "inp_mask");
+    const int32_t toks[2] = { a, b };
+    ggml_backend_tensor_set(inp_tokens, toks, 0, 2 * sizeof(int32_t));
+    const int32_t pos[2] = { n_past, n_past + 1 };
+    ggml_backend_tensor_set(inp_pos, pos, 0, 2 * sizeof(int32_t));
+    std::vector<ggml_fp16_t> mask((size_t) n_kv * n_tokens);
+    const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+    for (int i = 0; i < n_tokens; ++i) {
+        const int abs_i = n_past + i;
+        for (int j = 0; j < n_kv; ++j) mask[(size_t) i * n_kv + j] = (j <= abs_i) ? z : ninf;
+    }
+    ggml_backend_tensor_set(inp_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+        throw std::runtime_error("decode_verify: compute failed");
+
+    ggml_tensor * lt = ggml_graph_get_tensor(gf, "logits");
+    const int n_vocab = (int) lt->ne[0];
+    vL1.resize(n_vocab); vL2.resize(n_vocab);
+    ggml_backend_tensor_get(lt, vL1.data(), 0,            n_vocab * sizeof(float));
+    ggml_backend_tensor_get(lt, vL2.data(), lt->nb[1],    n_vocab * sizeof(float));
+    ggml_tensor * h = ggml_graph_get_tensor(gf, "main_hidden");
+    const int n_embd = (int) h->ne[0];
+    vh1.resize(n_embd); vh2.resize(n_embd);
+    ggml_backend_tensor_get(h, vh1.data(), 0,          n_embd * sizeof(float));
+    ggml_backend_tensor_get(h, vh2.data(), h->nb[1],   n_embd * sizeof(float));
+
+    n_past += n_tokens;
+    ggml_free(ctx);
+    (void) hp;
+}
+
+// MTP self-speculative greedy decode: draft one token with the MTP block, verify
+// it with a single 2-token main forward, accept on match. ~1.x-2x fewer main
+// forwards depending on the draft acceptance rate.
+void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_new,
+                                 const std::function<bool(int32_t)> & on_token) {
+    const auto & hp = model.hparams();
+    const bool gdn = hp.has_gdn;
+    auto argmax = [](const std::vector<float> & v) {
+        int b = 0; for (int i = 1; i < (int) v.size(); ++i) if (v[i] > v[b]) b = i; return b;
+    };
+
+    // prefill token-by-token: builds main KV + MTP KV (so drafts have history)
+    std::vector<float> mlog;
+    const int P = (int) prompt.size();
+    for (int i = 0; i < P; ++i) {
+        mlog = decode({ prompt[i] });
+        if (i + 1 < P) mtp_draft(prompt[i + 1]);
+    }
+    int32_t x = argmax(mlog);            // first generated token
+    int generated = 0;
+    int steps = 0, accepts = 0;
+
+    while (generated < max_new) {
+        if (!on_token(x)) break;
+        if (++generated >= max_new) break;
+
+        int32_t d = argmax(mtp_draft(x));              // MTP draft: token after x
+
+        const int p1 = n_past;                         // position where x lands
+        if (gdn) backup_states();
+        decode_verify(x, d);                           // n_past += 2
+        const int32_t y = argmax(vL1);                 // main's true token after x
+        ++steps;
+
+        static const bool no_accept = getenv("QWEN_MTP_NOACCEPT") != nullptr;
+        if (y == d && !no_accept) {
+            ++accepts;
+            // accept the draft: advance MTP one step (consume position p1) and continue
+            mtp_hidden = vh1;
+            mtp_draft(d);                              // catch-up MTP KV; draft discarded
+            mtp_hidden = vh2;
+            if (!on_token(d)) break;
+            if (++generated >= max_new) break;
+            x = argmax(vL2);
+        } else {
+            // reject: keep only x. roll back GDN state (advanced by 2) and re-run x.
+            if (gdn) {
+                restore_states();
+                n_past = p1;
+                decode({ x });                         // rewrites KV[p1], correct GDN state, mtp_hidden=h_{p1}
+            } else {
+                n_past = p1 + 1;                        // KV[p1] from verify is valid; drop KV[p1+1]
+                mtp_hidden = vh1;
+            }
+            x = y;
+        }
+    }
+    if (steps > 0)
+        fprintf(stderr, "[MTP: %d tokens, %d verify steps, %d accepted (%.0f%%), %.2f tok/forward]\n",
+                generated, steps, accepts, 100.0 * accepts / steps,
+                (double) generated / steps);
 }
 
 // Single-token decode using a persistent graph built once and reused, so that
@@ -1413,6 +1515,28 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token) {
     return logits;
 }
 
+// Allocate the GDN recurrent-state backup buffers (idempotent). Needed to roll
+// back conv/ssm state on a speculative miss (cache fast path) or MTP reject.
+void Runtime::Impl::init_state_backup() {
+    const auto & hp = model.hparams();
+    if (!hp.has_gdn || bak_buf) return;
+    ggml_init_params bp{};
+    bp.mem_size = ggml_tensor_overhead() * hp.n_layer * 2 + 256;
+    bp.no_alloc = true;
+    bak_ctx = ggml_init(bp);
+    conv_bak.assign(hp.n_layer, nullptr);
+    ssm_bak.assign(hp.n_layer, nullptr);
+    for (int il = 0; il < (int) hp.n_layer; ++il) {
+        if (!conv_state[il]) continue;
+        conv_bak[il] = ggml_new_tensor(bak_ctx, conv_state[il]->type,
+                                       ggml_n_dims(conv_state[il]), conv_state[il]->ne);
+        ssm_bak[il]  = ggml_new_tensor(bak_ctx, ssm_state[il]->type,
+                                       ggml_n_dims(ssm_state[il]), ssm_state[il]->ne);
+    }
+    bak_buf = ggml_backend_alloc_ctx_tensors(bak_ctx, backend);
+    if (!bak_buf) throw std::runtime_error("failed to alloc state backup");
+}
+
 void Runtime::Impl::backup_states() {
     if (!bak_buf) return;
     for (int il = 0; il < (int) model.hparams().n_layer; ++il) {
@@ -1637,6 +1761,10 @@ const std::vector<float> & Runtime::decode(const std::vector<int32_t> & tokens) 
 }
 const std::vector<float> & Runtime::mtp_draft(int32_t token) { return impl_->mtp_draft(token); }
 bool Runtime::has_mtp() const { return impl_->model.hparams().has_mtp(); }
+void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new,
+                           const std::function<bool(int32_t)> & on_token) {
+    impl_->generate_mtp(prompt, max_new, on_token);
+}
 void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->zero_states(); }
 int  Runtime::n_past() const { return impl_->n_past; }
 

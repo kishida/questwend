@@ -20,6 +20,7 @@ static void usage(const char * prog) {
     printf("  -i             interactive chat\n");
     printf("  --chat         wrap -p prompt in ChatML\n");
     printf("  --reasoning <on|off>  thinking mode for chat (default on)\n");
+    printf("  --mtp          MTP self-speculative greedy decode (models with a nextn block)\n");
     printf("  -n <N>         max new tokens (default 128)\n");
     printf("  --n-ctx <N>    context length (default 4096)\n");
     printf("  --temp <f>     temperature (0 = greedy, default 0)\n");
@@ -39,7 +40,7 @@ int main(int argc, char ** argv) {
     int  max_tokens = 128, n_ctx = 4096;
     size_t vram_budget_mb = 0;
     bool interactive = false, info_only = false, chat = false, log_speed = false, force_cpu = false;
-    bool experts_ssd = false, reasoning = true;
+    bool experts_ssd = false, reasoning = true, use_mtp = false;
     SamplerConfig sc;
     sc.temperature = 0.0f;  // CLI defaults to greedy for reproducibility
 
@@ -60,6 +61,7 @@ int main(int argc, char ** argv) {
         else if (a == "--cache-profile" && i + 1 < argc) cache_profile = next();
         else if (a == "--experts-ssd")      experts_ssd = true;
         else if (a == "--reasoning" && i + 1 < argc) { std::string v = next(); reasoning = (v != "off" && v != "0" && v != "false"); }
+        else if (a == "--mtp")              use_mtp = true;
         else if (a == "--log-tokens-per-sec")    log_speed = true;
         else if (a == "--cpu")              force_cpu = true;
         else if (a == "--info")             info_only = true;
@@ -154,6 +156,25 @@ int main(int argc, char ** argv) {
         using clk = std::chrono::steady_clock;
         auto secs = [](clk::duration d){ return std::chrono::duration<double>(d).count(); };
         auto run = [&](const std::vector<int32_t> & ids) {
+            // MTP self-speculative greedy decode
+            if (use_mtp && rt.has_mtp()) {
+                int generated = 0;
+                auto t0 = clk::now();
+                rt.reset();
+                rt.generate_mtp(ids, max_tokens, [&](int32_t t) {
+                    if (is_stop(t)) return false;
+                    std::cout << tok.decode(t) << std::flush;
+                    return ++generated < max_tokens;
+                });
+                std::cout << std::endl;
+                if (log_speed) {
+                    double s = secs(clk::now() - t0);
+                    fprintf(stderr, "[mtp gen: %d tok in %.3fs = %.1f tok/s (incl. prefill)]\n",
+                            generated, s, s > 0 ? generated / s : 0.0);
+                }
+                return;
+            }
+
             // prefill (prompt processing)
             auto tp0 = clk::now();
             auto logits = rt.decode(ids);

@@ -40,6 +40,11 @@ public:
     const std::vector<float> & mtp_draft(int32_t token);
     bool has_mtp() const;
 
+    // MTP self-speculative greedy decode. Calls on_token for each accepted token
+    // (return false to stop, e.g. on EOS). Reset KV first. has_mtp() must be true.
+    void generate_mtp(const std::vector<int32_t> & prompt, int max_new,
+                      const std::function<bool(int32_t)> & on_token);
+
     void reset();                 // clear KV cache / position
     int  n_past() const;
 
