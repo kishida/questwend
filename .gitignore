@@ -1,0 +1,36 @@
+# build output
+/build/
+/build-*/
+/out/
+
+# Claude local config
+/.claude/
+
+# generated cache profiles
+*.prof
+*.prof.frozen
+*.frozen
+*.fast
+*.slow
+
+# model weights (kept outside the repo)
+*.gguf
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# build artifacts (in case of in-tree builds)
+*.o
+*.obj
+*.lib
+*.a
+*.dll
+*.exe
+*.pdb
+*.exp
+*.ilk
