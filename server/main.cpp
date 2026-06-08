@@ -26,12 +26,154 @@ static std::string now_id(const char * prefix) {
     return std::string(prefix) + std::to_string(t);
 }
 
+// Minimal self-contained chat UI (served at GET /). Talks to the server's own
+// OpenAI-compatible /v1/chat/completions endpoint with streaming.
+static const char * CHAT_HTML = R"HTML(<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qwencpp chat</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#e6e8ee; --muted:#8b93a7; --accent:#5b8cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; height:100vh; display:flex; flex-direction:column; background:var(--bg); color:var(--txt);
+         font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; }
+  header b { font-weight:600; }
+  header .model { color:var(--muted); font-size:13px; }
+  header .spacer { flex:1; }
+  header button, .ctl { background:var(--panel); color:var(--txt); border:1px solid var(--line);
+         border-radius:8px; padding:6px 10px; font-size:13px; cursor:pointer; }
+  header label { color:var(--muted); font-size:12px; display:flex; align-items:center; gap:6px; }
+  header input[type=number] { width:64px; background:var(--bg); color:var(--txt); border:1px solid var(--line);
+         border-radius:6px; padding:4px 6px; }
+  #chat { flex:1; overflow-y:auto; padding:20px 0; }
+  .wrap { max-width:780px; margin:0 auto; padding:0 16px; }
+  .msg { display:flex; gap:12px; margin:14px 0; }
+  .msg .who { width:30px; height:30px; border-radius:7px; flex:none; display:flex; align-items:center;
+         justify-content:center; font-size:13px; font-weight:600; }
+  .msg.user .who { background:#2a3550; color:#bcd0ff; }
+  .msg.assistant .who { background:#23314a; color:#9fd6c0; }
+  .msg .body { white-space:pre-wrap; word-wrap:break-word; padding-top:3px; }
+  .msg .body.think { color:var(--muted); font-style:italic; }
+  footer { border-top:1px solid var(--line); padding:12px 0 18px; }
+  .inrow { max-width:780px; margin:0 auto; padding:0 16px; display:flex; gap:10px; align-items:flex-end; }
+  textarea { flex:1; resize:none; background:var(--panel); color:var(--txt); border:1px solid var(--line);
+         border-radius:10px; padding:10px 12px; font:inherit; max-height:200px; }
+  .send { background:var(--accent); color:#fff; border:none; border-radius:10px; padding:10px 18px;
+         font-size:15px; cursor:pointer; }
+  .send:disabled { opacity:.5; cursor:default; }
+  .hint { color:var(--muted); font-size:12px; text-align:center; margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <b>qwencpp</b><span class="model" id="model">…</span>
+  <span class="spacer"></span>
+  <label>temp <input type="number" id="temp" value="0.7" step="0.1" min="0" max="2"></label>
+  <label>max <input type="number" id="maxtok" value="512" step="64" min="1"></label>
+  <button id="clear">Clear</button>
+</header>
+<div id="chat"><div class="wrap" id="list"></div></div>
+<footer>
+  <div class="inrow">
+    <textarea id="input" rows="1" placeholder="Message…  (Enter to send, Shift+Enter for newline)"></textarea>
+    <button class="send" id="send">Send</button>
+  </div>
+  <div class="hint">streams from /v1/chat/completions</div>
+</footer>
+<script>
+const list = document.getElementById('list');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+let history = [];
+let busy = false;
+
+fetch('/v1/models').then(r=>r.json()).then(j=>{
+  document.getElementById('model').textContent = (j.data && j.data[0] && j.data[0].id) || '';
+}).catch(()=>{});
+
+function addMsg(role, text){
+  const m = document.createElement('div'); m.className = 'msg ' + role;
+  const who = document.createElement('div'); who.className = 'who'; who.textContent = role==='user'?'You':'AI';
+  const body = document.createElement('div'); body.className = 'body'; body.textContent = text;
+  m.appendChild(who); m.appendChild(body); list.appendChild(m);
+  document.getElementById('chat').scrollTop = 1e9;
+  return body;
+}
+function autosize(){ input.style.height='auto'; input.style.height = Math.min(input.scrollHeight,200)+'px'; }
+input.addEventListener('input', autosize);
+input.addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); }});
+sendBtn.addEventListener('click', send);
+document.getElementById('clear').addEventListener('click', ()=>{ history=[]; list.innerHTML=''; });
+
+async function send(){
+  const text = input.value.trim();
+  if(!text || busy) return;
+  busy = true; sendBtn.disabled = true;
+  history.push({role:'user', content:text});
+  addMsg('user', text);
+  input.value=''; autosize();
+  const body = addMsg('assistant', '');
+  let acc = '';
+  try {
+    const resp = await fetch('/v1/chat/completions', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        messages: history, stream: true,
+        temperature: parseFloat(document.getElementById('temp').value)||0,
+        max_tokens: parseInt(document.getElementById('maxtok').value)||512
+      })
+    });
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while(true){
+      const {value, done} = await reader.read();
+      if(done) break;
+      buf += dec.decode(value, {stream:true});
+      let idx;
+      while((idx = buf.indexOf('\n\n')) >= 0){
+        const ev = buf.slice(0, idx); buf = buf.slice(idx+2);
+        const line = ev.replace(/^data:\s*/, '');
+        if(line === '[DONE]') continue;
+        try {
+          const j = JSON.parse(line);
+          const piece = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
+          if(piece){ acc += piece; renderAssistant(body, acc); document.getElementById('chat').scrollTop = 1e9; }
+        } catch(e){}
+      }
+    }
+  } catch(e){ acc += '\n[error: '+e+']'; renderAssistant(body, acc); }
+  history.push({role:'assistant', content:acc});
+  busy = false; sendBtn.disabled = false; input.focus();
+}
+// show <think> blocks dimmed
+function renderAssistant(el, txt){
+  el.innerHTML = '';
+  const re = /<think>([\s\S]*?)(<\/think>|$)/g; let last=0, m;
+  while((m = re.exec(txt))){
+    if(m.index>last) el.appendChild(document.createTextNode(txt.slice(last, m.index)));
+    const t = document.createElement('span'); t.className='body think';
+    t.textContent = m[1]; el.appendChild(t); last = re.lastIndex;
+  }
+  if(last < txt.length) el.appendChild(document.createTextNode(txt.slice(last)));
+}
+</script>
+</body>
+</html>
+)HTML";
+
 int main(int argc, char ** argv) {
     std::string model_path;
     int  port  = 8080;
     int  n_ctx = 4096;
     bool force_cpu = false;
     std::string host = "127.0.0.1";
+    size_t vram_budget_mb = 0;
+    std::string cache_profile;
+    bool experts_ssd = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -39,10 +181,21 @@ int main(int argc, char ** argv) {
         else if (a == "--port" && i + 1 < argc) port = std::stoi(argv[++i]);
         else if (a == "--host" && i + 1 < argc) host = argv[++i];
         else if (a == "--n-ctx" && i + 1 < argc) n_ctx = std::stoi(argv[++i]);
+        else if (a == "--vram-budget" && i + 1 < argc) vram_budget_mb = (size_t) std::stoul(argv[++i]);
+        else if (a == "--cache-profile" && i + 1 < argc) cache_profile = argv[++i];
+        else if (a == "--experts-ssd")      experts_ssd = true;
         else if (a == "--cpu")              force_cpu = true;
     }
     if (model_path.empty()) {
-        fprintf(stderr, "usage: %s -m <model.gguf> [--port 8080] [--host 127.0.0.1]\n", argv[0]);
+        fprintf(stderr,
+            "usage: %s -m <model.gguf> [options]\n"
+            "  --port <N>          listen port (default 8080)\n"
+            "  --host <addr>       bind address (default 127.0.0.1)\n"
+            "  --n-ctx <N>         context length (default 4096)\n"
+            "  --vram-budget <MB>  offload expert weights; keep non-expert on GPU\n"
+            "  --cache-profile <f> prefetch hot-expert profile (read-only on the server)\n"
+            "  --experts-ssd       stream experts from the GGUF on SSD (no RAM copy)\n"
+            "  --cpu               force CPU backend\n", argv[0]);
         return 1;
     }
 
@@ -52,7 +205,13 @@ int main(int argc, char ** argv) {
     try {
         model = Model::load(model_path);
         tok   = std::make_unique<Tokenizer>(model->vocab());
-        RuntimeConfig cfg; cfg.n_ctx = n_ctx; cfg.use_cuda = !force_cpu;
+        RuntimeConfig cfg;
+        cfg.n_ctx              = n_ctx;
+        cfg.use_cuda           = !force_cpu;
+        cfg.vram_budget_mb     = vram_budget_mb;
+        cfg.cache_profile      = cache_profile;
+        cfg.cache_profile_save = false;   // server only reads the profile, never overwrites it
+        cfg.experts_ssd        = experts_ssd;
         rt = std::make_unique<Runtime>(*model, cfg);
     } catch (const std::exception & e) {
         fprintf(stderr, "load error: %s\n", e.what());
@@ -85,6 +244,10 @@ int main(int argc, char ** argv) {
     };
 
     httplib::Server srv;
+
+    srv.Get("/", [](const httplib::Request &, httplib::Response & res) {
+        res.set_content(CHAT_HTML, "text/html; charset=utf-8");
+    });
 
     srv.Get("/health", [](const httplib::Request &, httplib::Response & res) {
         res.set_content(json{{"status", "ok"}}.dump(), "application/json");
@@ -187,7 +350,8 @@ int main(int argc, char ** argv) {
         res.set_content(resp.dump(), "application/json");
     });
 
-    fprintf(stderr, "qwencpp server: http://%s:%d  (model: %s)\n", host.c_str(), port, model_id.c_str());
+    fprintf(stderr, "qwencpp server: http://%s:%d  (chat UI at /, model: %s)\n",
+            host.c_str(), port, model_id.c_str());
     if (!srv.listen(host.c_str(), port)) {
         fprintf(stderr, "failed to bind %s:%d\n", host.c_str(), port);
         return 1;

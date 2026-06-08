@@ -113,7 +113,7 @@ struct Runtime::Impl {
                     (unsigned long long) acc,
                     acc ? 100.0 * (double) s.hits / (double) acc : 0.0,
                     (unsigned long long) s.misses, (unsigned long long) s.evictions);
-            if (!cfg.cache_profile.empty() && ecache->save_profile(cfg.cache_profile))
+            if (cfg.cache_profile_save && !cfg.cache_profile.empty() && ecache->save_profile(cfg.cache_profile))
                 fprintf(stderr, "expert cache: saved profile to '%s'\n", cfg.cache_profile.c_str());
         }
         ecache.reset();

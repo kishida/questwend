@@ -21,6 +21,7 @@ struct RuntimeConfig {
     size_t vram_budget_mb = 0;       // >0: offload expert weights to CPU,
                                      //     enables running large MoE models with limited VRAM
     std::string cache_profile;       // file to persist/prefetch the hot-expert profile
+    bool   cache_profile_save = true; // false: load/prefetch only, never overwrite the profile
     bool   experts_ssd    = false;   // stream experts from the GGUF on SSD (no RAM copy)
 };
 
