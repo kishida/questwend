@@ -57,6 +57,7 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
   .msg.assistant .who { background:#23314a; color:#9fd6c0; }
   .msg .body { white-space:pre-wrap; word-wrap:break-word; padding-top:3px; }
   .msg .body.think { color:var(--muted); font-style:italic; }
+  .stats { color:var(--muted); font-size:12px; margin-top:8px; font-variant-numeric:tabular-nums; }
   footer { border-top:1px solid var(--line); padding:12px 0 18px; }
   .inrow { max-width:780px; margin:0 auto; padding:0 16px; display:flex; gap:10px; align-items:flex-end; }
   textarea { flex:1; resize:none; background:var(--panel); color:var(--txt); border:1px solid var(--line);
@@ -118,6 +119,7 @@ async function send(){
   input.value=''; autosize();
   const body = addMsg('assistant', '');
   let acc = '';
+  let timings = null;
   try {
     const resp = await fetch('/v1/chat/completions', {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -142,12 +144,14 @@ async function send(){
         if(line === '[DONE]') continue;
         try {
           const j = JSON.parse(line);
+          if(j.timings) timings = j.timings;
           const piece = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
           if(piece){ acc += piece; renderAssistant(body, acc); document.getElementById('chat').scrollTop = 1e9; }
         } catch(e){}
       }
     }
   } catch(e){ acc += '\n[error: '+e+']'; renderAssistant(body, acc); }
+  if(timings) showStats(body, timings);
   history.push({role:'assistant', content:acc});
   busy = false; sendBtn.disabled = false; input.focus();
 }
@@ -170,6 +174,14 @@ function renderAssistant(el, txt){
   if(answer.length){
     el.appendChild(document.createTextNode(answer.replace(/^\n+/, '')));
   }
+}
+function showStats(el, t){
+  const s = document.createElement('div'); s.className = 'stats';
+  const f = (x)=> (x||0).toFixed(1);
+  s.textContent = `TTFT ${Math.round(t.ttft_ms||0)} ms · prefill ${f(t.prefill_tps)} tok/s `
+    + `(${t.prompt_tokens} in) · gen ${f(t.gen_tps)} tok/s · ${t.completion_tokens} out`;
+  el.appendChild(s);
+  document.getElementById('chat').scrollTop = 1e9;
 }
 </script>
 </body>
@@ -302,25 +314,41 @@ int main(int argc, char ** argv) {
             res.set_header("Content-Type", "text/event-stream");
             res.set_header("Cache-Control", "no-cache");
 
+            using clk = std::chrono::steady_clock;
             struct State {
                 std::unique_lock<std::mutex> lock;
                 Sampler smp;
                 std::vector<int32_t> prompt;
                 std::vector<float> logits;
-                int generated = 0, max_tokens;
+                int generated = 0, max_tokens = 0, prompt_tokens = 0;
                 bool started = false, finished = false;
+                clk::time_point t0, t_prefill, t_first;
                 State(std::mutex & m, const SamplerConfig & sc) : lock(m), smp(sc) {}
             };
             auto st = std::make_shared<State>(infer_mtx, sc);
             st->prompt = prompt;
             st->max_tokens = max_tokens;
+            st->prompt_tokens = (int) prompt.size();
 
             res.set_chunked_content_provider("text/event-stream",
                 [&, st, id](size_t, httplib::DataSink & sink) -> bool {
                     if (st->finished) return false;
                     auto finish = [&]() -> bool {
+                        const auto t_end = clk::now();
+                        auto ms = [](clk::time_point a, clk::time_point b) {
+                            return std::chrono::duration<double, std::milli>(b - a).count();
+                        };
+                        const double prefill_ms = ms(st->t0, st->t_prefill);
+                        const double gen_ms     = ms(st->t_prefill, t_end);
+                        json timings = {
+                            {"prompt_tokens",     st->prompt_tokens},
+                            {"completion_tokens", st->generated},
+                            {"ttft_ms",     ms(st->t0, st->t_first)},
+                            {"prefill_tps", prefill_ms > 0 ? st->prompt_tokens * 1000.0 / prefill_ms : 0.0},
+                            {"gen_tps",     gen_ms     > 0 ? st->generated     * 1000.0 / gen_ms     : 0.0},
+                        };
                         json fin = {{"id", id}, {"object", "chat.completion.chunk"},
-                            {"model", model_id}, {"choices", json::array({
+                            {"model", model_id}, {"timings", timings}, {"choices", json::array({
                                 {{"index", 0}, {"delta", json::object()}, {"finish_reason", "stop"}}})}};
                         std::string ev = "data: " + fin.dump() + "\n\ndata: [DONE]\n\n";
                         sink.write(ev.data(), ev.size());
@@ -331,13 +359,17 @@ int main(int argc, char ** argv) {
                     try {
                         if (!st->started) {
                             st->started = true;
+                            st->t0 = clk::now();
                             rt->reset();
                             st->logits = rt->decode(st->prompt);
+                            st->t_prefill = clk::now();
+                            st->t_first   = st->t_prefill;   // overwritten on the first emitted token
                         }
                         int next = st->smp.sample(st->logits);
                         // stop on EOS, token budget, or context limit (avoids overflow crash)
                         if (is_stop(next) || st->generated >= st->max_tokens || rt->n_past() + 1 >= n_ctx)
                             return finish();
+                        if (st->generated == 0) st->t_first = clk::now();
                         std::string piece = tok->decode(next);
                         json chunk = {{"id", id}, {"object", "chat.completion.chunk"},
                             {"model", model_id}, {"choices", json::array({
@@ -358,11 +390,15 @@ int main(int argc, char ** argv) {
         // non-streaming
         std::string text;
         int generated = 0;
+        using clk = std::chrono::steady_clock;
+        clk::time_point t0, t_prefill = {}, t_end = {};
         try {
             std::lock_guard<std::mutex> lk(infer_mtx);
             Sampler smp(sc);
             rt->reset();
+            t0 = clk::now();
             auto logits = rt->decode(prompt);
+            t_prefill = clk::now();
             for (int t = 0; t < max_tokens; ++t) {
                 int next = smp.sample(logits);
                 if (is_stop(next) || rt->n_past() + 1 >= n_ctx) break;
@@ -370,9 +406,16 @@ int main(int argc, char ** argv) {
                 ++generated;
                 logits = rt->decode({ next });
             }
+            t_end = clk::now();
         } catch (const std::exception & e) {
             fprintf(stderr, "generation error: %s\n", e.what());  // return what we have
+            if (t_end == clk::time_point{}) t_end = clk::now();
         }
+        auto ms = [](clk::time_point a, clk::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        const double prefill_ms = ms(t0, t_prefill);
+        const double gen_ms     = ms(t_prefill, t_end);
         json resp = {
             {"id", id}, {"object", "chat.completion"}, {"model", model_id},
             {"choices", json::array({
@@ -380,7 +423,12 @@ int main(int argc, char ** argv) {
                  {"finish_reason", "stop"}}})},
             {"usage", {{"prompt_tokens", (int) prompt.size()},
                        {"completion_tokens", generated},
-                       {"total_tokens", (int) prompt.size() + generated}}}
+                       {"total_tokens", (int) prompt.size() + generated}}},
+            {"timings", {{"prompt_tokens", (int) prompt.size()},
+                         {"completion_tokens", generated},
+                         {"ttft_ms", prefill_ms},
+                         {"prefill_tps", prefill_ms > 0 ? prompt.size() * 1000.0 / prefill_ms : 0.0},
+                         {"gen_tps", gen_ms > 0 ? generated * 1000.0 / gen_ms : 0.0}}}
         };
         res.set_content(resp.dump(), "application/json");
     });
