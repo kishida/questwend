@@ -4,10 +4,13 @@
 #include "sampler.h"
 #include "chat.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <iostream>
 #include <string>
+#include <vector>
 
 using namespace qwencpp;
 
@@ -81,6 +84,32 @@ int main(int argc, char ** argv) {
         cfg.experts_ssd    = experts_ssd;
         Runtime rt(*model, cfg);
         Sampler smp(sc);
+
+        // GDN equivalence check: multi-token prefill vs token-by-token must give
+        // the same final-token logits (build_graph multi-token GDN == single step).
+        if (getenv("QWEN_GDN_TEST")) {
+            std::string tp = prompt.empty()
+                ? "The quick brown fox jumps over the lazy dog near the river bank."
+                : prompt;
+            auto ids = tok.encode(tp, false);
+            auto argmax = [](const std::vector<float> & v) {
+                int b = 0; for (int i = 1; i < (int) v.size(); ++i) if (v[i] > v[b]) b = i; return b;
+            };
+            rt.reset();
+            std::vector<float> A = rt.decode(ids);          // one multi-token forward
+            rt.reset();
+            std::vector<float> B;
+            for (int32_t t : ids) B = rt.decode({ t });     // token-by-token
+            double md = 0, l2 = 0;
+            for (size_t i = 0; i < A.size(); ++i) { double d = A[i] - B[i]; md = std::max(md, std::fabs(d)); l2 += d * d; }
+            const int aA = argmax(A), aB = argmax(B);
+            fprintf(stderr, "GDN test (%zu prompt tokens, %s):\n", ids.size(), arch_name(model->hparams().arch));
+            fprintf(stderr, "  multi-token    argmax=%d '%s'\n", aA, tok.decode(aA).c_str());
+            fprintf(stderr, "  token-by-token argmax=%d '%s'\n", aB, tok.decode(aB).c_str());
+            fprintf(stderr, "  max|diff|=%.5g  L2=%.5g  -> %s\n",
+                    md, std::sqrt(l2), aA == aB ? "ARGMAX MATCH" : "ARGMAX DIFFER");
+            return 0;
+        }
 
         const int32_t eos    = model->vocab().eos_id;
         const int32_t im_end = tok.token_to_id("<|im_end|>");
