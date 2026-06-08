@@ -16,6 +16,7 @@ static void usage(const char * prog) {
     printf("  -p <text>      prompt (one-shot)\n");
     printf("  -i             interactive chat\n");
     printf("  --chat         wrap -p prompt in ChatML\n");
+    printf("  --reasoning <on|off>  thinking mode for chat (default on)\n");
     printf("  -n <N>         max new tokens (default 128)\n");
     printf("  --n-ctx <N>    context length (default 4096)\n");
     printf("  --temp <f>     temperature (0 = greedy, default 0)\n");
@@ -35,7 +36,7 @@ int main(int argc, char ** argv) {
     int  max_tokens = 128, n_ctx = 4096;
     size_t vram_budget_mb = 0;
     bool interactive = false, info_only = false, chat = false, log_speed = false, force_cpu = false;
-    bool experts_ssd = false;
+    bool experts_ssd = false, reasoning = true;
     SamplerConfig sc;
     sc.temperature = 0.0f;  // CLI defaults to greedy for reproducibility
 
@@ -55,6 +56,7 @@ int main(int argc, char ** argv) {
         else if (a == "--vram-budget" && i + 1 < argc) vram_budget_mb = (size_t) std::stoul(next());
         else if (a == "--cache-profile" && i + 1 < argc) cache_profile = next();
         else if (a == "--experts-ssd")      experts_ssd = true;
+        else if (a == "--reasoning" && i + 1 < argc) { std::string v = next(); reasoning = (v != "off" && v != "0" && v != "false"); }
         else if (a == "--log-tokens-per-sec")    log_speed = true;
         else if (a == "--cpu")              force_cpu = true;
         else if (a == "--info")             info_only = true;
@@ -121,7 +123,7 @@ int main(int argc, char ** argv) {
                 std::cout << "\n> " << std::flush;
                 if (!std::getline(std::cin, line) || line.empty()) break;
                 history.push_back({ "user", line });
-                auto ids = build_chatml_tokens(tok, history, true);
+                auto ids = build_chatml_tokens(tok, history, true, reasoning);
                 // reset KV so each turn re-encodes the full history (simple + correct)
                 rt.reset();
                 run(ids);
@@ -129,7 +131,7 @@ int main(int argc, char ** argv) {
         } else {
             std::vector<int32_t> ids;
             if (chat) {
-                ids = build_chatml_tokens(tok, {{ "user", prompt }}, true);
+                ids = build_chatml_tokens(tok, {{ "user", prompt }}, true, reasoning);
             } else {
                 if (prompt.empty()) prompt = "Hello";
                 std::cout << prompt;

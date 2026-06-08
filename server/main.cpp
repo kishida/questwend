@@ -73,6 +73,7 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
   <span class="spacer"></span>
   <label>temp <input type="number" id="temp" value="0.7" step="0.1" min="0" max="2"></label>
   <label>max <input type="number" id="maxtok" value="512" step="64" min="1"></label>
+  <label><input type="checkbox" id="think" checked> think</label>
   <button id="clear">Clear</button>
 </header>
 <div id="chat"><div class="wrap" id="list"></div></div>
@@ -123,7 +124,8 @@ async function send(){
       body: JSON.stringify({
         messages: history, stream: true,
         temperature: parseFloat(document.getElementById('temp').value)||0,
-        max_tokens: parseInt(document.getElementById('maxtok').value)||512
+        max_tokens: parseInt(document.getElementById('maxtok').value)||512,
+        reasoning: document.getElementById('think').checked
       })
     });
     const reader = resp.body.getReader();
@@ -149,16 +151,25 @@ async function send(){
   history.push({role:'assistant', content:acc});
   busy = false; sendBtn.disabled = false; input.focus();
 }
-// show <think> blocks dimmed
+// dim the reasoning span. With thinking on, the prompt pre-opens <think>, so the
+// model's output is "reasoning…</think>\n\nanswer" (no leading <think> tag).
 function renderAssistant(el, txt){
   el.innerHTML = '';
-  const re = /<think>([\s\S]*?)(<\/think>|$)/g; let last=0, m;
-  while((m = re.exec(txt))){
-    if(m.index>last) el.appendChild(document.createTextNode(txt.slice(last, m.index)));
-    const t = document.createElement('span'); t.className='body think';
-    t.textContent = m[1]; el.appendChild(t); last = re.lastIndex;
+  let think = null, answer = txt;
+  const close = txt.indexOf('</think>');
+  if(close >= 0){
+    think  = txt.slice(0, close).replace(/^\s*<think>/, '');
+    answer = txt.slice(close + 8);
+  } else if(/^\s*<think>/.test(txt)){
+    think = txt.replace(/^\s*<think>/, ''); answer = '';
   }
-  if(last < txt.length) el.appendChild(document.createTextNode(txt.slice(last)));
+  if(think !== null && think.trim().length){
+    const t = document.createElement('span'); t.className = 'body think';
+    t.textContent = think.replace(/^\n+/, ''); el.appendChild(t);
+  }
+  if(answer.length){
+    el.appendChild(document.createTextNode(answer.replace(/^\n+/, '')));
+  }
 }
 </script>
 </body>
@@ -174,6 +185,7 @@ int main(int argc, char ** argv) {
     size_t vram_budget_mb = 0;
     std::string cache_profile;
     bool experts_ssd = false;
+    bool reasoning_default = true;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -184,6 +196,7 @@ int main(int argc, char ** argv) {
         else if (a == "--vram-budget" && i + 1 < argc) vram_budget_mb = (size_t) std::stoul(argv[++i]);
         else if (a == "--cache-profile" && i + 1 < argc) cache_profile = argv[++i];
         else if (a == "--experts-ssd")      experts_ssd = true;
+        else if (a == "--reasoning" && i + 1 < argc) { std::string v = argv[++i]; reasoning_default = (v != "off" && v != "0" && v != "false"); }
         else if (a == "--cpu")              force_cpu = true;
     }
     if (model_path.empty()) {
@@ -195,6 +208,7 @@ int main(int argc, char ** argv) {
             "  --vram-budget <MB>  offload expert weights; keep non-expert on GPU\n"
             "  --cache-profile <f> prefetch hot-expert profile (read-only on the server)\n"
             "  --experts-ssd       stream experts from the GGUF on SSD (no RAM copy)\n"
+            "  --reasoning <on|off> default thinking mode (per-request override: \"reasoning\")\n"
             "  --cpu               force CPU backend\n", argv[0]);
         return 1;
     }
@@ -271,7 +285,11 @@ int main(int argc, char ** argv) {
         const SamplerConfig sc = make_sampler(body);
         const std::string id   = now_id("chatcmpl-");
 
-        auto prompt = build_chatml_tokens(*tok, messages, true);
+        // per-request thinking control: body "reasoning" overrides the server default
+        bool reasoning = reasoning_default;
+        if (body.contains("reasoning")) reasoning = body["reasoning"].get<bool>();
+        else if (body.contains("enable_thinking")) reasoning = body["enable_thinking"].get<bool>();
+        auto prompt = build_chatml_tokens(*tok, messages, true, reasoning);
 
         if (stream) {
             res.set_header("Content-Type", "text/event-stream");

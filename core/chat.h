@@ -15,10 +15,14 @@ struct ChatMessage {
     std::string content;
 };
 
+// reasoning: when the model has <think> tokens, open a thinking block in the
+// generation prompt ("<think>\n").  reasoning=false instead closes an empty one
+// ("<think>\n\n</think>\n") so the model skips reasoning and answers directly.
 inline std::vector<int32_t> build_chatml_tokens(
         const Tokenizer & tok,
         const std::vector<ChatMessage> & messages,
-        bool add_generation_prompt = true) {
+        bool add_generation_prompt = true,
+        bool reasoning = true) {
     const int32_t im_start = tok.token_to_id("<|im_start|>");
     const int32_t im_end   = tok.token_to_id("<|im_end|>");
 
@@ -41,6 +45,19 @@ inline std::vector<int32_t> build_chatml_tokens(
         if (have_specials) {
             ids.push_back(im_start);
             append(tok.encode("assistant\n", false));
+            // thinking control (only when the model defines the <think> tokens)
+            const int32_t think_open  = tok.token_to_id("<think>");
+            const int32_t think_close = tok.token_to_id("</think>");
+            if (think_open >= 0) {
+                ids.push_back(think_open);
+                if (reasoning || think_close < 0) {
+                    append(tok.encode("\n", false));            // <think>\n  (model reasons)
+                } else {
+                    append(tok.encode("\n\n", false));          // <think>\n\n</think>\n  (skip)
+                    ids.push_back(think_close);
+                    append(tok.encode("\n", false));
+                }
+            }
         } else {
             append(tok.encode("assistant: ", false));
         }
