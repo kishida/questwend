@@ -259,8 +259,15 @@ int main(int argc, char ** argv) {
 
     httplib::Server srv;
 
-    srv.Get("/", [](const httplib::Request &, httplib::Response & res) {
-        res.set_content(CHAT_HTML, "text/html; charset=utf-8");
+    srv.Get("/", [reasoning_default](const httplib::Request &, httplib::Response & res) {
+        std::string html = CHAT_HTML;
+        // initialise the UI "think" checkbox from the server default
+        if (!reasoning_default) {
+            const std::string from = "id=\"think\" checked";
+            auto p = html.find(from);
+            if (p != std::string::npos) html.replace(p, from.size(), "id=\"think\"");
+        }
+        res.set_content(html, "text/html; charset=utf-8");
     });
 
     srv.Get("/health", [](const httplib::Request &, httplib::Response & res) {
@@ -310,14 +317,8 @@ int main(int argc, char ** argv) {
 
             res.set_chunked_content_provider("text/event-stream",
                 [&, st, id](size_t, httplib::DataSink & sink) -> bool {
-                    if (st->finished) { return false; }
-                    if (!st->started) {
-                        st->started = true;
-                        rt->reset();
-                        st->logits = rt->decode(st->prompt);
-                    }
-                    int next = st->smp.sample(st->logits);
-                    if (is_stop(next) || st->generated >= st->max_tokens) {
+                    if (st->finished) return false;
+                    auto finish = [&]() -> bool {
                         json fin = {{"id", id}, {"object", "chat.completion.chunk"},
                             {"model", model_id}, {"choices", json::array({
                                 {{"index", 0}, {"delta", json::object()}, {"finish_reason", "stop"}}})}};
@@ -326,16 +327,30 @@ int main(int argc, char ** argv) {
                         st->finished = true;
                         sink.done();
                         return false;
+                    };
+                    try {
+                        if (!st->started) {
+                            st->started = true;
+                            rt->reset();
+                            st->logits = rt->decode(st->prompt);
+                        }
+                        int next = st->smp.sample(st->logits);
+                        // stop on EOS, token budget, or context limit (avoids overflow crash)
+                        if (is_stop(next) || st->generated >= st->max_tokens || rt->n_past() + 1 >= n_ctx)
+                            return finish();
+                        std::string piece = tok->decode(next);
+                        json chunk = {{"id", id}, {"object", "chat.completion.chunk"},
+                            {"model", model_id}, {"choices", json::array({
+                                {{"index", 0}, {"delta", {{"content", piece}}}, {"finish_reason", nullptr}}})}};
+                        std::string ev = "data: " + chunk.dump() + "\n\n";
+                        if (!sink.write(ev.data(), ev.size())) { st->finished = true; return false; }  // client gone
+                        st->generated++;
+                        st->logits = rt->decode({ next });
+                        return true;
+                    } catch (const std::exception & e) {
+                        fprintf(stderr, "stream error: %s\n", e.what());
+                        return finish();
                     }
-                    std::string piece = tok->decode(next);
-                    json chunk = {{"id", id}, {"object", "chat.completion.chunk"},
-                        {"model", model_id}, {"choices", json::array({
-                            {{"index", 0}, {"delta", {{"content", piece}}}, {"finish_reason", nullptr}}})}};
-                    std::string ev = "data: " + chunk.dump() + "\n\n";
-                    sink.write(ev.data(), ev.size());
-                    st->generated++;
-                    st->logits = rt->decode({ next });
-                    return true;
                 });
             return;
         }
@@ -343,18 +358,20 @@ int main(int argc, char ** argv) {
         // non-streaming
         std::string text;
         int generated = 0;
-        {
+        try {
             std::lock_guard<std::mutex> lk(infer_mtx);
             Sampler smp(sc);
             rt->reset();
             auto logits = rt->decode(prompt);
             for (int t = 0; t < max_tokens; ++t) {
                 int next = smp.sample(logits);
-                if (is_stop(next)) break;
+                if (is_stop(next) || rt->n_past() + 1 >= n_ctx) break;
                 text += tok->decode(next);
                 ++generated;
                 logits = rt->decode({ next });
             }
+        } catch (const std::exception & e) {
+            fprintf(stderr, "generation error: %s\n", e.what());  // return what we have
         }
         json resp = {
             {"id", id}, {"object", "chat.completion"}, {"model", model_id},
@@ -367,6 +384,11 @@ int main(int argc, char ** argv) {
         };
         res.set_content(resp.dump(), "application/json");
     });
+
+    // generous timeouts: a single token (esp. SSD/offload prefill) can take a while
+    srv.set_read_timeout(600, 0);
+    srv.set_write_timeout(600, 0);
+    srv.set_keep_alive_timeout(600);
 
     fprintf(stderr, "qwencpp server: http://%s:%d  (chat UI at /, model: %s)\n",
             host.c_str(), port, model_id.c_str());
