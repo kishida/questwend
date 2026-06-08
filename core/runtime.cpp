@@ -86,6 +86,15 @@ struct Runtime::Impl {
 
     ggml_gallocr_t galloc = nullptr;
 
+    // MTP (multi-token prediction): the trailing nextn block drafts the next-next
+    // token from the main model's last hidden state. Used for self-speculative
+    // decoding. The MTP block has its own KV cache slot (k/v_cache[n_main]).
+    bool                  capture_hidden = false;   // main forward exposes its last hidden
+    std::vector<float>    mtp_hidden;               // host copy of the last main hidden [n_embd]
+    std::vector<float>    mtp_logits;
+    int                   mtp_past = 0;             // MTP KV write position
+    ggml_gallocr_t        mtp_galloc = nullptr;
+
     int n_ctx  = 0;
     int n_past = 0;
 
@@ -117,6 +126,7 @@ struct Runtime::Impl {
                 fprintf(stderr, "expert cache: saved profile to '%s'\n", cfg.cache_profile.c_str());
         }
         ecache.reset();
+        if (mtp_galloc)     ggml_gallocr_free(mtp_galloc);
         if (f_galloc)       ggml_gallocr_free(f_galloc);
         if (f_ctx)          ggml_free(f_ctx);
         if (bak_buf)        ggml_backend_buffer_free(bak_buf);
@@ -164,6 +174,12 @@ struct Runtime::Impl {
                             ggml_tensor * x, int n_tokens);
     const std::vector<float> & decode(const std::vector<int32_t> & tokens);
     const std::vector<float> & decode_reuse(int32_t token);
+
+    // MTP draft: predict the token after `token`, given the captured main hidden.
+    ggml_tensor * build_mtp(ggml_context * ctx, ggml_cgraph * gf,
+                            ggml_tensor * h, ggml_tensor * tok, ggml_tensor * pos, ggml_tensor * mask);
+    const std::vector<float> & mtp_draft(int32_t token);
+    void capture_main_hidden(ggml_cgraph * gf, int col);
 
     // ---- Phase B v2 dynamic-cache decode (single token) ----
     void init_cache();
@@ -300,6 +316,12 @@ void Runtime::Impl::init() {
     }
     if (sched || ssd_mode) {
         init_cache();   // dynamic per-expert VRAM cache for the decode hot path
+    }
+    // MTP: main forward exposes its last hidden, drafted by the nextn block
+    capture_hidden = model.hparams().has_mtp();
+    if (capture_hidden) {
+        mtp_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        mtp_hidden.assign(model.hparams().n_embd, 0.0f);
     }
     zero_states();
 }
@@ -666,7 +688,7 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
     ggml_tensor * cur;
     ggml_tensor * inpL = ggml_get_rows(ctx, model.tok_embd_rows(), inp_tokens);
 
-    for (int il = 0; il < hp.n_layer; ++il) {
+    for (int il = 0; il < (int) hp.n_main(); ++il) {
         ggml_tensor * inpSA = inpL;
 
         cur = ggml_rms_norm(ctx, inpL, eps);
@@ -736,6 +758,13 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
         inpL = cur;
     }
 
+    // expose the main stack's last hidden (pre-output-norm) for the MTP module
+    if (capture_hidden) {
+        ggml_set_name(inpL, "main_hidden");
+        ggml_set_output(inpL);
+        ggml_build_forward_expand(gf, inpL);
+    }
+
     cur = ggml_rms_norm(ctx, inpL, eps);
     cur = ggml_mul(ctx, cur, model.tensor("output_norm.weight"));
 
@@ -746,6 +775,118 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
 
     ggml_build_forward_expand(gf, cur);
     return gf;
+}
+
+// Read column `col` of the graph's "main_hidden" tensor into mtp_hidden (host).
+void Runtime::Impl::capture_main_hidden(ggml_cgraph * gf, int col) {
+    if (!capture_hidden) return;
+    ggml_tensor * h = ggml_graph_get_tensor(gf, "main_hidden");
+    if (!h) return;
+    const int n_embd = (int) h->ne[0];
+    mtp_hidden.resize(n_embd);
+    ggml_backend_tensor_get(h, mtp_hidden.data(), (size_t) col * h->nb[1], n_embd * sizeof(float));
+}
+
+// MTP (nextn) block: combine the main hidden with the embedding of `tok`, run one
+// transformer block (its own KV at layer n_main), then the shared head -> logits
+// for the token *after* `tok`.
+ggml_tensor * Runtime::Impl::build_mtp(ggml_context * ctx, ggml_cgraph * gf,
+        ggml_tensor * h, ggml_tensor * tok, ggml_tensor * pos, ggml_tensor * mask) {
+    const auto & hp = model.hparams();
+    const int L           = (int) hp.n_main();      // MTP block index
+    const int n_embd      = hp.n_embd;
+    const int n_head      = hp.n_head;
+    const int n_head_kv   = hp.n_head_kv;
+    const int n_embd_head = hp.n_embd_head;
+    const float eps       = hp.rms_eps;
+    const int n_kv        = mtp_past + 1;
+
+    // h' = eh_proj( concat( hnorm(h), enorm(emb(tok)) ) )
+    ggml_tensor * emb = ggml_get_rows(ctx, model.tok_embd_rows(), tok);            // [n_embd,1]
+    ggml_tensor * e   = ggml_mul(ctx, ggml_rms_norm(ctx, emb, eps), W("blk.%d.nextn.enorm.weight", L));
+    ggml_tensor * h2  = ggml_reshape_2d(ctx, h, n_embd, 1);
+    ggml_tensor * hn  = ggml_mul(ctx, ggml_rms_norm(ctx, h2, eps), W("blk.%d.nextn.hnorm.weight", L));
+    // eh_proj expects [ enorm(emb) ; hnorm(hidden) ]  (embedding first)
+    ggml_tensor * combined = ggml_concat(ctx, e, hn, 0);                            // [2*n_embd,1]
+    ggml_tensor * cur = ggml_mul_mat(ctx, W("blk.%d.nextn.eh_proj.weight", L), combined); // [n_embd,1]
+
+    // transformer block (gated attention + dense FFN), gated like qwen35
+    ggml_tensor * inpSA = cur;
+    ggml_tensor * x = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W("blk.%d.attn_norm.weight", L));
+
+    ggml_tensor * Qf = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", L), x);
+    const size_t es = ggml_element_size(Qf);
+    ggml_tensor * Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head, 1,
+            es * n_embd_head * 2, es * n_embd_head * 2 * n_head, 0);
+    ggml_tensor * gate_t = ggml_view_3d(ctx, Qf, n_embd_head, n_head, 1,
+            es * n_embd_head * 2, es * n_embd_head * 2 * n_head, es * n_embd_head);
+    gate_t = ggml_cont_2d(ctx, gate_t, n_embd_head * n_head, 1);
+    ggml_tensor * K = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", L), x), n_embd_head, n_head_kv, 1);
+    ggml_tensor * V = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", L), x), n_embd_head, n_head_kv, 1);
+    Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", L));
+    K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", L));
+    Q = ggml_rope_ext(ctx, Q, pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX, 0, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    K = ggml_rope_ext(ctx, K, pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX, 0, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    ggml_tensor * att = build_attn(ctx, gf, L, Q, K, V, mask, 1, n_kv);   // KV write uses n_past (= mtp_past, set by caller)
+    att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
+    cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", L), att);
+    cur = ggml_add(ctx, cur, inpSA);
+
+    ggml_tensor * ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W("blk.%d.post_attention_norm.weight", L));
+    ggml_tensor * gt = ggml_mul_mat(ctx, W("blk.%d.ffn_gate.weight", L), ffn_in);
+    ggml_tensor * up = ggml_mul_mat(ctx, W("blk.%d.ffn_up.weight",   L), ffn_in);
+    ggml_tensor * ff = ggml_mul_mat(ctx, W("blk.%d.ffn_down.weight", L), ggml_mul(ctx, ggml_silu(ctx, gt), up));
+    cur = ggml_add(ctx, ff, cur);
+
+    ggml_tensor * fin = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W("blk.%d.nextn.shared_head_norm.weight", L));
+    ggml_tensor * lm = model.tensor("output.weight");
+    if (!lm) lm = model.tensor("token_embd.weight");
+    ggml_tensor * logits = ggml_mul_mat(ctx, lm, fin);
+    ggml_set_name(logits, "mtp_logits");
+    ggml_build_forward_expand(gf, logits);
+    return logits;
+}
+
+// Run the MTP block once: draft the token after `token`, advancing MTP KV.
+const std::vector<float> & Runtime::Impl::mtp_draft(int32_t token) {
+    const auto & hp = model.hparams();
+    const int n_embd = hp.n_embd;
+    const int n_kv   = mtp_past + 1;
+
+    ggml_init_params gp{};
+    gp.mem_size = ggml_tensor_overhead() * GRAPH_SIZE + ggml_graph_overhead_custom(GRAPH_SIZE, false);
+    gp.no_alloc = true;
+    ggml_context * ctx = ggml_init(gp);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+
+    ggml_tensor * h_in  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd); ggml_set_input(h_in);
+    ggml_tensor * t_in  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);      ggml_set_input(t_in);
+    ggml_tensor * p_in  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);      ggml_set_input(p_in);
+    ggml_tensor * m_in  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, 1); ggml_set_input(m_in);
+
+    const int saved = n_past;
+    n_past = mtp_past;                 // build_attn writes MTP KV at this position
+    ggml_tensor * logits_t = build_mtp(ctx, gf, h_in, t_in, p_in, m_in);
+    n_past = saved;
+
+    if (!ggml_gallocr_alloc_graph(mtp_galloc, gf))
+        throw std::runtime_error("mtp_draft: gallocr alloc failed");
+
+    ggml_backend_tensor_set(h_in, mtp_hidden.data(), 0, n_embd * sizeof(float));
+    ggml_backend_tensor_set(t_in, &token, 0, sizeof(int32_t));
+    int32_t pos = mtp_past; ggml_backend_tensor_set(p_in, &pos, 0, sizeof(int32_t));
+    std::vector<ggml_fp16_t> mask(n_kv, ggml_fp32_to_fp16(0.0f));   // all past positions visible
+    ggml_backend_tensor_set(m_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+        throw std::runtime_error("mtp_draft: compute failed");
+
+    const int n_vocab = (int) logits_t->ne[0];
+    mtp_logits.resize(n_vocab);
+    ggml_backend_tensor_get(logits_t, mtp_logits.data(), 0, n_vocab * sizeof(float));
+    ggml_free(ctx);
+    mtp_past += 1;
+    return mtp_logits;
 }
 
 // Single-token decode using a persistent graph built once and reused, so that
@@ -802,6 +943,7 @@ const std::vector<float> & Runtime::Impl::decode_reuse(int32_t token) {
     const int n_vocab = (int) logits_t->ne[0];
     logits.resize(n_vocab);
     ggml_backend_tensor_get(logits_t, logits.data(), 0, n_vocab * sizeof(float));
+    capture_main_hidden(dgf, 0);
 
     if (prof) {
         auto ms = [](auto a, auto b){ return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -931,7 +1073,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
 
     std::vector<int32_t> sel(n_used * T), sg(n_used * T), su(n_used * T), sd(n_used * T);
 
-    for (int il = 0; il < hp.n_layer; ++il) {
+    for (int il = 0; il < (int) hp.n_main(); ++il) {
         const bool recurrent = hp.is_recurrent(il);
 
         // ===== seg A: attention/GDN + router (all T tokens) =====
@@ -1146,7 +1288,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token) {
 
     std::vector<int32_t> sel(n_used), slot_g(n_used), slot_u(n_used), slot_d(n_used);
 
-    for (int il = 0; il < hp.n_layer; ++il) {
+    for (int il = 0; il < (int) hp.n_main(); ++il) {
         const bool recurrent = hp.is_recurrent(il);
 
         // ================= seg A: attention/GDN + router =================
@@ -1296,7 +1438,7 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     const auto & hp = model.hparams();
     const int n_used  = hp.n_expert_used;
     const int n_exp   = hp.n_expert;
-    const int n_layer = hp.n_layer;
+    const int n_layer = (int) hp.n_main();   // MTP blocks excluded from the main stack
 
     // (re)build the persistent fast graph when the KV bucket changes
     const int want_nkv = std::min(((n_past + 1 + KV_BUCKET - 1) / KV_BUCKET) * KV_BUCKET, n_ctx);
@@ -1476,6 +1618,7 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     logits.resize(n_vocab);
     const size_t off = (size_t) (n_tokens - 1) * logits_t->nb[1];
     ggml_backend_tensor_get(logits_t, logits.data(), off, n_vocab * sizeof(float));
+    capture_main_hidden(gf, n_tokens - 1);
 
     n_past += n_tokens;
     ggml_free(ctx);
@@ -1492,7 +1635,9 @@ Runtime::~Runtime() = default;
 const std::vector<float> & Runtime::decode(const std::vector<int32_t> & tokens) {
     return impl_->decode(tokens);
 }
-void Runtime::reset()        { impl_->n_past = 0; impl_->zero_states(); }
+const std::vector<float> & Runtime::mtp_draft(int32_t token) { return impl_->mtp_draft(token); }
+bool Runtime::has_mtp() const { return impl_->model.hparams().has_mtp(); }
+void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->zero_states(); }
 int  Runtime::n_past() const { return impl_->n_past; }
 
 } // namespace qwencpp

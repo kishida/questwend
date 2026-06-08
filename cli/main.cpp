@@ -111,6 +111,41 @@ int main(int argc, char ** argv) {
             return 0;
         }
 
+        // MTP draft acceptance: lockstep main + MTP draft, count how often the
+        // draft (token two ahead) matches the main model's actual next token.
+        if (getenv("QWEN_MTP_TEST")) {
+            if (!rt.has_mtp()) { fprintf(stderr, "model has no MTP module\n"); return 1; }
+            std::string tp = prompt.empty()
+                ? "The quick brown fox jumps over the lazy dog near the river bank at sunset."
+                : prompt;
+            auto ids = tok.encode(tp, false);
+            const int n_gen = max_tokens > 0 ? max_tokens : 64;
+            auto argmax = [](const std::vector<float> & v) {
+                int b = 0; for (int i = 1; i < (int) v.size(); ++i) if (v[i] > v[b]) b = i; return b;
+            };
+            rt.reset();
+            std::vector<float> mlog;
+            const int P = (int) ids.size();
+            for (int i = 0; i < P; ++i) {
+                mlog = rt.decode({ ids[i] });
+                if (i + 1 < P) rt.mtp_draft(ids[i + 1]);     // build MTP KV over the prompt
+            }
+            int32_t x = argmax(mlog);                        // first generated token
+            int matches = 0, total = 0;
+            const int32_t eos = model->vocab().eos_id;
+            for (int s = 0; s < n_gen; ++s) {
+                int32_t d  = argmax(rt.mtp_draft(x));        // draft: token after x
+                mlog = rt.decode({ x });
+                int32_t nx = argmax(mlog);                   // main model's actual next token
+                ++total; if (d == nx) ++matches;
+                x = nx;
+                if (x == eos) break;
+            }
+            fprintf(stderr, "MTP draft accept rate: %d/%d = %.1f%% (%d prompt tokens)\n",
+                    matches, total, total ? 100.0 * matches / total : 0.0, P);
+            return 0;
+        }
+
         const int32_t eos    = model->vocab().eos_id;
         const int32_t im_end = tok.token_to_id("<|im_end|>");
         auto is_stop = [&](int32_t t){ return t == eos || (im_end >= 0 && t == im_end); };

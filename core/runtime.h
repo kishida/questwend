@@ -34,6 +34,12 @@ public:
     // the KV cache. Returns the logits (size n_vocab) for the LAST token.
     const std::vector<float> & decode(const std::vector<int32_t> & tokens);
 
+    // MTP (multi-token prediction): draft the token *after* `token`, using the
+    // main hidden captured by the most recent decode(); advances the MTP KV.
+    // Only valid when has_mtp(). Returns draft logits for the next-next token.
+    const std::vector<float> & mtp_draft(int32_t token);
+    bool has_mtp() const;
+
     void reset();                 // clear KV cache / position
     int  n_past() const;
 

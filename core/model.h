@@ -62,11 +62,13 @@ struct HParams {
     uint32_t nextn_predict_layers = 0;
 
     bool is_moe() const { return n_expert > 0; }
+    // Main transformer stack excludes the trailing MTP (next-token-prediction) blocks.
+    uint32_t n_main()  const { return n_layer - nextn_predict_layers; }
+    bool     has_mtp() const { return nextn_predict_layers > 0; }
     // GDN (recurrent) layer iff hybrid, within main stack, and not a full-attn slot.
     bool is_recurrent(uint32_t il) const {
         if (!has_gdn) return false;
-        const uint32_t n_main = n_layer - nextn_predict_layers;
-        return il < n_main && ((il + 1) % full_attn_interval != 0);
+        return il < n_main() && ((il + 1) % full_attn_interval != 0);
     }
 };
 
