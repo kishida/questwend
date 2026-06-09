@@ -104,7 +104,9 @@ struct Runtime::Impl {
     int                   mtp_past = 0;             // MTP KV write position
     ggml_gallocr_t        mtp_galloc = nullptr;
     // 2-token verify outputs (logits + hidden for both positions)
-    std::vector<float>    vL1, vL2, vh1, vh2;
+    // k+1-token verify outputs: per-position logits (vL) and main hidden (vH).
+    std::vector<std::vector<float>> vL, vH;
+    std::vector<float>    mtp_block_hidden;   // MTP block output hidden (for chaining drafts)
 
     int n_ctx  = 0;
     int n_past = 0;
@@ -209,9 +211,9 @@ struct Runtime::Impl {
                             ggml_tensor * h, ggml_tensor * tok, ggml_tensor * pos, ggml_tensor * mask);
     const std::vector<float> & mtp_draft(int32_t token);
     void capture_main_hidden(ggml_cgraph * gf, int col);
-    void decode_verify(int32_t a, int32_t b);       // 2-token forward -> vL1/vL2/vh1/vh2
-    void decode_verify_cached(int32_t a, int32_t b);// offload variant (via decode_cached_batch)
-    void generate_mtp(const std::vector<int32_t> & prompt, int max_new,
+    void decode_verify(const std::vector<int32_t> & toks);        // T-token forward -> vL/vH
+    void decode_verify_cached(const std::vector<int32_t> & toks); // offload variant (decode_cached_batch)
+    void generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                       const std::function<bool(int32_t)> & on_token);
 
     // ---- Phase B v2 dynamic-cache decode (single token) ----
@@ -876,6 +878,12 @@ ggml_tensor * Runtime::Impl::build_mtp(ggml_context * ctx, ggml_cgraph * gf,
     }
     cur = ggml_add(ctx, ff, cur);
 
+    // expose the block output hidden so drafts can be chained (use it as the next
+    // step's "main hidden" proxy when drafting 2+ tokens ahead).
+    ggml_set_name(cur, "mtp_blk_hidden");
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+
     ggml_tensor * fin = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W("blk.%d.nextn.shared_head_norm.weight", L));
     ggml_tensor * lm = model.tensor("output.weight");
     if (!lm) lm = model.tensor("token_embd.weight");
@@ -924,6 +932,11 @@ const std::vector<float> & Runtime::Impl::mtp_draft(int32_t token) {
     const int n_vocab = (int) logits_t->ne[0];
     mtp_logits.resize(n_vocab);
     ggml_backend_tensor_get(logits_t, mtp_logits.data(), 0, n_vocab * sizeof(float));
+    // capture the block output hidden for chaining the next draft
+    if (ggml_tensor * bh = ggml_graph_get_tensor(gf, "mtp_blk_hidden")) {
+        mtp_block_hidden.resize(n_embd);
+        ggml_backend_tensor_get(bh, mtp_block_hidden.data(), 0, n_embd * sizeof(float));
+    }
     ggml_free(ctx);
     mtp_past += 1;
     return mtp_logits;
@@ -932,24 +945,24 @@ const std::vector<float> & Runtime::Impl::mtp_draft(int32_t token) {
 // Uses the batched cache path when the pools can hold both tokens' experts at
 // once; otherwise falls back to two single-token decodes (still correct, just
 // no shared-fetch amortization).
-void Runtime::Impl::decode_verify_cached(int32_t a, int32_t b) {
+void Runtime::Impl::decode_verify_cached(const std::vector<int32_t> & toks) {
+    const int T = (int) toks.size();
     const int n_used = model.hparams().n_expert_used;
-    if (ecache->min_slots() >= 2 * n_used) {
-        const int32_t toks[2] = { a, b };
-        decode_cached_batch(toks, 2, /*want_logits=*/false, /*verify=*/true);
+    if (ecache->min_slots() >= T * n_used) {
+        decode_cached_batch(toks.data(), T, /*want_logits=*/false, /*verify=*/true);
     } else {
-        vL1 = decode_cached(a); vh1 = mtp_hidden;
-        vL2 = decode_cached(b); vh2 = mtp_hidden;
+        // pools too small to hold all tokens' experts at once: token-by-token.
+        vL.assign(T, {}); vH.assign(T, {});
+        for (int i = 0; i < T; ++i) { vL[i] = decode_cached(toks[i]); vH[i] = mtp_hidden; }
     }
 }
 
-// Verify forward: run the main model on two tokens [a,b] at the current position,
-// exposing per-position logits (vL1,vL2) and hidden (vh1,vh2). Advances n_past+=2.
-void Runtime::Impl::decode_verify(int32_t a, int32_t b) {
-    if (ecache) { decode_verify_cached(a, b); return; }   // expert-offload mode
+// Verify forward: run the main model on `toks` (T tokens) at the current position,
+// exposing per-position logits (vL[i]) and main hidden (vH[i]). Advances n_past+=T.
+void Runtime::Impl::decode_verify(const std::vector<int32_t> & toks) {
+    if (ecache) { decode_verify_cached(toks); return; }   // expert-offload mode
 
-    const auto & hp = model.hparams();
-    const int n_tokens = 2;
+    const int n_tokens = (int) toks.size();
     const int n_kv = n_past + n_tokens;
 
     ggml_init_params gp{};
@@ -963,10 +976,10 @@ void Runtime::Impl::decode_verify(int32_t a, int32_t b) {
     ggml_tensor * inp_tokens = ggml_graph_get_tensor(gf, "inp_tokens");
     ggml_tensor * inp_pos    = ggml_graph_get_tensor(gf, "inp_pos");
     ggml_tensor * inp_mask   = ggml_graph_get_tensor(gf, "inp_mask");
-    const int32_t toks[2] = { a, b };
-    ggml_backend_tensor_set(inp_tokens, toks, 0, 2 * sizeof(int32_t));
-    const int32_t pos[2] = { n_past, n_past + 1 };
-    ggml_backend_tensor_set(inp_pos, pos, 0, 2 * sizeof(int32_t));
+    ggml_backend_tensor_set(inp_tokens, toks.data(), 0, n_tokens * sizeof(int32_t));
+    std::vector<int32_t> pos(n_tokens);
+    for (int i = 0; i < n_tokens; ++i) pos[i] = n_past + i;
+    ggml_backend_tensor_set(inp_pos, pos.data(), 0, n_tokens * sizeof(int32_t));
     std::vector<ggml_fp16_t> mask((size_t) n_kv * n_tokens);
     const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
     for (int i = 0; i < n_tokens; ++i) {
@@ -979,28 +992,30 @@ void Runtime::Impl::decode_verify(int32_t a, int32_t b) {
         throw std::runtime_error("decode_verify: compute failed");
 
     ggml_tensor * lt = ggml_graph_get_tensor(gf, "logits");
+    ggml_tensor * h  = ggml_graph_get_tensor(gf, "main_hidden");
     const int n_vocab = (int) lt->ne[0];
-    vL1.resize(n_vocab); vL2.resize(n_vocab);
-    ggml_backend_tensor_get(lt, vL1.data(), 0,            n_vocab * sizeof(float));
-    ggml_backend_tensor_get(lt, vL2.data(), lt->nb[1],    n_vocab * sizeof(float));
-    ggml_tensor * h = ggml_graph_get_tensor(gf, "main_hidden");
-    const int n_embd = (int) h->ne[0];
-    vh1.resize(n_embd); vh2.resize(n_embd);
-    ggml_backend_tensor_get(h, vh1.data(), 0,          n_embd * sizeof(float));
-    ggml_backend_tensor_get(h, vh2.data(), h->nb[1],   n_embd * sizeof(float));
+    const int n_embd  = (int) h->ne[0];
+    vL.assign(n_tokens, std::vector<float>(n_vocab));
+    vH.assign(n_tokens, std::vector<float>(n_embd));
+    for (int i = 0; i < n_tokens; ++i) {
+        ggml_backend_tensor_get(lt, vL[i].data(), (size_t) i * lt->nb[1], n_vocab * sizeof(float));
+        ggml_backend_tensor_get(h,  vH[i].data(), (size_t) i * h->nb[1],  n_embd  * sizeof(float));
+    }
 
     n_past += n_tokens;
     ggml_free(ctx);
-    (void) hp;
 }
 
-// MTP self-speculative greedy decode: draft one token with the MTP block, verify
-// it with a single 2-token main forward, accept on match. ~1.x-2x fewer main
-// forwards depending on the draft acceptance rate.
-void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_new,
+// MTP self-speculative greedy decode. Drafts `n_draft` tokens by chaining the
+// single nextn block (each draft feeds the block's own hidden into the next),
+// verifies them with one (n_draft+1)-token main forward, and accepts the longest
+// matching prefix. n_draft=1 reduces exactly to the 2-token verify.
+void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                                  const std::function<bool(int32_t)> & on_token) {
     const auto & hp = model.hparams();
     const bool gdn = hp.has_gdn;
+    const int  K   = n_draft < 1 ? 1 : n_draft;
+    static const bool no_accept = getenv("QWEN_MTP_NOACCEPT") != nullptr;
     auto argmax = [](const std::vector<float> & v) {
         int b = 0; for (int i = 1; i < (int) v.size(); ++i) if (v[i] > v[b]) b = i; return b;
     };
@@ -1013,47 +1028,77 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
         if (i + 1 < P) mtp_draft(prompt[i + 1]);
     }
     int32_t x = argmax(mlog);            // first generated token
+    // invariant at loop top: n_past = pos(x), mtp_past = pos(x)-1, mtp_hidden = h_{pos(x)-1}
     int generated = 0;
-    int steps = 0, accepts = 0;
+    long steps = 0, draft_forwards = 0, accepted_drafts = 0;
 
     while (generated < max_new) {
         if (!on_token(x)) break;
         if (++generated >= max_new) break;
 
-        int32_t d = argmax(mtp_draft(x));              // MTP draft: token after x
+        const int p   = n_past;            // x lands at main position p
+        const int mp0 = mtp_past;          // = p-1
 
-        const int p1 = n_past;                         // position where x lands
+        // ---- draft K tokens by chaining the MTP block ----
+        std::vector<int32_t> drafts; drafts.reserve(K);
+        {
+            int32_t t = x;                 // first draft uses the true main hidden in mtp_hidden
+            for (int j = 0; j < K; ++j) {
+                int32_t dj = argmax(mtp_draft(t));   // writes MTP KV, advances mtp_past, sets mtp_block_hidden
+                drafts.push_back(dj);
+                ++draft_forwards;
+                if (j + 1 < K) { mtp_hidden = mtp_block_hidden; t = dj; }   // chain on the block hidden
+            }
+        }
+
+        // ---- verify [x, d_1..d_K] in one (K+1)-token main forward ----
+        std::vector<int32_t> vtoks; vtoks.reserve(K + 1);
+        vtoks.push_back(x);
+        for (int j = 0; j < K; ++j) vtoks.push_back(drafts[j]);
         if (gdn) backup_states();
-        decode_verify(x, d);                           // n_past += 2
-        const int32_t y = argmax(vL1);                 // main's true token after x
+        decode_verify(vtoks);              // fills vL[0..K], vH[0..K]; n_past += K+1
         ++steps;
 
-        static const bool no_accept = getenv("QWEN_MTP_NOACCEPT") != nullptr;
-        if (y == d && !no_accept) {
-            ++accepts;
-            // accept the draft: advance MTP one step (consume position p1) and continue
-            mtp_hidden = vh1;
-            mtp_draft(d);                              // catch-up MTP KV; draft discarded
-            mtp_hidden = vh2;
-            if (!on_token(d)) break;
-            if (++generated >= max_new) break;
-            x = argmax(vL2);
-        } else {
-            // reject: keep only x. roll back GDN state (advanced by 2) and re-run x.
-            if (gdn) {
-                restore_states();
-                n_past = p1;
-                decode({ x });                         // rewrites KV[p1], correct GDN state, mtp_hidden=h_{p1}
-            } else {
-                n_past = p1 + 1;                        // KV[p1] from verify is valid; drop KV[p1+1]
-                mtp_hidden = vh1;
-            }
-            x = y;
+        // ---- accept the longest matching draft prefix ----
+        int a = 0;
+        if (!no_accept) while (a < K && argmax(vL[a]) == drafts[a]) ++a;
+        accepted_drafts += a;
+        const int32_t x_new = argmax(vL[a]);   // correction (or bonus token if a==K)
+
+        bool stop = false;
+        for (int j = 0; j < a; ++j) {          // emit accepted drafts
+            if (!on_token(drafts[j])) { stop = true; break; }
+            if (++generated >= max_new) { stop = true; break; }
         }
+        if (stop) break;
+
+        // ---- settle main KV / recurrent state to the a+1 confirmed tokens ----
+        if (a == K) {
+            // full accept: the verify forward already left the correct state
+        } else if (gdn) {
+            restore_states();
+            n_past = p;
+            std::vector<int32_t> conf; conf.reserve(a + 1);
+            conf.push_back(x);
+            for (int j = 0; j < a; ++j) conf.push_back(drafts[j]);
+            decode(conf);                      // redo a+1 tokens for correct GDN state
+        } else {
+            n_past = p + a + 1;                // KV[p..p+a] from verify is valid; drop the rest
+        }
+
+        // ---- re-sync MTP KV for the confirmed tokens using the true main hiddens ----
+        mtp_past = mp0 + 1;                    // keep index p-1 (draft 1 used the true hidden)
+        for (int j = 0; j < a; ++j) {
+            mtp_hidden = vH[j];                // true h_{p+j}
+            mtp_draft(drafts[j]);              // rewrite MTP KV index p+j with the true hidden
+        }
+        mtp_hidden = vH[a];                    // h_{p+a}: draft context for x_new
+        x = x_new;
     }
     if (steps > 0)
-        fprintf(stderr, "[MTP: %d tokens, %d verify steps, %d accepted (%.0f%%), %.2f tok/forward]\n",
-                generated, steps, accepts, 100.0 * accepts / steps,
+        fprintf(stderr, "[MTP: %d tokens, %ld verify forwards, %ld/%ld drafts accepted (%.0f%%), %.2f tok/forward]\n",
+                generated, steps, accepted_drafts, draft_forwards,
+                draft_forwards ? 100.0 * accepted_drafts / draft_forwards : 0.0,
                 (double) generated / steps);
 }
 
@@ -1409,12 +1454,12 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_free(ctx);
     }
 
-    // MTP verify (T==2): expose per-position logits (vL1,vL2) and main hidden
-    // (vh1,vh2) so the caller can accept/reject the speculative draft.
+    // MTP verify: expose per-position logits (vL[i]) and main hidden (vH[i]) for
+    // all T tokens so the caller can accept the longest matching draft prefix.
     if (verify) {
-        vh1.resize(n_embd); vh2.resize(n_embd);
-        ggml_backend_tensor_get(h_b, vh1.data(), 0,                              n_embd * sizeof(float));
-        ggml_backend_tensor_get(h_b, vh2.data(), (size_t) (T - 1) * n_embd * sizeof(float), n_embd * sizeof(float));
+        vH.assign(T, std::vector<float>(n_embd));
+        for (int i = 0; i < T; ++i)
+            ggml_backend_tensor_get(h_b, vH[i].data(), (size_t) i * n_embd * sizeof(float), n_embd * sizeof(float));
 
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
@@ -1429,9 +1474,9 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("decode_cached_batch: verify output compute failed");
         const int n_vocab = (int) cur->ne[0];
-        vL1.resize(n_vocab); vL2.resize(n_vocab);
-        ggml_backend_tensor_get(cur, vL1.data(), 0,            n_vocab * sizeof(float));
-        ggml_backend_tensor_get(cur, vL2.data(), cur->nb[1],   n_vocab * sizeof(float));
+        vL.assign(T, std::vector<float>(n_vocab));
+        for (int i = 0; i < T; ++i)
+            ggml_backend_tensor_get(cur, vL[i].data(), (size_t) i * cur->nb[1], n_vocab * sizeof(float));
         ggml_free(ctx);
     }
 
@@ -1901,9 +1946,9 @@ const std::vector<float> & Runtime::decode(const std::vector<int32_t> & tokens) 
 }
 const std::vector<float> & Runtime::mtp_draft(int32_t token) { return impl_->mtp_draft(token); }
 bool Runtime::has_mtp() const { return impl_->model.hparams().has_mtp(); }
-void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new,
+void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                            const std::function<bool(int32_t)> & on_token) {
-    impl_->generate_mtp(prompt, max_new, on_token);
+    impl_->generate_mtp(prompt, max_new, n_draft, on_token);
 }
 void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->zero_states(); }
 int  Runtime::n_past() const { return impl_->n_past; }
