@@ -119,6 +119,27 @@ MoE FFN は `build_moe`）を使う。これで draft の SSD fetch とグラフ
 メインスタック同様にオフロードする（`8a24f4f`）。これで非 MTP 実行時の VRAM 浪費を回避。
 （35B SSD, budget 15000: 非 --mtp でメインキャッシュ常駐 54%→56%。）
 
+### 3.4 メモリ階層別まとめ（MTP の損得は階層で決まる）
+
+experts の置き場所を変えて、MTP vs plain を横並びにしたもの。
+
+| モデル / 階層 | MTP | plain | MTP/plain |
+|---|---|---|---|
+| 35B-A3B-MTP, **SSD**（`--experts-ssd`, 54%常駐） | 7.0–7.7 tok/s | 8.8–9.0 | **約15%遅い** |
+| 35B-A3B-MTP, **RAM**（`--vram-budget` のみ, 54%常駐） | 9.5–10.1 tok/s | 10.9–11.5 | **約12%遅い** |
+| 27B-MTP (dense), **全量 VRAM 常駐** | 12.1–13.7 tok/s | 10.3–11.8 | **+16%速い** |
+
+観察:
+- **RAM 退避は SSD より全体が速い**（plain 9→11.5、MTP 7→10）。RAM 帯域が SSD より広いため。
+- しかし **MTP/plain の比はほぼ変わらない**（SSD 15% → RAM 12% 遅い）。MTP も plain も
+  同じく fetch 速度の恩恵を受けるので、MTP の不利（verify が2位置分の expert を fetch）は
+  相殺されない。**offload である限り（RAM/SSD 問わず）fetch 律速で MTP は負ける**。
+- MTP が勝つのは **全量 VRAM 常駐＝計算律速**のときだけ（27B）。
+
+> 注意: 35B を RAM 退避すると 19GB の experts を pinned（page-locked）メモリに確保できず
+> （ホストのロック可能メモリ上限）、pageable メモリ経由の H2D になる。pin できれば RAM 退避は
+> さらに速くなり得るが、MTP/plain の比は同様と見込まれる。
+
 ---
 
 ## 4. なぜ offload では遅いのか（重要な教訓）
@@ -173,9 +194,9 @@ QWEN_MTP_NOACCEPT=1 infer -m model-MTP.gguf -p "..." -n 64 --mtp
 - **損得はメモリ階層で決まる**:
   - **計算律速（モデルが全量 VRAM 常駐）** → MTP は速い。
     27B dense を全 VRAM で **+16%（10–12 → 12–14 tok/s）**。
-  - **SSD フェッチ律速（experts オフロード）** → MTP は遅い。35B offload で
-    plain の ~15%（nextn VRAM 常駐後）〜2倍（旧）遅い。verify の 2 位置 expert
-    fetch が支配項で、これは自己推測の構造上消せない。
+  - **フェッチ律速（experts オフロード）** → MTP は遅い。35B offload で plain より
+    SSD で約15%・RAM で約12%遅い（RAM 退避でも比はほぼ不変）。verify の 2 位置
+    expert fetch が支配項で、これは自己推測の構造上消せない。
 - 付随する最適化:
   - nextn ブロックを VRAM 常駐（`d40ec74`）— offload 時の draft オーバーヘッド削減。
   - 非 MTP 時は nextn もオフロード（`8a24f4f`）— VRAM 浪費の回避。
