@@ -131,19 +131,29 @@ ExpertCache に fetch 計測を追加（`expert cache fetch:` 行）。
 - 仕組み: 1層内の複数ミスコピーが host のキャッシュ簿記とパイプライン化され、
   per-copy の host ブロッキングが消える。`QWEN_SYNC_FETCH=1` で旧 sync に戻せる。
 
-### STEP3 fused graph = decode_cached_fast（**不採用**: partial residency で逆に遅い）
-- `QWEN_FASTCACHE` で実測: **9.2 tok/s（default 12.3 より遅い）**。出力は一致。
-- 理由: 楽観的単一グラフ → 残差検証 → **ミス時に decode_cached へ全フォールバック**。
-  hit82% でもレイヤ単位でほぼ毎トークン1ミスは起き、二度手間になる。
-- near-100% 常駐（＝モデルがほぼ VRAM に乗る）でのみ有効。35B/16GB では到達不可。
+### STEP3 fused graph
+**3a. 完全融合 = decode_cached_fast（不採用）**
+- `QWEN_FASTCACHE` 実測: 10.7 tok/s（default 14.8 より遅い、pin+async 後でも）。出力一致。
+- 理由: 単一グラフはルーティングをグラフ内で行うため **ミス expert をグラフ実行中に
+  fetch できない**。「楽観実行→1ミスでも decode_cached 全再計算」になり、hit82% では
+  ほぼ毎トークン全フォールバック＝純損。near-100% 常駐でしか成立しない（35B/16GB 不可）。
+
+**3b. 隣接セグ融合（実装済み・採用, commit 2c843a5）**
+- 完全融合の代わりに、host sync を挟まない **segB(L)+segA(L+1) を1グラフに融合**。
+  per-token の GPU サブミットを ~2*n_layer+2 → ~n_layer+3 に半減（fetch モデルは不変）。
+- carry テンソル（ffn_in/resid/weights）を **層パリティでダブルバッファ**化して
+  融合グラフ内の write-after-read ハザードを回避（segB は carry[L%2] 読み、
+  segA は carry[(L+1)%2] 書き）。p_h は単一（segB 書き→segA 読みの真の依存で順序OK）。
+- 効果: A/B 同条件で **17.3 → 18.9 tok/s（約+9%）**。出力一致（lossless）、
+  qwen3moe(非GDN/SSD) / qwen35moe(GDN/RAM) / MTP すべて検証。
 
 ### 総括
 - **計画の前提（fetch がボトルネック）は正しい**。RAM offload で fetch ≈ 43%。
-- **STEP1（チャンク pin + 直接 H2D）→ STEP2（async H2D）で
-  RAM offload decode 11.0 → ~17.5 tok/s（+59%）**。出力は全段でロスレス。
+- **STEP1（チャンク pin + 直接 H2D）→ STEP2（async H2D）→ STEP3b（隣接セグ融合）で
+  RAM offload decode 11.0 → ~19 tok/s（+~70%）**。出力は全段でロスレス。
   - 「pin できない」の真因は容量でなく単一確保上限（≈15.5GB）→ チャンク分割で解決。
   - async は ggml の同一 stream 順序を使い、専用 stream/event 無しで実現。
-- STEP3（fused graph）は partial residency で逆効果のため不採用。
+  - 完全融合（STEP3a）は partial residency で逆効果のため不採用。サブミット半減（3b）を採用。
 - さらに効きそうな方向:
   1) ミス**回数**削減（calibrated preload=`--cache-profile`、常駐率↑）。
   2) per-layer のミスを 1回の大きな転送にまとめる（slot 連続化が要る）。
