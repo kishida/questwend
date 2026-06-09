@@ -181,8 +181,10 @@ struct Runtime::Impl {
     ggml_tensor * build_mtp(ggml_context * ctx, ggml_cgraph * gf,
                             ggml_tensor * h, ggml_tensor * tok, ggml_tensor * pos, ggml_tensor * mask);
     const std::vector<float> & mtp_draft(int32_t token);
+    const std::vector<float> & mtp_draft_cached(int32_t token);  // offload (segmented MoE MTP block)
     void capture_main_hidden(ggml_cgraph * gf, int col);
     void decode_verify(int32_t a, int32_t b);       // 2-token forward -> vL1/vL2/vh1/vh2
+    void decode_verify_cached(int32_t a, int32_t b);// offload variant (via decode_cached_batch)
     void generate_mtp(const std::vector<int32_t> & prompt, int max_new,
                       const std::function<bool(int32_t)> & on_token);
 
@@ -201,7 +203,8 @@ struct Runtime::Impl {
     const std::vector<float> & decode_cached(int32_t token);
     // Batched prefill over the cache: process up to a pool-sized chunk of tokens
     // in one segmented forward (instead of token-by-token).
-    void decode_cached_batch(const int32_t * toks, int n_tokens, bool want_logits);
+    void decode_cached_batch(const int32_t * toks, int n_tokens, bool want_logits,
+                             bool verify = false);
 };
 
 void Runtime::Impl::init() {
@@ -839,6 +842,10 @@ ggml_tensor * Runtime::Impl::build_mtp(ggml_context * ctx, ggml_cgraph * gf,
 
 // Run the MTP block once: draft the token after `token`, advancing MTP KV.
 const std::vector<float> & Runtime::Impl::mtp_draft(int32_t token) {
+    // Expert-offload mode: the MTP block is MoE with its experts on the SSD/CPU
+    // tier, so run it segmented through the VRAM expert cache (like decode_cached).
+    if (ecache) return mtp_draft_cached(token);
+
     const auto & hp = model.hparams();
     const int n_embd = hp.n_embd;
     const int n_kv   = mtp_past + 1;
@@ -879,9 +886,160 @@ const std::vector<float> & Runtime::Impl::mtp_draft(int32_t token) {
     return mtp_logits;
 }
 
+// Offload MTP draft: the nextn block is MoE with its experts on the SSD/CPU tier,
+// so run it segmented through the VRAM expert cache (mirrors decode_cached):
+//   seg 0: eh_proj(concat(enorm(emb(tok)), hnorm(h)))         -> p_h
+//   seg A: gated attention(L) + router(L)                     -> p_ffn_in/p_resid/selected
+//   host:  ensure the selected experts of block L resident
+//   seg B: cached MoE matmul + residual + shared head + lm    -> mtp_logits
+const std::vector<float> & Runtime::Impl::mtp_draft_cached(int32_t token) {
+    const auto & hp = model.hparams();
+    const int L           = (int) hp.n_main();   // MTP block index
+    const int n_embd      = hp.n_embd;
+    const int n_head      = hp.n_head;
+    const int n_head_kv   = hp.n_head_kv;
+    const int n_embd_head = hp.n_embd_head;
+    const int n_used      = hp.n_expert_used;
+    const float eps       = hp.rms_eps;
+    const int n_kv        = mtp_past + 1;
+
+    auto new_ctx = [&]() {
+        ggml_init_params gp{};
+        gp.mem_size = ggml_tensor_overhead() * GRAPH_SIZE + ggml_graph_overhead_custom(GRAPH_SIZE, false);
+        gp.no_alloc = true;
+        return ggml_init(gp);
+    };
+    auto run = [&](ggml_context * ctx, ggml_cgraph * gf) {
+        (void) ctx;
+        if (!ggml_gallocr_alloc_graph(cache_galloc, gf))
+            throw std::runtime_error("mtp_draft_cached: gallocr alloc failed");
+    };
+
+    // ---- seg 0: eh_proj( concat( enorm(emb(tok)), hnorm(h) ) ) -> p_h ----
+    {
+        ggml_context * ctx = new_ctx();
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+        ggml_tensor * h_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd); ggml_set_input(h_in);
+        ggml_tensor * t_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);      ggml_set_input(t_in);
+        ggml_tensor * emb = ggml_get_rows(ctx, model.tok_embd_rows(), t_in);          // [n_embd,1]
+        ggml_tensor * e   = ggml_mul(ctx, ggml_rms_norm(ctx, emb, eps), W("blk.%d.nextn.enorm.weight", L));
+        ggml_tensor * h2  = ggml_reshape_2d(ctx, h_in, n_embd, 1);
+        ggml_tensor * hn  = ggml_mul(ctx, ggml_rms_norm(ctx, h2, eps), W("blk.%d.nextn.hnorm.weight", L));
+        ggml_tensor * combined = ggml_concat(ctx, e, hn, 0);                          // [2*n_embd,1]
+        ggml_tensor * cur = ggml_mul_mat(ctx, W("blk.%d.nextn.eh_proj.weight", L), combined);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, cur, n_embd), p_h));
+        run(ctx, gf);
+        ggml_backend_tensor_set(h_in, mtp_hidden.data(), 0, n_embd * sizeof(float));
+        ggml_backend_tensor_set(t_in, &token, 0, sizeof(int32_t));
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("mtp_draft_cached: seg0 compute failed");
+        ggml_free(ctx);
+    }
+
+    std::vector<int32_t> sel(n_used), slot_g(n_used), slot_u(n_used), slot_d(n_used);
+
+    // ---- seg A: gated attention(L) + router(L) ----
+    {
+        ggml_context * ctx = new_ctx();
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+        ggml_tensor * inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);  ggml_set_input(inp_pos);
+        ggml_tensor * inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, 1); ggml_set_input(inp_mask);
+
+        ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, p_h, eps), W("blk.%d.attn_norm.weight", L));
+
+        ggml_tensor * Qf = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", L), cur);
+        const size_t es = ggml_element_size(Qf);
+        ggml_tensor * Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head, 1,
+                es * n_embd_head * 2, es * n_embd_head * 2 * n_head, 0);
+        ggml_tensor * gate_t = ggml_view_3d(ctx, Qf, n_embd_head, n_head, 1,
+                es * n_embd_head * 2, es * n_embd_head * 2 * n_head, es * n_embd_head);
+        gate_t = ggml_cont_2d(ctx, gate_t, n_embd_head * n_head, 1);
+        ggml_tensor * K = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", L), cur), n_embd_head, n_head_kv, 1);
+        ggml_tensor * V = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", L), cur), n_embd_head, n_head_kv, 1);
+        Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", L));
+        K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", L));
+        Q = ggml_rope_ext(ctx, Q, inp_pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX, 0, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        K = ggml_rope_ext(ctx, K, inp_pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX, 0, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        const int saved = n_past;
+        n_past = mtp_past;                 // build_attn writes MTP KV[L] at this position
+        ggml_tensor * att = build_attn(ctx, gf, L, Q, K, V, inp_mask, 1, n_kv);
+        n_past = saved;
+        att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
+        cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", L), att);
+
+        ggml_tensor * attn_resid = ggml_add(ctx, cur, p_h);
+        ggml_tensor * ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", L));
+
+        ggml_tensor * weights = nullptr;
+        ggml_tensor * selected = build_router(ctx, gf, L, ffn_in, weights);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, p_ffn_in));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, p_resid));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, weights, n_used), p_weights));
+
+        run(ctx, gf);
+        int32_t pos = mtp_past;
+        ggml_backend_tensor_set(inp_pos, &pos, 0, sizeof(int32_t));
+        std::vector<ggml_fp16_t> mask(n_kv, ggml_fp32_to_fp16(0.0f));   // all past positions visible
+        ggml_backend_tensor_set(inp_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("mtp_draft_cached: seg A compute failed");
+        ggml_backend_tensor_get(selected, sel.data(), 0, n_used * sizeof(int32_t));
+        ggml_free(ctx);
+    }
+
+    // ---- host: make block L's selected experts resident ----
+    ecache->ensure(L, sel.data(), n_used, slot_g.data(), slot_u.data(), slot_d.data());
+    ggml_backend_tensor_set(p_slot_g, slot_g.data(), 0, n_used * sizeof(int32_t));
+    ggml_backend_tensor_set(p_slot_u, slot_u.data(), 0, n_used * sizeof(int32_t));
+    ggml_backend_tensor_set(p_slot_d, slot_d.data(), 0, n_used * sizeof(int32_t));
+
+    // ---- seg B: cached MoE + residual + shared head -> mtp_logits ----
+    {
+        ggml_context * ctx = new_ctx();
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+        ggml_tensor * moe_out = build_moe_cached(ctx, gf, L, p_ffn_in,
+                                                 p_slot_g, p_slot_u, p_slot_d, p_weights);
+        ggml_tensor * cur = ggml_add(ctx, moe_out, p_resid);
+        ggml_tensor * fin = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W("blk.%d.nextn.shared_head_norm.weight", L));
+        ggml_tensor * lm = model.tensor("output.weight");
+        if (!lm) lm = model.tensor("token_embd.weight");
+        ggml_tensor * logits_t = ggml_mul_mat(ctx, lm, fin);
+        ggml_set_name(logits_t, "mtp_logits");
+        ggml_build_forward_expand(gf, logits_t);
+        run(ctx, gf);
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("mtp_draft_cached: seg B compute failed");
+        const int n_vocab = (int) logits_t->ne[0];
+        mtp_logits.resize(n_vocab);
+        ggml_backend_tensor_get(logits_t, mtp_logits.data(), 0, n_vocab * sizeof(float));
+        ggml_free(ctx);
+    }
+
+    mtp_past += 1;
+    return mtp_logits;
+}
+
+// Offload verify: run the 2-token main forward through the VRAM expert cache.
+// Uses the batched cache path when the pools can hold both tokens' experts at
+// once; otherwise falls back to two single-token decodes (still correct, just
+// no shared-fetch amortization).
+void Runtime::Impl::decode_verify_cached(int32_t a, int32_t b) {
+    const int n_used = model.hparams().n_expert_used;
+    if (ecache->min_slots() >= 2 * n_used) {
+        const int32_t toks[2] = { a, b };
+        decode_cached_batch(toks, 2, /*want_logits=*/false, /*verify=*/true);
+    } else {
+        vL1 = decode_cached(a); vh1 = mtp_hidden;
+        vL2 = decode_cached(b); vh2 = mtp_hidden;
+    }
+}
+
 // Verify forward: run the main model on two tokens [a,b] at the current position,
 // exposing per-position logits (vL1,vL2) and hidden (vh1,vh2). Advances n_past+=2.
 void Runtime::Impl::decode_verify(int32_t a, int32_t b) {
+    if (ecache) { decode_verify_cached(a, b); return; }   // expert-offload mode
+
     const auto & hp = model.hparams();
     const int n_tokens = 2;
     const int n_kv = n_past + n_tokens;
@@ -1119,7 +1277,8 @@ ggml_tensor * Runtime::Impl::build_moe_cached(ggml_context * ctx, ggml_cgraph * 
 //  -> seg B expert matmuls for all tokens). Far fewer graph dispatches than the
 // token-by-token path. n_tokens is bounded so a layer's distinct experts fit the
 // pool. Only the last token's logits are produced (when want_logits).
-void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool want_logits) {
+void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool want_logits,
+                                        bool verify) {
     const auto & hp = model.hparams();
     const int n_embd      = hp.n_embd;
     const int n_exp       = hp.n_expert;
@@ -1342,6 +1501,32 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_free(ctx);
     }
 
+    // MTP verify (T==2): expose per-position logits (vL1,vL2) and main hidden
+    // (vh1,vh2) so the caller can accept/reject the speculative draft.
+    if (verify) {
+        vh1.resize(n_embd); vh2.resize(n_embd);
+        ggml_backend_tensor_get(h_b, vh1.data(), 0,                              n_embd * sizeof(float));
+        ggml_backend_tensor_get(h_b, vh2.data(), (size_t) (T - 1) * n_embd * sizeof(float), n_embd * sizeof(float));
+
+        ggml_context * ctx = new_ctx();
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+        ggml_tensor * cur = ggml_rms_norm(ctx, h_b, eps);                        // [n_embd, T]
+        cur = ggml_mul(ctx, cur, model.tensor("output_norm.weight"));
+        ggml_tensor * output_w = model.tensor("output.weight");
+        if (!output_w) output_w = model.tensor("token_embd.weight");
+        cur = ggml_mul_mat(ctx, output_w, cur);                                 // [n_vocab, T]
+        ggml_set_name(cur, "vlogits");
+        ggml_build_forward_expand(gf, cur);
+        run(ctx, gf);
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("decode_cached_batch: verify output compute failed");
+        const int n_vocab = (int) cur->ne[0];
+        vL1.resize(n_vocab); vL2.resize(n_vocab);
+        ggml_backend_tensor_get(cur, vL1.data(), 0,            n_vocab * sizeof(float));
+        ggml_backend_tensor_get(cur, vL2.data(), cur->nb[1],   n_vocab * sizeof(float));
+        ggml_free(ctx);
+    }
+
     ggml_backend_buffer_free(tbuf);
     ggml_free(tctx);
     n_past += T;
@@ -1512,6 +1697,12 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token) {
         logits.resize(n_vocab);
         ggml_backend_tensor_get(cur, logits.data(), 0, n_vocab * sizeof(float));
         ggml_free(ctx);
+    }
+
+    // MTP: expose this token's main hidden (pre-output-norm) for the nextn block.
+    if (capture_hidden) {
+        mtp_hidden.resize(n_embd);
+        ggml_backend_tensor_get(p_h, mtp_hidden.data(), 0, n_embd * sizeof(float));
     }
 
     n_past += 1;
