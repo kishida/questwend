@@ -107,18 +107,24 @@ ExpertCache に fetch 計測を追加（`expert cache fetch:` 行）。
 - 内訳: ミス約10500回 × 小スラブ(~0.6MB) の **同期 cudaMemcpy**。→ 帯域でなく
   **レイテンシ/呼び出しオーバーヘッド律速**だった（1 fetch ≈ 0.2ms）。
 
-### STEP1 pinned host staging（実装済み・採用, commit b912c98）
-- 全 experts(19GB) の pin は **このホストでは確保失敗**（実測）。→ 計画の gotcha どおり
-  **staging だけ pinned**（1スラブ分の有界 pinned buffer）に変更。`stage_host()`。
-- 効果: fetch 2703→2217ms、**11.0→12.3 tok/s（約+11%）**、出力不変。安全。
-- ただし帯域は 2.3→2.8 GB/s 止まり（依然レイテンシ律速。ソースが pageable で
-  CPU→pinned の bounce memcpy が残る）。
+### STEP1 pinned（実装済み・採用）— 2段で完成
+**1a. pinned staging（commit b912c98）**: 1スラブ分の有界 pinned buffer 経由に変更
+（`stage_host()`）。fetch 2703→2217ms、11.0→12.3 tok/s（+11%）。ただし帯域 2.8GB/s
+止まり（ソースが pageable のまま、bounce memcpy 残）。
 
-### STEP2 async copy stream（**保留**: このホストでは原理的にブロック）
-- cudaMemcpyAsync の真の非同期は **ソースが pinned 前提**。19GB の expert 本体を
-  pin できない以上、pageable ソースからの async は同期 fallback して効かない。
-- 効かせるには「pinned ring 経由の二段コピー」or「experts を pin 可能サイズに収める」
-  が必要。費用対効果が読めず、深い CUDA stream/event 手術（ggml 抽象の外）になるため保留。
+**1b. pin失敗の真因究明＋チャンク pin（commit df12418）**:
+- probe（cudaHostAlloc）の結果: **単一確保の上限 ≈ 15.5GB**。チャンク（512MB〜2GB）なら
+  19GB 到達。→ **容量(64GB/36GB空き)ではなく「1個の巨大 page-locked 確保」の上限**が原因。
+- `load_weights_split` を **expert を複数 host buffer（各≤8GB）に分割確保**へ変更
+  → 全19GB を確実に pin（"in 3 pinned chunk(s)"、pin失敗警告も消滅）。
+- ソースが pinned になったので fetch を **ソースから直接 H2D（bounce 省略）** に。
+- 効果: **fetch 2703→1324ms（51%減）、2.3→4.7 GB/s（2倍）、
+  decode 11.0→~14 tok/s（plain）/ 9.5→13.2 tok/s（MTP）**。出力不変。
+
+### STEP2 async copy stream（**解禁**: pinned ソースが揃った → 次の候補）
+- 1b で expert 本体が全 pinned になったため cudaMemcpyAsync の前提が満たされた。
+- 残課題はレイテンシ（多数の小同期コピー）。専用 copy stream + event で seg A→B の
+  ミス fetch を計算とオーバーラップすれば更に改善余地（ggml 抽象の外で CUDA 直叩きが要る）。
 
 ### STEP3 fused graph = decode_cached_fast（**不採用**: partial residency で逆に遅い）
 - `QWEN_FASTCACHE` で実測: **9.2 tok/s（default 12.3 より遅い）**。出力は一致。
@@ -127,11 +133,11 @@ ExpertCache に fetch 計測を追加（`expert cache fetch:` 行）。
 - near-100% 常駐（＝モデルがほぼ VRAM に乗る）でのみ有効。35B/16GB では到達不可。
 
 ### 総括
-- **計画の前提（fetch がボトルネック）は正しい**。ただしこのホット経路は
-  **帯域でなくレイテンシ律速**（多数の小さい同期コピー）。
-- 安全に効いたのは STEP1（pinned staging, +11%）のみ。STEP2 は pin 不可で原理的に阻まれ、
-  STEP3 は partial residency で逆効果。
-- 次に効きそうな方向（要・別途検討）:
-  1) ミス**回数**の削減（calibrated preload=`--cache-profile`、常駐率↑）。
-  2) per-layer のミスを **1回の大きな転送にまとめる**（slot 配置の連続化が要る）。
-  3) experts が pin 可能サイズに収まる構成（量子化↓ / 小モデル）でのみ STEP2/3 が活きる。
+- **計画の前提（fetch がボトルネック）は正しい**。RAM offload で fetch ≈ 43%。
+- **STEP1 完成（チャンク pin + 直接 H2D）で RAM offload decode 11→~14 tok/s（+25%）**。
+  「pin できない」の真因は容量でなく単一確保上限（≈15.5GB）で、チャンク分割で解決。
+- STEP3（fused graph）は partial residency で逆効果のため不採用。
+- 次に効きそうな方向:
+  1) **STEP2 async overlap**（pinned ソースが揃い解禁。copy stream + event）。
+  2) ミス**回数**削減（calibrated preload=`--cache-profile`、常駐率↑）。
+  3) per-layer のミスを 1回の大きな転送にまとめる（slot 連続化が要る）。
