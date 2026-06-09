@@ -52,9 +52,15 @@ struct Runtime::Impl {
     ggml_context *        cctx       = nullptr;
     ggml_backend_buffer_t cbuf       = nullptr;
     ggml_tensor *         p_h        = nullptr;  // [n_embd]   hidden state across layers
+    // Carry tensors are double-buffered (parity by layer) so that a fused
+    // segB(L)+segA(L+1) graph has no write-after-read hazard: segB(L) reads
+    // carry[L%2] while segA(L+1) writes carry[(L+1)%2].
     ggml_tensor *         p_ffn_in   = nullptr;  // [n_embd]   normed FFN input (seg A -> B)
     ggml_tensor *         p_resid    = nullptr;  // [n_embd]   FFN residual base (seg A -> B)
     ggml_tensor *         p_weights  = nullptr;  // [n_used]   normalized expert weights
+    ggml_tensor *         p_ffn_in2  = nullptr;
+    ggml_tensor *         p_resid2   = nullptr;
+    ggml_tensor *         p_weights2 = nullptr;
     ggml_tensor *         p_slot_g   = nullptr;  // [n_used]   gate slot ids (host -> GPU)
     ggml_tensor *         p_slot_u   = nullptr;  // [n_used]   up   slot ids
     ggml_tensor *         p_slot_d   = nullptr;  // [n_used]   down slot ids
@@ -370,13 +376,16 @@ void Runtime::Impl::init_cache() {
     // persistent carry tensors (bridge per-layer graph segments) + fast-path
     // in-graph remap table (g2s_all) and selection readback (sel_all).
     ggml_init_params cp{};
-    cp.mem_size = ggml_tensor_overhead() * 12 + 256;
+    cp.mem_size = ggml_tensor_overhead() * 16 + 256;
     cp.no_alloc = true;
     cctx = ggml_init(cp);
     p_h       = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
     p_ffn_in  = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
     p_resid   = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
     p_weights = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_used);
+    p_ffn_in2 = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
+    p_resid2  = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
+    p_weights2= ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_used);
     p_slot_g  = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, 1);
     p_slot_u  = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, 1);
     p_slot_d  = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, 1);
@@ -386,6 +395,9 @@ void Runtime::Impl::init_cache() {
     ggml_set_name(p_ffn_in, "carry.ffn_in");
     ggml_set_name(p_resid, "carry.resid");
     ggml_set_name(p_weights, "carry.weights");
+    ggml_set_name(p_ffn_in2, "carry.ffn_in2");
+    ggml_set_name(p_resid2, "carry.resid2");
+    ggml_set_name(p_weights2, "carry.weights2");
     ggml_set_name(p_slot_g, "carry.slot_g");
     ggml_set_name(p_slot_u, "carry.slot_u");
     ggml_set_name(p_slot_d, "carry.slot_d");
@@ -1464,13 +1476,17 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token) {
 
     std::vector<int32_t> sel(n_used), slot_g(n_used), slot_u(n_used), slot_d(n_used);
 
-    for (int il = 0; il < (int) hp.n_main(); ++il) {
+    // Double-buffered carry tensors (parity by layer) so a fused segB(L)+segA(L+1)
+    // graph has no write-after-read hazard on the carry buffers.
+    ggml_tensor * carry_ffn[2] = { p_ffn_in, p_ffn_in2 };
+    ggml_tensor * carry_res[2] = { p_resid,  p_resid2  };
+    ggml_tensor * carry_wgt[2] = { p_weights, p_weights2 };
+
+    // Append seg A (attention/GDN + router) for layer `il` to (ctx,gf). Writes the
+    // normed FFN input / residual / router weights into the layer's parity carry,
+    // and exposes `selected` (router top-k) for host readback. Returns selected.
+    auto build_segA = [&](ggml_context * ctx, ggml_cgraph * gf, int il) -> ggml_tensor * {
         const bool recurrent = hp.is_recurrent(il);
-
-        // ================= seg A: attention/GDN + router =================
-        ggml_context * ctx = new_ctx();
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-
         ggml_tensor * inp_pos = nullptr, * inp_mask = nullptr;
         if (!recurrent) {
             inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
@@ -1478,10 +1494,8 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token) {
             inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, 1);
             ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
         }
-
         ggml_tensor * cur = ggml_rms_norm(ctx, p_h, eps);
         cur = ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il));
-
         if (recurrent) {
             cur = build_gdn(ctx, gf, il, cur, 1);
         } else {
@@ -1516,51 +1530,71 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token) {
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
         }
-
-        ggml_tensor * attn_resid = ggml_add(ctx, cur, p_h);            // [n_embd,1]
+        ggml_tensor * attn_resid = ggml_add(ctx, cur, p_h);
         ggml_tensor * ffn_in;
         if (gated) ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", il));
         else       ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il));
-
         ggml_tensor * weights = nullptr;
         ggml_tensor * selected = build_router(ctx, gf, il, ffn_in, weights);
-
-        // persist seg-A outputs needed by seg B (F32 cpy is GPU-supported)
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, p_ffn_in));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, p_resid));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, weights, n_used), p_weights));
-
-        run(ctx, gf);
-        if (!recurrent) {
-            int32_t pos = n_past;
-            ggml_backend_tensor_set(inp_pos, &pos, 0, sizeof(int32_t));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, carry_ffn[il & 1]));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, carry_res[il & 1]));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, weights, n_used), carry_wgt[il & 1]));
+        return selected;
+    };
+    // Append seg B (cached expert matmul + residual) for layer `il`; writes p_h.
+    auto build_segB = [&](ggml_context * ctx, ggml_cgraph * gf, int il) {
+        ggml_tensor * moe_out = build_moe_cached(ctx, gf, il, carry_ffn[il & 1],
+                                                 p_slot_g, p_slot_u, p_slot_d, carry_wgt[il & 1]);
+        ggml_tensor * h_new = ggml_add(ctx, moe_out, carry_res[il & 1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, h_new, n_embd), p_h));
+    };
+    // Set the attention pos/mask inputs of a graph (no-op if it has none, e.g. a
+    // segB-only graph or a GDN-only seg A).
+    auto set_attn_inputs = [&](ggml_cgraph * gf) {
+        if (ggml_tensor * ip = ggml_graph_get_tensor(gf, "inp_pos")) {
+            int32_t pos = n_past; ggml_backend_tensor_set(ip, &pos, 0, sizeof(int32_t));
+        }
+        if (ggml_tensor * im = ggml_graph_get_tensor(gf, "inp_mask")) {
             std::vector<ggml_fp16_t> mask(n_kv);
             const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
             for (int j = 0; j < n_kv; ++j) mask[j] = (j <= n_past) ? z : ninf;
-            ggml_backend_tensor_set(inp_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+            ggml_backend_tensor_set(im, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
         }
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
-            throw std::runtime_error("decode_cached: seg A compute failed");
-
+    };
+    // Read back layer `il`'s router selection and make those experts resident.
+    auto ensure_layer = [&](ggml_tensor * selected, int il) {
         ggml_backend_tensor_get(selected, sel.data(), 0, n_used * sizeof(int32_t));
-        ggml_free(ctx);
-
-        // ================= host: make experts resident =================
         ecache->ensure(il, sel.data(), n_used, slot_g.data(), slot_u.data(), slot_d.data());
         ggml_backend_tensor_set(p_slot_g, slot_g.data(), 0, n_used * sizeof(int32_t));
         ggml_backend_tensor_set(p_slot_u, slot_u.data(), 0, n_used * sizeof(int32_t));
         ggml_backend_tensor_set(p_slot_d, slot_d.data(), 0, n_used * sizeof(int32_t));
+    };
 
-        // ================= seg B: expert matmul + residual =================
-        ctx = new_ctx();
-        gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-        ggml_tensor * moe_out = build_moe_cached(ctx, gf, il, p_ffn_in,
-                                                 p_slot_g, p_slot_u, p_slot_d, p_weights);
-        ggml_tensor * h_new = ggml_add(ctx, moe_out, p_resid);        // [n_embd,1]
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, h_new, n_embd), p_h));
+    const int N = (int) hp.n_main();
+
+    // seg A(0) on its own, then fuse segB(L)+segA(L+1) per step so each layer
+    // boundary is a single GPU submit instead of two (~halves the dispatches).
+    {
+        ggml_context * ctx = new_ctx();
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+        ggml_tensor * selected = build_segA(ctx, gf, 0);
         run(ctx, gf);
+        set_attn_inputs(gf);
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
-            throw std::runtime_error("decode_cached: seg B compute failed");
+            throw std::runtime_error("decode_cached: seg A0 compute failed");
+        ensure_layer(selected, 0);
+        ggml_free(ctx);
+    }
+    for (int il = 0; il < N; ++il) {
+        ggml_context * ctx = new_ctx();
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+        build_segB(ctx, gf, il);
+        ggml_tensor * nsel = (il + 1 < N) ? build_segA(ctx, gf, il + 1) : nullptr;
+        run(ctx, gf);
+        set_attn_inputs(gf);
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("decode_cached: fused segB/segA compute failed");
+        if (nsel) ensure_layer(nsel, il + 1);
         ggml_free(ctx);
     }
 
