@@ -147,10 +147,23 @@ ExpertCache に fetch 計測を追加（`expert cache fetch:` 行）。
 - 効果: A/B 同条件で **17.3 → 18.9 tok/s（約+9%）**。出力一致（lossless）、
   qwen3moe(非GDN/SSD) / qwen35moe(GDN/RAM) / MTP すべて検証。
 
+### STEP①相当: cache-profile プリロード（実装済み・計測）
+- `--cache-profile <f>` は1回目に頻度プロファイルを保存、2回目以降は起動時に
+  ホット expert をプール容量まで事前常駐（`load_prefetch`）。
+- 計測（n=96, 同一プロンプト, クリーンな交互 A/B）:
+  **無: 18.3–19.9 tok/s / 84% hit → 有: 25.4–26.5 tok/s / 100% hit（0 miss）= +33%**。
+  100% hit ＝ ストリーミングゼロ ＝ 計算律速に到達。
+- **汎化する**: 別トピックのプロンプトでも hit 86%→95–100%（ホット expert 集合は
+  プロンプト間で安定）。warm restart / 安定ワークロードで特に有効。低コスト・既存機能。
+- 注: 長時間連続計測では GPU サーマルスロットリングで tok/s が乱れる（hit 率は信頼可）。
+- 参考ベンチ: 同環境 llama.cpp(20 MoE offload) が 35B で 32 tok/s。我々は計算律速で ~26。
+  残差は segmented 方式 vs 完全融合グラフの計算効率差。
+
 ### 総括
 - **計画の前提（fetch がボトルネック）は正しい**。RAM offload で fetch ≈ 43%。
 - **STEP1（チャンク pin + 直接 H2D）→ STEP2（async H2D）→ STEP3b（隣接セグ融合）で
   RAM offload decode 11.0 → ~19 tok/s（+~70%）**。出力は全段でロスレス。
+- **さらに cache-profile プリロードで hit を 84%→~100% に上げると ~26 tok/s（計算律速）**。
   - 「pin できない」の真因は容量でなく単一確保上限（≈15.5GB）→ チャンク分割で解決。
   - async は ggml の同一 stream 順序を使い、専用 stream/event 無しで実現。
   - 完全融合（STEP3a）は partial residency で逆効果のため不採用。サブミット半減（3b）を採用。
