@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -33,6 +34,10 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
                          int n_layer, int n_expert, int n_used, size_t vram_avail_bytes,
                          bool ssd)
     : model_(model), ssd_(ssd), n_layer_(n_layer), n_expert_(n_expert) {
+
+    // Pinned host staging buffer type (CUDA): makes the slab H2D a pinned-DMA copy.
+    if (ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend))
+        host_buft_ = ggml_backend_dev_host_buffer_type(dev);
 
     // SSD tier: precompute each expert tensor's shard file + offset (files are
     // opened lazily on first fetch; sharded models spread experts across files).
@@ -130,8 +135,32 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
 
 ExpertCache::~ExpertCache() {
     for (auto & kv : files_) if (kv.second) fclose((FILE *) kv.second);
+    if (stage_buf_) ggml_backend_buffer_free(stage_buf_);
     if (buf_) ggml_backend_buffer_free(buf_);
     if (ctx_) ggml_free(ctx_);
+}
+
+// Return a host pointer to at least `nbytes` of staging memory. Prefers a pinned
+// (page-locked) buffer for fast H2D; falls back to a pageable vector if the
+// backend has no host buffer type or the pinned allocation fails.
+void * ExpertCache::stage_host(size_t nbytes) {
+    if (host_buft_) {
+        if (stage_cap_ < nbytes) {
+            if (stage_buf_) ggml_backend_buffer_free(stage_buf_);
+            stage_buf_ = ggml_backend_buft_alloc_buffer(host_buft_, nbytes);
+            if (stage_buf_) {
+                stage_ptr_ = ggml_backend_buffer_get_base(stage_buf_);
+                stage_cap_ = nbytes;
+            } else {
+                host_buft_ = nullptr;   // pinned alloc failed: stop trying
+                stage_ptr_ = nullptr;
+                stage_cap_ = 0;
+            }
+        }
+        if (stage_ptr_) return stage_ptr_;
+    }
+    if (stage_.size() < nbytes) stage_.resize(nbytes);
+    return stage_.data();
 }
 
 ggml_tensor * ExpertCache::tensor(Role role, int layer) const {
@@ -147,11 +176,12 @@ int ExpertCache::min_slots() const {
 // Copy one expert's slab from the slower tier into a VRAM slot.
 // This is the tiering seam: RAM (tensor_get) vs SSD (pread from the GGUF file).
 void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst, int slot) {
+    const auto t0 = std::chrono::steady_clock::now();
     ggml_tensor * src = role_tensor(model_, role, layer);
     const size_t nb2 = src->nb[2];
     if (dst->nb[2] != nb2)
         throw std::runtime_error("ExpertCache: slab size mismatch (pool vs source)");
-    if (stage_.size() < nb2) stage_.resize(nb2);
+    void * stage = stage_host(nb2);   // pinned (fast H2D) when available
 
     if (ssd_) {
         const size_t off = foff_[role][layer] + (size_t) expert * nb2;
@@ -166,12 +196,15 @@ void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst
 #else
         if (fseeko(f, (off_t) off, SEEK_SET) != 0 ||
 #endif
-            fread(stage_.data(), 1, nb2, f) != nb2)
+            fread(stage, 1, nb2, f) != nb2)
             throw std::runtime_error("ExpertCache: SSD pread failed");
     } else {
-        ggml_backend_tensor_get(src, stage_.data(), (size_t) expert * nb2, nb2);
+        ggml_backend_tensor_get(src, stage, (size_t) expert * nb2, nb2);
     }
-    ggml_backend_tensor_set(dst, stage_.data(), (size_t) slot * nb2, nb2);
+    ggml_backend_tensor_set(dst, stage, (size_t) slot * nb2, nb2);
+    stats_.fetch_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    stats_.fetch_bytes += nb2;
 }
 
 // Fetch (layer,expert) into a free (or LRU-evicted) slot; updates residency maps.

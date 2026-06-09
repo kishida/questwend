@@ -28,8 +28,9 @@
 
 struct ggml_tensor;
 struct ggml_context;
-typedef struct ggml_backend *        ggml_backend_t;
-typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
+typedef struct ggml_backend *             ggml_backend_t;
+typedef struct ggml_backend_buffer *      ggml_backend_buffer_t;
+typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
 
 namespace qwencpp {
 
@@ -79,7 +80,8 @@ public:
     // absent (counts as misses). Used to repair a speculative single-graph miss.
     void ensure_resident(int layer, int expert);
 
-    struct Stats { uint64_t hits = 0, misses = 0, evictions = 0; };
+    struct Stats { uint64_t hits = 0, misses = 0, evictions = 0;
+                   double fetch_ms = 0; uint64_t fetch_bytes = 0; };
     const Stats & stats() const { return stats_; }
 
     // Persist the access-frequency profile (hot experts) for warm restarts, and
@@ -126,7 +128,18 @@ private:
     std::vector<int>  layer_pool_[N_ROLE];
 
     uint64_t clock_ = 0;
-    std::vector<uint8_t> stage_;   // host staging buffer for fetch
+    std::vector<uint8_t> stage_;   // host staging buffer for fetch (pageable fallback)
+
+    // Pinned (page-locked) host staging buffer: the H2D source for a slab upload.
+    // Bounded to one slab, so it is always allocatable (unlike pinning all experts)
+    // yet gives pinned-DMA bandwidth. Falls back to `stage_` if the backend has no
+    // host buffer type (non-CUDA). Allocated lazily on first fetch.
+    ggml_backend_buffer_type_t host_buft_ = nullptr;  // pinned host buffer type (or null)
+    ggml_backend_buffer_t      stage_buf_ = nullptr;  // pinned staging buffer
+    void *                     stage_ptr_ = nullptr;  // base of stage_buf_
+    size_t                     stage_cap_ = 0;        // bytes of stage_buf_
+    void * stage_host(size_t nbytes);                 // ptr to >= nbytes pinned (or pageable) staging
+
     Stats stats_;
 };
 
