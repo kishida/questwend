@@ -109,6 +109,10 @@ struct Runtime::Impl {
     int n_ctx  = 0;
     int n_past = 0;
 
+    // decode_cached profiling (QWEN_PROF_DC): wall vs GPU-compute time
+    double dc_wall_ms = 0, dc_gpu_ms = 0;
+    uint64_t dc_tokens = 0;
+
     // persistent single-token decode graph (built once, reused -> enables CUDA graphs)
     // NOTE: disabled when sched is active (expert offload mode)
     bool                  persistent = false;     // true while building/using the decode graph
@@ -133,6 +137,12 @@ struct Runtime::Impl {
                     (unsigned long long) acc,
                     acc ? 100.0 * (double) s.hits / (double) acc : 0.0,
                     (unsigned long long) s.misses, (unsigned long long) s.evictions);
+            if (dc_tokens)
+                fprintf(stderr,
+                    "decode_cached prof: %llu tok, wall %.2f ms/tok, gpu-compute %.2f ms/tok (%.0f%%), host %.2f ms/tok\n",
+                    (unsigned long long) dc_tokens, dc_wall_ms / dc_tokens, dc_gpu_ms / dc_tokens,
+                    dc_wall_ms > 0 ? 100.0 * dc_gpu_ms / dc_wall_ms : 0.0,
+                    (dc_wall_ms - dc_gpu_ms) / dc_tokens);
             if (s.fetch_bytes && s.fetch_ms > 1.0)
                 fprintf(stderr,
                     "expert cache fetch: %.0f ms total, %.1f MB (%.1f GB/s effective)\n",
@@ -1458,6 +1468,15 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token) {
         if (!ggml_gallocr_alloc_graph(cache_galloc, gf))
             throw std::runtime_error("decode_cached: gallocr alloc failed");
     };
+    const bool prof_dc = getenv("QWEN_PROF_DC") != nullptr;
+    auto wall0 = std::chrono::steady_clock::now();
+    auto compute = [&](ggml_cgraph * gf, const char * msg) {
+        auto t = std::chrono::steady_clock::now();
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error(std::string("decode_cached: ") + msg);
+        if (prof_dc) dc_gpu_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t).count();
+    };
 
     // ---- seg 0: token embedding -> p_h ----
     {
@@ -1469,8 +1488,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token) {
         ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, emb, n_embd), p_h));
         run(ctx, gf);
         ggml_backend_tensor_set(inp, &token, 0, sizeof(int32_t));
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
-            throw std::runtime_error("decode_cached: embed compute failed");
+        compute(gf, "embed compute failed");
         ggml_free(ctx);
     }
 
@@ -1580,8 +1598,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token) {
         ggml_tensor * selected = build_segA(ctx, gf, 0);
         run(ctx, gf);
         set_attn_inputs(gf);
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
-            throw std::runtime_error("decode_cached: seg A0 compute failed");
+        compute(gf, "seg A0 compute failed");
         ensure_layer(selected, 0);
         ggml_free(ctx);
     }
@@ -1592,8 +1609,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token) {
         ggml_tensor * nsel = (il + 1 < N) ? build_segA(ctx, gf, il + 1) : nullptr;
         run(ctx, gf);
         set_attn_inputs(gf);
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
-            throw std::runtime_error("decode_cached: fused segB/segA compute failed");
+        compute(gf, "fused segB/segA compute failed");
         if (nsel) ensure_layer(nsel, il + 1);
         ggml_free(ctx);
     }
@@ -1611,8 +1627,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token) {
         ggml_set_name(cur, "logits");
         ggml_build_forward_expand(gf, cur);
         run(ctx, gf);
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
-            throw std::runtime_error("decode_cached: output compute failed");
+        compute(gf, "output compute failed");
         const int n_vocab = (int) cur->ne[0];
         logits.resize(n_vocab);
         ggml_backend_tensor_get(cur, logits.data(), 0, n_vocab * sizeof(float));
@@ -1625,6 +1640,11 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token) {
         ggml_backend_tensor_get(p_h, mtp_hidden.data(), 0, n_embd * sizeof(float));
     }
 
+    if (prof_dc) {
+        dc_wall_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - wall0).count();
+        dc_tokens++;
+    }
     n_past += 1;
     return logits;
 }
