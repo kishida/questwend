@@ -1236,7 +1236,10 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         // multi-token router
         ggml_tensor * logits = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp.weight", il), ffn_in);  // [n_exp, T]
         ggml_tensor * probs   = ggml_soft_max(ctx, logits);
-        ggml_tensor * selected = ggml_argsort_top_k(ctx, probs, n_used);          // [n_used, T]
+        // argsort_top_k returns a STRIDED view (nb[1] = n_exp*4); make it contiguous
+        // so the [n_used, T] host readback (ggml_backend_tensor_get) is not corrupted
+        // for columns >= 1 (it ignores strides). Single-token path is T=1 so unaffected.
+        ggml_tensor * selected = ggml_cont(ctx, ggml_argsort_top_k(ctx, probs, n_used));  // [n_used, T]
         ggml_tensor * probs3  = ggml_reshape_3d(ctx, probs, 1, n_exp, T);
         ggml_tensor * weights = ggml_get_rows(ctx, probs3, selected);             // [1, n_used, T]
         weights = ggml_reshape_2d(ctx, weights, n_used, T);
@@ -1660,9 +1663,15 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     // SSD tier has no CPU-expert sched path: run prefill as batched chunks via
     // the cache (chunk bounded so a layer's distinct experts fit the pools).
     if (ecache && !sched) {
-        // Batched prefill (QWEN_BATCH) is experimental: multi-token GDN layers
-        // currently diverge, so the default is the correct token-by-token path
-        // (which still benefits from parallel SSD prefetch).
+        // Batched prefill (QWEN_BATCH) processes a chunk of tokens through one
+        // segmented forward (seg A attention/GDN/router for all tokens -> one
+        // expert-residency sync -> seg B expert matmuls). Now argmax-equivalent to
+        // the token-by-token path for both plain-attn (qwen3moe) and GDN MoE models
+        // (the prior divergence was a router-readback bug, since fixed). It is opt-in
+        // because in the SSD tier it is *slower* than token-by-token: seg B is still
+        // per-token, and the per-chunk union-of-experts fetch defeats the async
+        // prefetch pipeline. The code path is retained for the MTP 2-token verify,
+        // where the union is tiny and mostly already resident.
         if (getenv("QWEN_BATCH")) {
             int chunk = ecache->min_slots() / (model.hparams().n_expert_used > 0 ? model.hparams().n_expert_used : 1);
             if (chunk < 1)   chunk = 1;
