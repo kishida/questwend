@@ -121,10 +121,15 @@ ExpertCache に fetch 計測を追加（`expert cache fetch:` 行）。
 - 効果: **fetch 2703→1324ms（51%減）、2.3→4.7 GB/s（2倍）、
   decode 11.0→~14 tok/s（plain）/ 9.5→13.2 tok/s（MTP）**。出力不変。
 
-### STEP2 async copy stream（**解禁**: pinned ソースが揃った → 次の候補）
-- 1b で expert 本体が全 pinned になったため cudaMemcpyAsync の前提が満たされた。
-- 残課題はレイテンシ（多数の小同期コピー）。専用 copy stream + event で seg A→B の
-  ミス fetch を計算とオーバーラップすれば更に改善余地（ggml 抽象の外で CUDA 直叩きが要る）。
+### STEP2 async H2D（実装済み・採用, commit 7dbe670）
+- 1b で expert 本体が全 pinned になったため `ggml_backend_tensor_set_async` で真の
+  非同期 DMA が可能に。RAM tier の slab H2D を backend stream 上の async に。
+- **専用 stream/event は不要**: 後続の seg B compute が同一 stream なので自動で
+  コピー後に順序付く（ggml 直叩き不要）。ソースは永続 pinned なので race-free。
+  p_slot のインデックス転送は host buffer を層で使い回すため sync 維持（安全）。
+- 効果: A/B で **sync 15.3 → async 17.5 tok/s（+14%）**。出力一致（lossless）。
+- 仕組み: 1層内の複数ミスコピーが host のキャッシュ簿記とパイプライン化され、
+  per-copy の host ブロッキングが消える。`QWEN_SYNC_FETCH=1` で旧 sync に戻せる。
 
 ### STEP3 fused graph = decode_cached_fast（**不採用**: partial residency で逆に遅い）
 - `QWEN_FASTCACHE` で実測: **9.2 tok/s（default 12.3 より遅い）**。出力は一致。
@@ -134,10 +139,12 @@ ExpertCache に fetch 計測を追加（`expert cache fetch:` 行）。
 
 ### 総括
 - **計画の前提（fetch がボトルネック）は正しい**。RAM offload で fetch ≈ 43%。
-- **STEP1 完成（チャンク pin + 直接 H2D）で RAM offload decode 11→~14 tok/s（+25%）**。
-  「pin できない」の真因は容量でなく単一確保上限（≈15.5GB）で、チャンク分割で解決。
+- **STEP1（チャンク pin + 直接 H2D）→ STEP2（async H2D）で
+  RAM offload decode 11.0 → ~17.5 tok/s（+59%）**。出力は全段でロスレス。
+  - 「pin できない」の真因は容量でなく単一確保上限（≈15.5GB）→ チャンク分割で解決。
+  - async は ggml の同一 stream 順序を使い、専用 stream/event 無しで実現。
 - STEP3（fused graph）は partial residency で逆効果のため不採用。
-- 次に効きそうな方向:
-  1) **STEP2 async overlap**（pinned ソースが揃い解禁。copy stream + event）。
-  2) ミス**回数**削減（calibrated preload=`--cache-profile`、常駐率↑）。
-  3) per-layer のミスを 1回の大きな転送にまとめる（slot 連続化が要る）。
+- さらに効きそうな方向:
+  1) ミス**回数**削減（calibrated preload=`--cache-profile`、常駐率↑）。
+  2) per-layer のミスを 1回の大きな転送にまとめる（slot 連続化が要る）。
+  3) 次層 expert の投機 prefetch（cache_profile 予測 + ダブルバッファ）。
