@@ -142,7 +142,11 @@ infer-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15000
 | `--vram-budget <MB>` / `--experts-ssd` | エキスパート・オフロード |
 | `--cache-profile <file>` | 常駐プロファイル（**サーバーは読み込みのみ**, 上書きしない） |
 | `--reasoning <on\|off>` | thinking モードの既定（UI のチェックにも反映） |
+| `--mtp` | MTP 自己推測デコード（nextn ブロックを持つモデル; 起動時に有効化） |
+| `--draft <N>` | MTP draft 長（既定 1） |
 | `--cpu` | CPU バックエンドを強制 |
+
+> MTP はモデルロード時に nextn ブロックを VRAM 常駐させるため、リクエスト単位ではなく**サーバー起動フラグ**で指定します。ストリーミング/非ストリーミングの両方に対応。
 
 ---
 
