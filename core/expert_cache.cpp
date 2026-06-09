@@ -35,6 +35,9 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
                          bool ssd)
     : model_(model), ssd_(ssd), n_layer_(n_layer), n_expert_(n_expert) {
 
+    backend_ = gpu_backend;
+    if (getenv("QWEN_SYNC_FETCH")) async_fetch_ = false;   // A/B: force synchronous H2D
+
     // Pinned host staging buffer type (CUDA): makes the slab H2D a pinned-DMA copy.
     if (ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend))
         host_buft_ = ggml_backend_dev_host_buffer_type(dev);
@@ -205,6 +208,14 @@ void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst
         // RAM tier: the expert weights live in a (pinned) CPU buffer -> H2D straight
         // from the source, no intermediate staging copy.
         hsrc = (const char *) src->data + (size_t) expert * nb2;
+        if (async_fetch_) {
+            // Async H2D on the backend's stream: the host does not block per copy,
+            // and the following seg-B compute (same stream) is naturally ordered
+            // after it. Source is pinned (persistent), so this is a true async DMA.
+            ggml_backend_tensor_set_async(backend_, dst, hsrc, (size_t) slot * nb2, nb2);
+            stats_.fetch_bytes += nb2;
+            return;
+        }
     }
     ggml_backend_tensor_set(dst, hsrc, (size_t) slot * nb2, nb2);
     stats_.fetch_ms += std::chrono::duration<double, std::milli>(

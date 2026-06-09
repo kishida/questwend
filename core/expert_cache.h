@@ -111,6 +111,8 @@ private:
     void fetch_parallel(int layer, std::vector<FetchJob> & jobs);  // SSD: parallel pread + serial H2D
 
     Model &        model_;
+    ggml_backend_t backend_ = nullptr;   // GPU backend (for async H2D on its stream)
+    bool           async_fetch_ = true;  // overlap RAM-tier H2D with host work
     ggml_context * ctx_ = nullptr;
     ggml_backend_buffer_t buf_ = nullptr;
 

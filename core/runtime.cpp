@@ -127,11 +127,14 @@ struct Runtime::Impl {
                     (unsigned long long) acc,
                     acc ? 100.0 * (double) s.hits / (double) acc : 0.0,
                     (unsigned long long) s.misses, (unsigned long long) s.evictions);
-            if (s.fetch_bytes)
+            if (s.fetch_bytes && s.fetch_ms > 1.0)
                 fprintf(stderr,
                     "expert cache fetch: %.0f ms total, %.1f MB (%.1f GB/s effective)\n",
                     s.fetch_ms, s.fetch_bytes / 1024.0 / 1024.0,
-                    s.fetch_ms > 0 ? (s.fetch_bytes / 1024.0 / 1024.0 / 1024.0) / (s.fetch_ms / 1000.0) : 0.0);
+                    (s.fetch_bytes / 1024.0 / 1024.0 / 1024.0) / (s.fetch_ms / 1000.0));
+            else if (s.fetch_bytes)
+                fprintf(stderr, "expert cache fetch: %.1f MB (async H2D)\n",
+                    s.fetch_bytes / 1024.0 / 1024.0);
             if (cfg.cache_profile_save && !cfg.cache_profile.empty() && ecache->save_profile(cfg.cache_profile))
                 fprintf(stderr, "expert cache: saved profile to '%s'\n", cfg.cache_profile.c_str());
         }
