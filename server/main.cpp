@@ -198,6 +198,8 @@ int main(int argc, char ** argv) {
     std::string cache_profile;
     bool experts_ssd = false;
     bool reasoning_default = true;
+    bool use_mtp = false;
+    int  n_draft = 1;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -209,6 +211,8 @@ int main(int argc, char ** argv) {
         else if (a == "--cache-profile" && i + 1 < argc) cache_profile = argv[++i];
         else if (a == "--experts-ssd")      experts_ssd = true;
         else if (a == "--reasoning" && i + 1 < argc) { std::string v = argv[++i]; reasoning_default = (v != "off" && v != "0" && v != "false"); }
+        else if (a == "--mtp")              use_mtp = true;
+        else if (a == "--draft" && i + 1 < argc) n_draft = std::stoi(argv[++i]);
         else if (a == "--cpu")              force_cpu = true;
     }
     if (model_path.empty()) {
@@ -221,6 +225,8 @@ int main(int argc, char ** argv) {
             "  --cache-profile <f> prefetch hot-expert profile (read-only on the server)\n"
             "  --experts-ssd       stream experts from the GGUF on SSD (no RAM copy)\n"
             "  --reasoning <on|off> default thinking mode (per-request override: \"reasoning\")\n"
+            "  --mtp               MTP self-speculative decode (models with a nextn block)\n"
+            "  --draft <N>         MTP draft length (default 1)\n"
             "  --cpu               force CPU backend\n", argv[0]);
         return 1;
     }
@@ -238,11 +244,19 @@ int main(int argc, char ** argv) {
         cfg.cache_profile      = cache_profile;
         cfg.cache_profile_save = false;   // server only reads the profile, never overwrites it
         cfg.experts_ssd        = experts_ssd;
+        cfg.use_mtp            = use_mtp;  // keeps the nextn block VRAM-resident
         rt = std::make_unique<Runtime>(*model, cfg);
     } catch (const std::exception & e) {
         fprintf(stderr, "load error: %s\n", e.what());
         return 1;
     }
+
+    // MTP self-speculative decode is active only if requested AND the model has a
+    // nextn block; otherwise fall back to plain decoding.
+    const bool mtp = use_mtp && rt->has_mtp();
+    if (use_mtp && !rt->has_mtp())
+        fprintf(stderr, "warning: --mtp requested but model has no nextn block; using plain decode\n");
+    if (mtp) fprintf(stderr, "MTP self-speculative decode ON (draft=%d)\n", n_draft);
 
     const std::string model_id = "qwencpp:" + std::string(arch_name(model->hparams().arch));
     const int32_t eos    = model->vocab().eos_id;
@@ -331,7 +345,7 @@ int main(int argc, char ** argv) {
             st->prompt_tokens = (int) prompt.size();
 
             res.set_chunked_content_provider("text/event-stream",
-                [&, st, id](size_t, httplib::DataSink & sink) -> bool {
+                [&, st, id, mtp, n_draft](size_t, httplib::DataSink & sink) -> bool {
                     if (st->finished) return false;
                     auto finish = [&]() -> bool {
                         const auto t_end = clk::now();
@@ -357,6 +371,29 @@ int main(int argc, char ** argv) {
                         return false;
                     };
                     try {
+                        // ---- MTP self-speculative decode: stream the whole run in one
+                        // blocking provider call, emitting an SSE chunk per token ----
+                        if (mtp) {
+                            if (st->started) return false;
+                            st->started = true;
+                            st->t0 = clk::now();
+                            rt->reset();
+                            st->t_prefill = st->t_first = st->t0;   // defaults if 0 tokens
+                            bool first = true;
+                            rt->generate_mtp(st->prompt, st->max_tokens, n_draft, [&](int32_t t) -> bool {
+                                if (is_stop(t) || rt->n_past() + 1 >= n_ctx) return false;
+                                if (first) { st->t_prefill = st->t_first = clk::now(); first = false; }
+                                std::string piece = tok->decode(t);
+                                json chunk = {{"id", id}, {"object", "chat.completion.chunk"},
+                                    {"model", model_id}, {"choices", json::array({
+                                        {{"index", 0}, {"delta", {{"content", piece}}}, {"finish_reason", nullptr}}})}};
+                                std::string ev = "data: " + chunk.dump() + "\n\n";
+                                if (!sink.write(ev.data(), ev.size())) return false;  // client gone
+                                st->generated++;
+                                return st->generated < st->max_tokens;
+                            });
+                            return finish();
+                        }
                         if (!st->started) {
                             st->started = true;
                             st->t0 = clk::now();
@@ -394,17 +431,29 @@ int main(int argc, char ** argv) {
         clk::time_point t0, t_prefill = {}, t_end = {};
         try {
             std::lock_guard<std::mutex> lk(infer_mtx);
-            Sampler smp(sc);
             rt->reset();
             t0 = clk::now();
-            auto logits = rt->decode(prompt);
-            t_prefill = clk::now();
-            for (int t = 0; t < max_tokens; ++t) {
-                int next = smp.sample(logits);
-                if (is_stop(next) || rt->n_past() + 1 >= n_ctx) break;
-                text += tok->decode(next);
-                ++generated;
-                logits = rt->decode({ next });
+            if (mtp) {
+                t_prefill = t0;
+                bool first = true;
+                rt->generate_mtp(prompt, max_tokens, n_draft, [&](int32_t t) -> bool {
+                    if (is_stop(t) || rt->n_past() + 1 >= n_ctx) return false;
+                    if (first) { t_prefill = clk::now(); first = false; }
+                    text += tok->decode(t);
+                    ++generated;
+                    return generated < max_tokens;
+                });
+            } else {
+                Sampler smp(sc);
+                auto logits = rt->decode(prompt);
+                t_prefill = clk::now();
+                for (int t = 0; t < max_tokens; ++t) {
+                    int next = smp.sample(logits);
+                    if (is_stop(next) || rt->n_past() + 1 >= n_ctx) break;
+                    text += tok->decode(next);
+                    ++generated;
+                    logits = rt->decode({ next });
+                }
             }
             t_end = clk::now();
         } catch (const std::exception & e) {
