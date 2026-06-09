@@ -120,7 +120,7 @@ void Model::load_weights_split(
     ggml_backend_t          gpu_backend,
     ggml_backend_buffer_type_t cpu_buft,
     ggml_backend_buffer_t & out_gpu_buf,
-    ggml_backend_buffer_t & out_cpu_buf)
+    std::vector<ggml_backend_buffer_t> & out_cpu_bufs)
 {
     ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_backend);
 
@@ -138,48 +138,52 @@ void Model::load_weights_split(
         // will be allocated into out_gpu_buf below
     }
 
-    // ---- Calculate sizes ----
-    size_t gpu_size = 0, cpu_size = 0;
+    // ---- GPU (non-expert) buffer: size, allocate, assign ----
+    size_t gpu_size = 0;
+    std::vector<ggml_tensor *> exp_tensors;     // offloaded experts (kept ordered)
     for (auto & kv : tensors_) {
-        if (is_offloaded_expert(kv.first)) {
-            cpu_size += ggml_backend_buft_get_alloc_size(cpu_buft, kv.second);
-        } else {
-            gpu_size += ggml_backend_buft_get_alloc_size(gpu_buft, kv.second);
-        }
+        if (is_offloaded_expert(kv.first)) exp_tensors.push_back(kv.second);
+        else gpu_size += ggml_backend_buft_get_alloc_size(gpu_buft, kv.second);
     }
-    if (need_f32_embd) {
-        gpu_size += ggml_backend_buft_get_alloc_size(gpu_buft, tok_embd_rows_);
-    }
+    if (need_f32_embd) gpu_size += ggml_backend_buft_get_alloc_size(gpu_buft, tok_embd_rows_);
 
-    // ---- Allocate buffers ----
     out_gpu_buf = ggml_backend_buft_alloc_buffer(gpu_buft, gpu_size);
     if (!out_gpu_buf)
         throw std::runtime_error("failed to allocate GPU weight buffer (split mode)");
-
-    out_cpu_buf = ggml_backend_buft_alloc_buffer(cpu_buft, cpu_size > 0 ? cpu_size : 1);
-    if (!out_cpu_buf)
-        throw std::runtime_error("failed to allocate CPU expert buffer");
-
     ggml_backend_buffer_set_usage(out_gpu_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    ggml_backend_buffer_set_usage(out_cpu_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    // ---- Assign tensors to buffers via tallocr ----
     struct ggml_tallocr gpu_talloc = ggml_tallocr_new(out_gpu_buf);
-    struct ggml_tallocr cpu_talloc = ggml_tallocr_new(out_cpu_buf);
-
     for (auto & kv : tensors_) {
-        if (is_offloaded_expert(kv.first)) {
-            if (ggml_tallocr_alloc(&cpu_talloc, kv.second) != GGML_STATUS_SUCCESS)
-                throw std::runtime_error("tallocr alloc failed (cpu): " + kv.first);
-        } else {
-            if (ggml_tallocr_alloc(&gpu_talloc, kv.second) != GGML_STATUS_SUCCESS)
-                throw std::runtime_error("tallocr alloc failed (gpu): " + kv.first);
-        }
+        if (is_offloaded_expert(kv.first)) continue;
+        if (ggml_tallocr_alloc(&gpu_talloc, kv.second) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("tallocr alloc failed (gpu): " + kv.first);
     }
     if (need_f32_embd) {
         if (ggml_tallocr_alloc(&gpu_talloc, tok_embd_rows_) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("tallocr alloc failed (embd.f32)");
         embd_buf_ = out_gpu_buf;  // owned by out_gpu_buf, don't free separately
+    }
+
+    // ---- CPU (expert) buffers: chunked so each stays under the single
+    // cudaHostAlloc cap (~15.5 GB on WDDM) and the whole set can be page-locked ----
+    const size_t CHUNK = 8ull * 1024 * 1024 * 1024;   // 8 GB per pinned buffer
+    size_t i = 0;
+    while (i < exp_tensors.size()) {
+        size_t group_sz = 0, j = i;
+        for (; j < exp_tensors.size(); ++j) {
+            const size_t sz = ggml_backend_buft_get_alloc_size(cpu_buft, exp_tensors[j]);
+            if (j > i && group_sz + sz > CHUNK) break;   // at least one tensor per buffer
+            group_sz += sz;
+        }
+        ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(cpu_buft, group_sz > 0 ? group_sz : 1);
+        if (!b) throw std::runtime_error("failed to allocate CPU expert buffer (chunk)");
+        ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        struct ggml_tallocr ta = ggml_tallocr_new(b);
+        for (size_t k = i; k < j; ++k)
+            if (ggml_tallocr_alloc(&ta, exp_tensors[k]) != GGML_STATUS_SUCCESS)
+                throw std::runtime_error("tallocr alloc failed (cpu expert chunk)");
+        out_cpu_bufs.push_back(b);
+        i = j;
     }
 
     // ---- Load tensor data (shard-aware) ----
@@ -211,8 +215,8 @@ void Model::load_weights_split(
     }
     for (auto & kv : files) if (kv.second) fclose((FILE *) kv.second);
 
-    fprintf(stderr, "expert cache: GPU %.1f MB | CPU (experts) %.1f MB\n",
-            gpu_bytes / 1024.0 / 1024.0, cpu_bytes / 1024.0 / 1024.0);
+    fprintf(stderr, "expert cache: GPU %.1f MB | CPU (experts) %.1f MB in %zu pinned chunk(s)\n",
+            gpu_bytes / 1024.0 / 1024.0, cpu_bytes / 1024.0 / 1024.0, out_cpu_bufs.size());
 }
 
 size_t Model::tensor_file_offset(const std::string & name) const {

@@ -35,7 +35,10 @@ struct Runtime::Impl {
     // and the rest of the weights are in weights_buf (GPU).
     // ggml_backend_sched handles routing ops to the right backend.
     ggml_backend_t        cpu_backend    = nullptr;
-    ggml_backend_buffer_t expert_cpu_buf = nullptr;
+    // Expert weights live in one or more pinned host buffers. Multiple buffers are
+    // used because a single cudaHostAlloc is capped (~15.5 GB on WDDM); chunking
+    // lets the full expert set be page-locked for fast/overlappable H2D.
+    std::vector<ggml_backend_buffer_t> expert_cpu_bufs;
     ggml_backend_sched_t  sched          = nullptr;
 
     // Phase B v2: dynamic per-expert VRAM cache (single-token decode hot path).
@@ -147,8 +150,8 @@ struct Runtime::Impl {
         if (dctx)           ggml_free(dctx);
         if (st_buf)         ggml_backend_buffer_free(st_buf);
         if (st_ctx)         ggml_free(st_ctx);
-        // expert_cpu_buf and weights_buf are owned here (not by Model in split mode)
-        if (expert_cpu_buf) ggml_backend_buffer_free(expert_cpu_buf);
+        // expert_cpu_bufs and weights_buf are owned here (not by Model in split mode)
+        for (auto b : expert_cpu_bufs) if (b) ggml_backend_buffer_free(b);
         if (cpu_backend)    ggml_backend_free(cpu_backend);
         // In single-backend mode, weights_buf is owned by Model; in split mode it's ours.
         // Model::~Model() also tries to free weights_buf_ -- that one is the original
@@ -270,7 +273,7 @@ void Runtime::Impl::init() {
         }
 
         // Load weights: non-expert → GPU, expert → CPU (pinned).
-        model.load_weights_split(backend, cpu_buft, weights_buf, expert_cpu_buf);
+        model.load_weights_split(backend, cpu_buft, weights_buf, expert_cpu_bufs);
 
         // Create backend scheduler: GPU first (higher priority), CPU fallback.
         // The sched routes ops to GPU for GPU-backend tensors and CPU for CPU-backend tensors.

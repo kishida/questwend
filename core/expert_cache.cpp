@@ -181,9 +181,11 @@ void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst
     const size_t nb2 = src->nb[2];
     if (dst->nb[2] != nb2)
         throw std::runtime_error("ExpertCache: slab size mismatch (pool vs source)");
-    void * stage = stage_host(nb2);   // pinned (fast H2D) when available
 
+    const void * hsrc;
     if (ssd_) {
+        // SSD tier: read the slab into a pinned staging buffer, then H2D from it.
+        void * stage = stage_host(nb2);
         const size_t off = foff_[role][layer] + (size_t) expert * nb2;
         void *& fp = files_[fpath_[role][layer]];
         if (!fp) {
@@ -198,10 +200,13 @@ void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst
 #endif
             fread(stage, 1, nb2, f) != nb2)
             throw std::runtime_error("ExpertCache: SSD pread failed");
+        hsrc = stage;
     } else {
-        ggml_backend_tensor_get(src, stage, (size_t) expert * nb2, nb2);
+        // RAM tier: the expert weights live in a (pinned) CPU buffer -> H2D straight
+        // from the source, no intermediate staging copy.
+        hsrc = (const char *) src->data + (size_t) expert * nb2;
     }
-    ggml_backend_tensor_set(dst, stage, (size_t) slot * nb2, nb2);
+    ggml_backend_tensor_set(dst, hsrc, (size_t) slot * nb2, nb2);
     stats_.fetch_ms += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
     stats_.fetch_bytes += nb2;

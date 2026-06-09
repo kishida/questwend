@@ -110,12 +110,14 @@ public:
     ggml_backend_buffer * load_weights(ggml_backend_t backend);
 
     // Split variant: expert weight tensors (ffn_*_exps) go to cpu_buft,
-    // everything else goes to gpu_backend. Both output buffers are caller-owned.
-    // Enables running large MoE models when GPU VRAM is limited.
+    // everything else goes to gpu_backend. All output buffers are caller-owned.
+    // Expert weights are spread over several cpu buffers (each below the single
+    // cudaHostAlloc cap) so the whole set can be page-locked. Enables running
+    // large MoE models when GPU VRAM is limited.
     void load_weights_split(ggml_backend_t gpu_backend,
                             ggml_backend_buffer_type_t cpu_buft,
                             ggml_backend_buffer_t & out_gpu_buf,
-                            ggml_backend_buffer_t & out_cpu_buf);
+                            std::vector<ggml_backend_buffer_t> & out_cpu_bufs);
 
     // SSD-tier variant: routed expert weights are NOT loaded into memory at all
     // (they stay on disk and are streamed on demand by ExpertCache). Everything
