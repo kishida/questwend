@@ -1,0 +1,139 @@
+# MTP (Multi-Token Prediction / nextn) — 実装と評価まとめ
+
+Qwen3.5/3.6 系の一部モデルに含まれる **nextn ブロック**（MTP module）を使った
+**自己推測デコード（self-speculative greedy decode）** を qwencpp に実装した記録。
+
+- 関連コミット: `fc0378d`（MTP本体）, `fe7de96`（推測ループ `--mtp`）,
+  `eb11017`（batched cache の router バグ修正）, `805d244`（offload/MoE-MTP対応）
+- 関連コード: `core/runtime.cpp`（`build_mtp` / `mtp_draft` / `mtp_draft_cached` /
+  `decode_verify` / `decode_verify_cached` / `generate_mtp`）
+
+---
+
+## 1. MTP とは
+
+通常の transformer は「直前までの hidden」から **次の1トークン** を予測する。
+MTP 付きモデルは末尾に **nextn ブロック**（block index = `n_layer - nextn_predict_layers`）
+を持ち、メインスタックの最終 hidden `h` と「いま確定したトークン `t` の embedding」を
+組み合わせて **`t` の *次の次* のトークン** を1手先読み（draft）できる。
+
+```
+h'      = eh_proj( concat( enorm(emb(t)), hnorm(h) ) )   // 埋め込みが先（重要）
+block   = gated attention + FFN（このブロック専用の KV を持つ）
+logits  = shared_head_norm -> lm_head（メインと共有）
+```
+
+これを使った **自己推測デコード**:
+
+1. メインモデルで `x` を確定し、その hidden から MTP で次トークン `d` を draft。
+2. メインモデルで `[x, d]` を **1回の2トークン forward** で verify。
+   - `y = argmax(verify_logits[0])`（`x` の本当の次トークン）
+   - `y == d` なら **draft 的中** → `x` と `d` の2トークンを一度に確定。
+   - 外れたら `x` だけ確定し `d` は破棄（recurrent 状態はロールバック）。
+3. 的中するほど「1回の verify forward で2トークン進む」ので main forward 回数が減る。
+
+ロスレス保証: 受理は `argmax` 一致時のみなので、出力は **verify（=メイン）モデルの
+greedy 出力と必ず一致**する。MTP は速度最適化であって品質は変えない。
+
+---
+
+## 2. 実装
+
+### 2.1 非オフロード（VRAM常駐）パス
+- `build_mtp`: nextn ブロックを1グラフで構築（dense FFN 前提）。
+- `mtp_draft`: 上を `mtp_galloc` で1回 compute。
+- `decode_verify`: `build_graph(n_tokens=2)` を `galloc` で compute、
+  各位置の logits（`vL1/vL2`）と hidden（`vh1/vh2`）を取り出す。
+- 小さい dense-MTP モデル（例: Qwen3.5-0.8B-MTP）で動作。
+
+### 2.2 オフロード（expert offload / SSD 階層）パス — `805d244`
+35B-A3B-MTP の **nextn ブロックは MoE**（256 experts + shared expert）で、
+その experts も SSD 階層にある。メイン同様に **VRAM expert cache 経由のセグメント
+実行** が必要になる。
+
+| 関数 | 役割 |
+|---|---|
+| `decode_cached` | 末尾で main hidden を `mtp_hidden` にキャプチャ（draft 入力用） |
+| `mtp_draft_cached` | nextn ブロックを `decode_cached` と同型にセグメント実行: seg0 `eh_proj` → segA gated attention + router → `ensure(L)` → segB cached-MoE + shared expert + shared head → logits |
+| `decode_verify_cached` | 2トークン verify を `decode_cached_batch` の **verify モード**で実行。両位置の logits/hidden を取得。プールが `2*n_used` 未満なら単一トークン decode 2回にフォールバック |
+| `mtp_draft` / `decode_verify` | `ecache` があれば上記 `*_cached` に分岐 |
+
+前提となったバグ修正（`eb11017`）:
+`ggml_argsort_top_k` は **ストライド付きビュー**を返すが、`ggml_backend_tensor_get`
+はストライドを無視して連続コピーするため、マルチトークン（T>1）の router 選択が
+列1以降で壊れていた。`ggml_cont` で連続化して解決。これにより `decode_cached_batch`
+が正しくなり、2トークン verify が成立した。
+
+---
+
+## 3. 検証結果
+
+### 3.1 正しさ
+- **Qwen3.5-0.8B-MTP（dense, 非offload）**: コヒーレント出力、`--mtp` 動作。
+- **Qwen3.6-35B-A3B-MTP（GDN MoE, SSD offload）**:
+  - draft 受理率 **81–92%**、**~1.8 tok/forward**。
+  - 出力は plain decode と **完全一致（ロスレス）**。
+  - GDN の reject ロールバック（backup/restore states）も正常。
+
+### 3.2 速度（Qwen3.6-35B-A3B-MTP, RTX 4060 Ti, `--vram-budget 15000 --experts-ssd`, 50%常駐 / hit 82%）
+
+| 方式 | 速度 | expert fetch 総アクセス |
+|---|---|---|
+| **MTP** (`--mtp`) | **4.9–6.8 tok/s**（受理81%, 1.81 tok/forward） | 60,744 |
+| **plain decode** | **8.5–8.9 tok/s** | 50,880 |
+
+→ **MTP の方が遅い**。HDD→SSD へ置き換えても結論は変わらなかった
+（ボトルネックは生のディスク速度ではない）。
+
+---
+
+## 4. なぜ offload では遅いのか（重要な教訓）
+
+自己推測 MTP は **「main forward の *回数*」を減らす** が、
+**「expert fetch の *総量*」は減らさない**:
+
+- 48トークン生成あたり
+  - plain: 単一トークン forward **48回**
+  - MTP: 2トークン verify forward **26回**（≈52トークン分の fetch）
+        ＋ `mtp_draft` **約47回**（各々 MoE 1層の fetch + lm_head）
+- `1.81 tok/forward` は **verify ステップだけ**を数えた指標で、draft の
+  オーバーヘッドを隠している。
+
+決定的だったのは **語彙 248,320 の巨大な lm_head**（約0.5GB）。
+これが draft と verify の各列で毎回計算されるため、「draft は main より十分安い」
+という自己推測の大前提が崩れる。さらに nextn ブロック自体が 256-expert MoE で
+自前の SSD fetch を発生させる。
+
+### MTP が勝てる条件
+1. **計算律速**であること（experts が高常駐 = fetch が実質ゼロ）。
+   → このとき main forward 回数の削減がそのまま効く。
+2. **draft が main より十分安い**こと（層数が多く / 語彙が小さい / lm_head が軽い）。
+
+19GB の experts は 16GB GPU に乗り切らず、35B では条件1に到達できない。
+よって `--mtp` は **opt-in** のまま維持する。実装はロスレスで、より大きな VRAM
+（experts が大半常駐）や語彙の小さいモデルでは速度メリットが出る。
+
+---
+
+## 5. 使い方
+
+```bash
+# 自己推測デコード（MTP ブロックを持つモデルのみ）
+infer -m model-MTP.gguf -p "..." -n 128 --mtp [--vram-budget N --experts-ssd]
+
+# draft 受理率の計測
+QWEN_MTP_TEST=1 infer -m model-MTP.gguf -p "..." -n 64
+
+# 受理を強制的に無効化（= 純 verify 出力、ロスレス確認用）
+QWEN_MTP_NOACCEPT=1 infer -m model-MTP.gguf -p "..." -n 64 --mtp
+```
+
+---
+
+## 6. まとめ
+
+- offload を含め **MoE-MTP の自己推測デコードを完全実装**し、ロスレス・高受理率を確認。
+- ただし **SSD フェッチ律速 + 巨大 lm_head** により、35B offload では **正味で遅い**。
+  これは実装の不備ではなく自己推測 MTP の構造的特性。
+- offload 環境の実利的な高速化は、MTP よりも **常駐率向上・プリフェッチ強化
+  （expert fetch そのものの削減）** が効く。

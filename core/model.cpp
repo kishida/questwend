@@ -49,6 +49,15 @@ bool Model::has_expert_tensors() const {
     return false;
 }
 
+bool Model::is_offloaded_expert(const std::string & name) const {
+    if (!is_expert_tensor(name)) return false;
+    // Keep the trailing MTP (nextn) block's experts in VRAM (block index >= n_main).
+    int blk = -1;
+    if (std::sscanf(name.c_str(), "blk.%d.", &blk) == 1 && blk >= (int) hp_.n_main())
+        return false;
+    return true;
+}
+
 Model::~Model() {
     if (embd_buf_)    ggml_backend_buffer_free(embd_buf_);
     if (embd_ctx_)    ggml_free(embd_ctx_);
@@ -128,7 +137,7 @@ void Model::load_weights_split(
     // ---- Calculate sizes ----
     size_t gpu_size = 0, cpu_size = 0;
     for (auto & kv : tensors_) {
-        if (is_expert_tensor(kv.first)) {
+        if (is_offloaded_expert(kv.first)) {
             cpu_size += ggml_backend_buft_get_alloc_size(cpu_buft, kv.second);
         } else {
             gpu_size += ggml_backend_buft_get_alloc_size(gpu_buft, kv.second);
@@ -155,7 +164,7 @@ void Model::load_weights_split(
     struct ggml_tallocr cpu_talloc = ggml_tallocr_new(out_cpu_buf);
 
     for (auto & kv : tensors_) {
-        if (is_expert_tensor(kv.first)) {
+        if (is_offloaded_expert(kv.first)) {
             if (ggml_tallocr_alloc(&cpu_talloc, kv.second) != GGML_STATUS_SUCCESS)
                 throw std::runtime_error("tallocr alloc failed (cpu): " + kv.first);
         } else {
@@ -183,8 +192,8 @@ void Model::load_weights_split(
         read_tensor_bytes(kv.first, buf.data(), nb, files);
         ggml_backend_tensor_set(t, buf.data(), 0, nb);
 
-        if (is_expert_tensor(kv.first)) cpu_bytes += nb;
-        else                             gpu_bytes += nb;
+        if (is_offloaded_expert(kv.first)) cpu_bytes += nb;
+        else                               gpu_bytes += nb;
 
         // also populate the F32 token-embedding copy
         if (need_f32_embd && t == te) {
@@ -253,7 +262,7 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
 
     size_t gpu_size = 0;
     for (auto & kv : tensors_) {
-        if (is_expert_tensor(kv.first)) continue;   // stays on SSD
+        if (is_offloaded_expert(kv.first)) continue;   // stays on SSD
         gpu_size += ggml_backend_buft_get_alloc_size(gpu_buft, kv.second);
     }
     if (need_f32_embd) gpu_size += ggml_backend_buft_get_alloc_size(gpu_buft, tok_embd_rows_);
@@ -264,7 +273,7 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
 
     struct ggml_tallocr talloc = ggml_tallocr_new(out_gpu_buf);
     for (auto & kv : tensors_) {
-        if (is_expert_tensor(kv.first)) continue;
+        if (is_offloaded_expert(kv.first)) continue;
         if (ggml_tallocr_alloc(&talloc, kv.second) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("tallocr alloc failed (ssd gpu): " + kv.first);
     }
@@ -282,7 +291,7 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
     for (auto & kv : tensors_) {
         ggml_tensor * t = kv.second;
         const size_t nb = ggml_nbytes(t);
-        if (is_expert_tensor(kv.first)) { ssd_bytes += nb; continue; }   // not loaded
+        if (is_offloaded_expert(kv.first)) { ssd_bytes += nb; continue; }   // not loaded
 
         buf.resize(nb);
         read_tensor_bytes(kv.first, buf.data(), nb, files);

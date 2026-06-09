@@ -135,6 +135,12 @@ public:
     // Returns true if the tensor name belongs to a routed expert (not shared expert).
     static bool is_expert_tensor(const std::string & name);
 
+    // Returns true if the tensor is a routed expert that should be offloaded to the
+    // SSD/CPU tier. The trailing MTP (nextn) block is kept fully VRAM-resident, so
+    // its experts are NOT offloaded (it runs once per drafted token and benefits
+    // from staying on the GPU).
+    bool is_offloaded_expert(const std::string & name) const;
+
     std::string summary() const;
     std::string debug_dump() const;
 
