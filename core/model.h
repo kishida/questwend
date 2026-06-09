@@ -100,7 +100,7 @@ public:
     ggml_tensor * tensor(const std::string & name) const;
 
     // Token embedding tensor suitable for ggml_get_rows on any backend.
-    // (CUDA get_rows does not support K-quant/IQ types, so a dequantized F32
+    // (CUDA get_rows does not support K-quant/IQ types, so a dequantized F16
     //  copy is provided for those; otherwise the original tensor is returned.)
     ggml_tensor * tok_embd_rows() const { return tok_embd_rows_; }
 
@@ -136,10 +136,14 @@ public:
     static bool is_expert_tensor(const std::string & name);
 
     // Returns true if the tensor is a routed expert that should be offloaded to the
-    // SSD/CPU tier. The trailing MTP (nextn) block is kept fully VRAM-resident, so
-    // its experts are NOT offloaded (it runs once per drafted token and benefits
-    // from staying on the GPU).
+    // SSD/CPU tier. When MTP is in use the trailing nextn block is kept fully
+    // VRAM-resident (its experts are NOT offloaded), since it runs once per drafted
+    // token and benefits from staying on the GPU. When MTP is not used, the nextn
+    // experts are offloaded like the rest to avoid wasting VRAM.
     bool is_offloaded_expert(const std::string & name) const;
+
+    // Keep the MTP (nextn) block's experts VRAM-resident (set before load_weights_*).
+    void set_keep_nextn_resident(bool v) { keep_nextn_resident_ = v; }
 
     std::string summary() const;
     std::string debug_dump() const;
@@ -149,6 +153,7 @@ private:
 
     HParams hp_;
     Vocab   vocab_;
+    bool    keep_nextn_resident_ = false;  // keep MTP nextn experts in VRAM (set by Runtime)
 
     std::string    path_;
     gguf_context * gguf_   = nullptr;        // KV metadata (first shard)

@@ -51,9 +51,11 @@ bool Model::has_expert_tensors() const {
 
 bool Model::is_offloaded_expert(const std::string & name) const {
     if (!is_expert_tensor(name)) return false;
-    // Keep the trailing MTP (nextn) block's experts in VRAM (block index >= n_main).
+    // The trailing MTP (nextn) block (block index >= n_main) is kept VRAM-resident
+    // only when MTP is in use; otherwise it is offloaded like the main stack.
     int blk = -1;
-    if (std::sscanf(name.c_str(), "blk.%d.", &blk) == 1 && blk >= (int) hp_.n_main())
+    if (keep_nextn_resident_ &&
+        std::sscanf(name.c_str(), "blk.%d.", &blk) == 1 && blk >= (int) hp_.n_main())
         return false;
     return true;
 }
@@ -83,8 +85,8 @@ ggml_backend_buffer * Model::load_weights(ggml_backend_t backend) {
         ep.mem_size = ggml_tensor_overhead() + 256;
         ep.no_alloc = true;
         embd_ctx_ = ggml_init(ep);
-        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_F32, te->ne[0], te->ne[1]);
-        ggml_set_name(tok_embd_rows_, "token_embd.f32");
+        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_F16, te->ne[0], te->ne[1]);
+        ggml_set_name(tok_embd_rows_, "token_embd.f16");
         embd_buf_ = ggml_backend_alloc_ctx_tensors(embd_ctx_, backend);
         if (!embd_buf_) throw std::runtime_error("failed to alloc F32 token embedding");
     }
@@ -105,7 +107,9 @@ ggml_backend_buffer * Model::load_weights(ggml_backend_t backend) {
             const int64_t ne = ggml_nelements(te);
             f32buf.resize(ne);
             ggml_get_type_traits(te->type)->to_float(buf.data(), f32buf.data(), ne);
-            ggml_backend_tensor_set(tok_embd_rows_, f32buf.data(), 0, ne * sizeof(float));
+            std::vector<ggml_fp16_t> f16buf(ne);
+            ggml_fp32_to_fp16_row(f32buf.data(), f16buf.data(), ne);
+            ggml_backend_tensor_set(tok_embd_rows_, f16buf.data(), 0, ne * sizeof(ggml_fp16_t));
         }
     }
     for (auto & kv : files) if (kv.second) fclose((FILE *) kv.second);
@@ -129,8 +133,8 @@ void Model::load_weights_split(
         ep.mem_size = ggml_tensor_overhead() + 256;
         ep.no_alloc = true;
         embd_ctx_ = ggml_init(ep);
-        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_F32, te->ne[0], te->ne[1]);
-        ggml_set_name(tok_embd_rows_, "token_embd.f32");
+        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_F16, te->ne[0], te->ne[1]);
+        ggml_set_name(tok_embd_rows_, "token_embd.f16");
         // will be allocated into out_gpu_buf below
     }
 
@@ -200,7 +204,9 @@ void Model::load_weights_split(
             const int64_t ne = ggml_nelements(te);
             f32buf.resize(ne);
             ggml_get_type_traits(te->type)->to_float(buf.data(), f32buf.data(), ne);
-            ggml_backend_tensor_set(tok_embd_rows_, f32buf.data(), 0, ne * sizeof(float));
+            std::vector<ggml_fp16_t> f16buf(ne);
+            ggml_fp32_to_fp16_row(f32buf.data(), f16buf.data(), ne);
+            ggml_backend_tensor_set(tok_embd_rows_, f16buf.data(), 0, ne * sizeof(ggml_fp16_t));
         }
     }
     for (auto & kv : files) if (kv.second) fclose((FILE *) kv.second);
@@ -256,8 +262,8 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
         ep.mem_size = ggml_tensor_overhead() + 256;
         ep.no_alloc = true;
         embd_ctx_ = ggml_init(ep);
-        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_F32, te->ne[0], te->ne[1]);
-        ggml_set_name(tok_embd_rows_, "token_embd.f32");
+        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_F16, te->ne[0], te->ne[1]);
+        ggml_set_name(tok_embd_rows_, "token_embd.f16");
     }
 
     size_t gpu_size = 0;
@@ -302,7 +308,9 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
             const int64_t ne = ggml_nelements(te);
             f32buf.resize(ne);
             ggml_get_type_traits(te->type)->to_float(buf.data(), f32buf.data(), ne);
-            ggml_backend_tensor_set(tok_embd_rows_, f32buf.data(), 0, ne * sizeof(float));
+            std::vector<ggml_fp16_t> f16buf(ne);
+            ggml_fp32_to_fp16_row(f32buf.data(), f16buf.data(), ne);
+            ggml_backend_tensor_set(tok_embd_rows_, f16buf.data(), 0, ne * sizeof(ggml_fp16_t));
         }
     }
     for (auto & kv : files) if (kv.second) fclose((FILE *) kv.second);
