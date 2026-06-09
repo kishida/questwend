@@ -84,6 +84,8 @@ int main(int argc, char ** argv) {
         cfg.vram_budget_mb = vram_budget_mb;
         cfg.cache_profile  = cache_profile;
         cfg.experts_ssd    = experts_ssd;
+        // MTP needs the nextn block kept VRAM-resident (also the dev MTP test mode).
+        cfg.use_mtp        = use_mtp || getenv("QWEN_MTP_TEST");
         Runtime rt(*model, cfg);
         Sampler smp(sc);
 

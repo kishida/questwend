@@ -23,6 +23,7 @@ struct RuntimeConfig {
     std::string cache_profile;       // file to persist/prefetch the hot-expert profile
     bool   cache_profile_save = true; // false: load/prefetch only, never overwrite the profile
     bool   experts_ssd    = false;   // stream experts from the GGUF on SSD (no RAM copy)
+    bool   use_mtp        = false;   // MTP self-speculative decode (keeps nextn block VRAM-resident)
 };
 
 class Runtime {
