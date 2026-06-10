@@ -8,6 +8,7 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -414,7 +415,28 @@ static std::vector<std::string> discover_shards(const std::string & path) {
     return { path };
 }
 
+// ggml log filter: the default callback prints every level, and the Metal
+// backend emits a DEBUG line per buffer allocation (plus a WARN per allocation
+// when near the recommended working-set limit), which floods stderr on paths
+// that allocate temp buffers per decode step. Drop DEBUG and collapse repeated
+// identical WARNs; QWEN_GGML_DEBUG=1 restores the full firehose.
+static void qwencpp_ggml_log(ggml_log_level level, const char * text, void * /*user*/) {
+    static bool debug = getenv("QWEN_GGML_DEBUG") != nullptr;
+    static ggml_log_level last_level = GGML_LOG_LEVEL_INFO;
+    static std::string last_warn;
+    if (debug) { fputs(text, stderr); return; }
+    if (level != GGML_LOG_LEVEL_CONT) last_level = level;
+    if (last_level == GGML_LOG_LEVEL_DEBUG) return;
+    if (last_level == GGML_LOG_LEVEL_WARN && level != GGML_LOG_LEVEL_CONT) {
+        if (text == last_warn) return;   // same warning repeating (e.g. per-alloc)
+        last_warn = text;
+    }
+    fputs(text, stderr);
+}
+
 std::unique_ptr<Model> Model::load(const std::string & path) {
+    ggml_log_set(qwencpp_ggml_log, nullptr);
+
     auto m = std::unique_ptr<Model>(new Model());
     m->path_ = path;
 
