@@ -68,6 +68,34 @@ Model::~Model() {
     if (meta_) ggml_free(meta_);
 }
 
+// Whether `backend` can run ggml_get_rows directly on a tensor of te's type.
+// CUDA lacks K-quant/IQ get_rows kernels (needs the F16/Q8_0 fallback copy);
+// Metal and CPU support them natively, so the copy would just waste memory.
+static bool backend_supports_get_rows(ggml_backend_t backend, const ggml_tensor * te) {
+    ggml_init_params p{};
+    p.mem_size = ggml_tensor_overhead() * 4 + 256;
+    p.no_alloc = true;
+    ggml_context * c = ggml_init(p);
+    ggml_tensor * src = ggml_new_tensor_2d(c, te->type, te->ne[0], te->ne[1]);
+    ggml_tensor * ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);
+    ggml_tensor * op  = ggml_get_rows(c, src, ids);
+    const bool ok = ggml_backend_supports_op(backend, op);
+    ggml_free(c);
+    return ok;
+}
+
+// Quantized token embedding needs a get_rows-friendly copy only when the
+// backend has no native kernel for the stored type.
+static bool need_embd_fallback(ggml_backend_t backend, const ggml_tensor * te) {
+    if (!te || te->type == GGML_TYPE_F32 || te->type == GGML_TYPE_F16) return false;
+    if (backend_supports_get_rows(backend, te)) {
+        fprintf(stderr, "token_embd: %s natively supported by backend get_rows (no fallback copy)\n",
+                ggml_type_name(te->type));
+        return false;
+    }
+    return true;
+}
+
 ggml_backend_buffer * Model::load_weights(ggml_backend_t backend) {
     // Allocate one backend buffer holding all weight tensors.
     weights_buf_ = ggml_backend_alloc_ctx_tensors(meta_, backend);
@@ -75,11 +103,11 @@ ggml_backend_buffer * Model::load_weights(ggml_backend_t backend) {
         throw std::runtime_error("failed to allocate weights buffer");
     }
 
-    // token embedding for get_rows: dequantize to F32 if the stored type is not
-    // get_rows-friendly on GPU (K-quants / IQ types are unsupported by CUDA).
+    // token embedding for get_rows: dequantize if the stored type has no native
+    // get_rows kernel on this backend (K-quants / IQ types on CUDA).
     ggml_tensor * te = tensor("token_embd.weight");
     tok_embd_rows_ = te;
-    const bool need_f32_embd = te && te->type != GGML_TYPE_F32 && te->type != GGML_TYPE_F16;
+    const bool need_f32_embd = need_embd_fallback(backend, te);
     if (need_f32_embd) {
         const ggml_type dst_type = embd_q8_ ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
         const double dst_mb = embd_q8_
@@ -136,10 +164,10 @@ void Model::load_weights_split(
 {
     ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_backend);
 
-    // ---- Prep F32 embedding copy (same as single-backend path) ----
+    // ---- Prep embedding fallback copy (same as single-backend path) ----
     ggml_tensor * te = tensor("token_embd.weight");
     tok_embd_rows_ = te;
-    const bool need_f32_embd = te && te->type != GGML_TYPE_F32 && te->type != GGML_TYPE_F16;
+    const bool need_f32_embd = need_embd_fallback(gpu_backend, te);
     if (need_f32_embd) {
         const ggml_type dst_type = embd_q8_ ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
         const double dst_mb = embd_q8_
@@ -281,10 +309,10 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
                              ggml_backend_buffer_t & out_gpu_buf) {
     ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_backend);
 
-    // F32 token-embedding fallback (same as load_weights)
+    // token-embedding fallback (same as load_weights)
     ggml_tensor * te = tensor("token_embd.weight");
     tok_embd_rows_ = te;
-    const bool need_f32_embd = te && te->type != GGML_TYPE_F32 && te->type != GGML_TYPE_F16;
+    const bool need_f32_embd = need_embd_fallback(gpu_backend, te);
     if (need_f32_embd) {
         const ggml_type dst_type = embd_q8_ ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
         const double dst_mb = embd_q8_

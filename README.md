@@ -10,7 +10,7 @@ Qwen3 / Qwen3.5 / Qwen3.6 をスクラッチ実装した推論エンジン（ven
   - エキスパート常駐プロファイルの永続化（`--cache-profile`）でウォーム起動を高速化
   - MTP（Multi-Token Prediction / nextn）自己推測デコード（`--mtp`, `--draft N`）
   - 分割（sharded）GGUF 対応（`-NNNNN-of-MMMMM.gguf`）
-  - 大語彙モデルの K-quant 埋め込みは get_rows 用に F16 変換版を VRAM に保持（`--embd-q8` で Q8_0 化し VRAM をさらに節約可能）
+  - 大語彙モデルの K-quant 埋め込みは、バックエンドの get_rows が非対応の場合のみ F16 変換版を VRAM に保持（CUDA のみ; Metal/CPU はネイティブ対応のためコピー不要。`--embd-q8` で Q8_0 化も可）
   - OpenAI 互換サーバー（`infer-server`）＋ブラウザ・チャット UI
 
 ---
@@ -174,6 +174,6 @@ infer -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40000 --ex
 ## 7. メモ / 制限
 
 - 既定はサンプリング無し（greedy, `temp=0`）で再現性重視。
-- 大語彙（例: 248k）の K-quant 埋め込みは get_rows 用に F16 変換版を VRAM に持つ（実質ロスレス）。VRAM が厳しい場合は `--embd-q8` で Q8_0 化（F16 比 約半分、わずかな量子化誤差あり）。
+- 大語彙（例: 248k）の K-quant 埋め込みは、バックエンドの get_rows がその型に非対応の場合のみ F16 変換版を VRAM に持つ（実質ロスレス）。CUDA は K-quant/IQ 非対応のため変換が走る。Metal / CPU はネイティブ対応なのでコピー自体を作らない（メモリ節約）。VRAM が厳しい場合は `--embd-q8` で Q8_0 化（F16 比 約半分、わずかな量子化誤差あり）。
 - オフロードの RAM 階層は host pinned メモリを使う。単一の `cudaHostAlloc` には上限（環境依存, 例 ~15.5GB）があるため、エキスパートは複数チャンクに分けて pin する。
 - CUDA グラフ / Flash Attention は CUDA ビルドで既定有効。

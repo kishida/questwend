@@ -1188,19 +1188,21 @@ void Runtime::Impl::decode_verify_cached(const std::vector<int32_t> & toks) {
     const int T = (int) toks.size();
     const int n_used = model.hparams().n_expert_used;
     if (ecache->min_slots() >= T * n_used) {
+        // batched path: fills vH and vA (GPU argmax, no logits readback)
         decode_cached_batch(toks.data(), T, /*want_logits=*/false, /*verify=*/true);
     } else {
-        // pools too small to hold all tokens' experts at once: token-by-token.
+        // pools too small to hold all tokens' experts at once: token-by-token,
+        // with host argmax over the full logits.
         vL.assign(T, {}); vH.assign(T, {});
-        for (int i = 0; i < T; ++i) { vL[i] = decode_cached(toks[i]); vH[i] = mtp_hidden; }
-    }
-    // host argmax (the fast path computes this on GPU)
-    vA.assign(T, 0);
-    for (int i = 0; i < T; ++i) {
-        const auto & v = vL[i];
-        int b = 0;
-        for (int j = 1; j < (int) v.size(); ++j) if (v[j] > v[b]) b = j;
-        vA[i] = b;
+        vA.assign(T, 0);
+        for (int i = 0; i < T; ++i) {
+            vL[i] = decode_cached(toks[i]);
+            vH[i] = mtp_hidden;
+            const auto & v = vL[i];
+            int b = 0;
+            for (int j = 1; j < (int) v.size(); ++j) if (v[j] > v[b]) b = j;
+            vA[i] = b;
+        }
     }
 }
 
@@ -1685,39 +1687,35 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_backend_tensor_set(slot_u_b, su.data(), 0, (size_t) n_used * T * sizeof(int32_t));
         ggml_backend_tensor_set(slot_d_b, sd.data(), 0, (size_t) n_used * T * sizeof(int32_t));
 
-        // ===== seg B: expert matmuls + residual (per token, one graph) =====
+        // ===== seg B: expert matmuls + residual (all T tokens, batched) =====
+        // mul_mat_id takes the whole batch at once (ids [n_used, T]); the
+        // weighted sum over n_used mirrors build_moe's batched path.
         ctx = new_ctx();
         gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-        ggml_tensor * up_sh = Wopt("blk.%d.ffn_up_shexp.weight", il);
-        for (int t = 0; t < T; ++t) {
-            ggml_tensor * ffn_t = ggml_view_2d(ctx, ffn_in_b, n_embd, 1, ffn_in_b->nb[1], (size_t) t * ffn_in_b->nb[1]);
-            ggml_tensor * sg_t  = ggml_view_2d(ctx, slot_g_b, n_used, 1, slot_g_b->nb[1], (size_t) t * slot_g_b->nb[1]);
-            ggml_tensor * su_t  = ggml_view_2d(ctx, slot_u_b, n_used, 1, slot_u_b->nb[1], (size_t) t * slot_u_b->nb[1]);
-            ggml_tensor * sd_t  = ggml_view_2d(ctx, slot_d_b, n_used, 1, slot_d_b->nb[1], (size_t) t * slot_d_b->nb[1]);
-            ggml_tensor * w_t   = ggml_view_2d(ctx, weights_b, n_used, 1, weights_b->nb[1], (size_t) t * weights_b->nb[1]);
-            ggml_tensor * r_t   = ggml_view_2d(ctx, resid_b,  n_embd, 1, resid_b->nb[1],  (size_t) t * resid_b->nb[1]);
-
-            ggml_tensor * x3   = ggml_reshape_3d(ctx, ggml_cont(ctx, ffn_t), n_embd, 1, 1);
-            ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3, su_t);
-            ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3, sg_t);
+        {
+            ggml_tensor * x3   = ggml_reshape_3d(ctx, ffn_in_b, n_embd, 1, T);
+            ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3, slot_u_b);
+            ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3, slot_g_b);
             ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
-            ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, sd_t);  // [n_embd, n_used, 1]
-            ggml_tensor * et = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, experts, n_embd, n_used)));
-            ggml_tensor * w  = ggml_reshape_2d(ctx, w_t, n_used, 1);
-            ggml_tensor * moe_t = ggml_mul_mat(ctx, et, w);   // [n_embd, 1]
+            ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, slot_d_b); // [n_embd, n_used, T]
+            experts = ggml_mul(ctx, experts, ggml_reshape_3d(ctx, weights_b, 1, n_used, T));
+            ggml_tensor * moe_out = nullptr;
+            for (int i = 0; i < n_used; ++i) {
+                ggml_tensor * v = ggml_view_2d(ctx, experts, n_embd, T, experts->nb[2], (size_t) i * experts->nb[1]);
+                moe_out = i ? ggml_add(ctx, moe_out, v) : v;
+            }
+            if (n_used == 1) moe_out = ggml_cont(ctx, moe_out);
 
-            if (up_sh) {
-                ggml_tensor * ffc = ggml_cont(ctx, ffn_t);
-                ggml_tensor * g  = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), ffc);
-                ggml_tensor * u  = ggml_mul_mat(ctx, up_sh, ffc);
+            if (ggml_tensor * up_sh = Wopt("blk.%d.ffn_up_shexp.weight", il)) {
+                ggml_tensor * g  = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), ffn_in_b);
+                ggml_tensor * u  = ggml_mul_mat(ctx, up_sh, ffn_in_b);
                 ggml_tensor * sh = ggml_mul_mat(ctx, W("blk.%d.ffn_down_shexp.weight", il),
                                                 ggml_mul(ctx, ggml_silu(ctx, g), u));
-                ggml_tensor * sgt = ggml_sigmoid(ctx, ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp_shexp.weight", il), ffc));
-                moe_t = ggml_add(ctx, moe_t, ggml_mul(ctx, sh, sgt));
+                ggml_tensor * sgt = ggml_sigmoid(ctx, ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp_shexp.weight", il), ffn_in_b));
+                moe_out = ggml_add(ctx, moe_out, ggml_mul(ctx, sh, sgt));
             }
-            ggml_tensor * h_t = ggml_add(ctx, moe_t, r_t);
-            ggml_tensor * dst = ggml_view_2d(ctx, h_b, n_embd, 1, h_b->nb[1], (size_t) t * h_b->nb[1]);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, h_t, dst));
+            ggml_tensor * h_new = ggml_add(ctx, moe_out, resid_b);              // [n_embd, T]
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, h_b));
         }
         run(ctx, gf);
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
@@ -1746,8 +1744,10 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_free(ctx);
     }
 
-    // MTP verify: expose per-position logits (vL[i]) and main hidden (vH[i]) for
-    // all T tokens so the caller can accept the longest matching draft prefix.
+    // MTP verify: expose per-position argmax (vA[i], GPU-computed) and main
+    // hidden (vH[i]) for all T tokens so the caller can accept the longest
+    // matching draft prefix. Full logits are never read back (T x n_vocab
+    // floats would dominate the readback cost on large-vocab models).
     if (verify) {
         vH.assign(T, std::vector<float>(n_embd));
         for (int i = 0; i < T; ++i)
@@ -1760,15 +1760,14 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_tensor * output_w = model.tensor("output.weight");
         if (!output_w) output_w = model.tensor("token_embd.weight");
         cur = ggml_mul_mat(ctx, output_w, cur);                                 // [n_vocab, T]
-        ggml_set_name(cur, "vlogits");
-        ggml_build_forward_expand(gf, cur);
+        ggml_tensor * am = ggml_argmax(ctx, cur);                               // [T] i32
+        ggml_set_name(am, "verify_argmax");
+        ggml_build_forward_expand(gf, am);
         run(ctx, gf);
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("decode_cached_batch: verify output compute failed");
-        const int n_vocab = (int) cur->ne[0];
-        vL.assign(T, std::vector<float>(n_vocab));
-        for (int i = 0; i < T; ++i)
-            ggml_backend_tensor_get(cur, vL[i].data(), (size_t) i * cur->nb[1], n_vocab * sizeof(float));
+        vA.assign(T, 0);
+        ggml_backend_tensor_get(am, vA.data(), 0, T * sizeof(int32_t));
         ggml_free(ctx);
     }
 
