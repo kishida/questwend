@@ -201,8 +201,50 @@ N トークン先読みできる。`[x, d_1..d_N]` を1回の (N+1) トークン
 - MTP が伸びない要因（このモデル特有）: **語彙 248k の巨大 lm_head を draft ごとに計算**、
   **GDN 再帰状態の partial-accept 再デコード**（KV と違い部分ロールバック不可）。
 
-> 既知の perf バグ: `--draft >= 3` は reject/partial が増えると GDN 状態 restore + 再デコード
-> 経路が支配的になり激遅化する（出力はロスレス）。実用は `--draft 1`〜`2` を推奨。
+> ~~既知の perf バグ: `--draft >= 3` は激遅化する~~ → **§4.6 の GDN チェックポイントで解消**。
+
+---
+
+## 4.6 高速化ラウンド2: llama.cpp 比較で見つけたオーバーヘッド除去
+
+llama.cpp は同環境の 27B Q2 (ctx=2000) で plain 19 → MTP 28 tok/s（+47%）を出すが、
+当時の本実装は 19 → 18 と**逆に遅かった**。`QWEN_PROF_MTP=1` でフェーズ分解した結果
+（1サイクル = draft K 回 + verify 1回 = 2.26 tok）:
+
+| フェーズ | 旧 (ms/cycle) | 新 (ms/cycle) | 対策 |
+|---|---|---|---|
+| draft ×2 | 12.7 | 11.0 | 永続グラフ + **専用 backend インスタンス**（CUDAグラフ枠を verify と分離）+ GPU argmax（248k logits 読み戻し→4B） |
+| verify (3tok) | 71.0 | 65.3 | 永続グラフ化（毎回の graph 構築+alloc を排除）+ GPU argmax |
+| settle (GDN巻き戻し) | 28.4 | **1.5** | **GDN 状態チェックポイント**（下記） |
+| resync (MTP KV 書き直し) | 7.2 | **1.4** | **headless 化**（共有 lm_head ~1GB の matmul をスキップ。llama.cpp の catch-up decode が logits=0 で head を省くのと同じ） |
+
+**GDN 状態チェックポイント**: verify グラフ内で `ggml_gated_delta_net` をトークン毎に
+分割実行（逐次演算なので FLOPs 同一）し、各トークン後の conv/ssm 状態を checkpoint
+バッファに `cpy`。partial accept 時は checkpoint[a] を `tensor_copy` で復元するだけ
+（旧: 状態 restore + 受理トークンのフル再デコード = 1回 ~61ms）。
+これが draft>=3 激遅バグの根治にもなった（reject 頻度が上がっても再デコードが無いため）。
+
+**付随修正**: 埋め込み get_rows フォールバックを F16 → **Q8_0**（2.5GB → 1.35GB）。
+27B Q2 + MTP 一式が ctx=2000 でも VRAM 16GB に収まるようになった
+（以前は WDDM ページングで全体が劣化していた。VRAM 残量が成績を支配するので注意）。
+
+### 実測（27B-UD-Q2_K_XL, ctx=2000, RTX 4060 Ti, n=200, GPU 専有）
+
+| 方式 | tok/s (prefill込) | 生成のみ換算 |
+|---|---|---|
+| plain | 18.2 | ~18.5 |
+| `--mtp --draft 1` | 22.1 | – |
+| `--mtp --draft 2` | **24.2** | **~28.5** |
+| `--mtp --draft 3` | 24.6 | – |
+| `--mtp --draft 4` | 24.0 | – |
+
+- plain 比 **+33%**（生成のみでは llama.cpp の 28 tok/s と同水準）。draft 2〜3 が最良。
+- 27B 非オフロードはロスレス確認済み（draft=1/2 で plain と出力完全一致）。
+- 35B offload は従来どおり MTP 不利（fetch 律速）。なお offload では plain（単発
+  経路）と MTP verify（バッチ経路）の浮動小数点順序差により、まれに near-tie の
+  argmax が反転して出力が分岐し得る（旧実装から存在する既知の性質、品質劣化ではない）。
+- 残る上限要因: draft 1回 ~5.4ms のうち ~3.7ms は **語彙 248k の共有 lm_head
+  mat-vec（~1GB 読み）**で、draft の argmax に必須なため不可避（llama.cpp も同条件）。
 
 ---
 
@@ -229,16 +271,16 @@ QWEN_MTP_NOACCEPT=1 infer -m model-MTP.gguf -p "..." -n 64 --mtp
 - dense / MoE / offload を含め **MTP 自己推測デコードを完全実装**し、ロスレス・
   高受理率（79–93%）を確認。
 - **損得はメモリ階層で決まる**（クリーン環境 = GPU 専有で再計測）:
-  - **計算律速（モデルが全量 VRAM 常駐, 27B）** → MTP は概ね中立。draft=2 で plain を
-    わずかに上回る（+3.5%, 17.7 vs 17.1 tok/s）。draft=2 > draft=1。
-    ※以前報告した「+16%」は GPU コンテンション下で plain が遅かったアーティファクト。
+  - **計算律速（モデルが全量 VRAM 常駐, 27B）** → §4.6 の最適化後、draft=2 で
+    **plain +33%**（18.2 → 24.2 tok/s, ctx=2000）。llama.cpp の MTP 同水準。
+    ※それ以前は「概ね中立」だった（verify 毎回グラフ構築・GDN 再デコード・
+    lm_head 読み戻しのオーバーヘッドが speculative ゲインを食っていた）。
   - **フェッチ律速（experts オフロード, 35B）** → MTP は遅い（plain 19.7 vs draft=1 16.9
     vs draft=2 12.9）。verify の追加 expert fetch が支配項で、自己推測の構造上消せない。
-  - MTP が伸びない要因: 語彙 248k の巨大 lm_head を draft ごとに計算、GDN の partial-accept
-    再デコード。既に最適化済みの plain decode が速いことも一因。
+  - 残る固定費: 語彙 248k の巨大 lm_head を draft ごとに計算（draft の argmax に必須）。
 - 付随する最適化:
   - nextn ブロックを VRAM 常駐（`d40ec74`）— offload 時の draft オーバーヘッド削減。
   - 非 MTP 時は nextn もオフロード（`8a24f4f`）— VRAM 浪費の回避。
-  - 埋め込み get_rows フォールバックを F16 化（`948d62e`）— 大語彙モデルの VRAM 半減。
+  - 埋め込み get_rows フォールバックを F16 化（`948d62e`）→ さらに Q8_0 化（§4.6）。
 - offload 環境で MTP 以外に効く方向: **常駐率向上・プリフェッチ強化
   （expert fetch そのものの削減）**。

@@ -10,7 +10,7 @@ Qwen3 / Qwen3.5 / Qwen3.6 をスクラッチ実装した推論エンジン（ven
   - エキスパート常駐プロファイルの永続化（`--cache-profile`）でウォーム起動を高速化
   - MTP（Multi-Token Prediction / nextn）自己推測デコード（`--mtp`, `--draft N`）
   - 分割（sharded）GGUF 対応（`-NNNNN-of-MMMMM.gguf`）
-  - 大語彙モデル向けに埋め込み get_rows フォールバックを F16 化（VRAM 半減）
+  - 大語彙モデル向けに埋め込み get_rows フォールバックを Q8_0 化（F32 比 1/4 の VRAM）
   - OpenAI 互換サーバー（`infer-server`）＋ブラウザ・チャット UI
 
 ---
@@ -114,12 +114,13 @@ infer -m moe.gguf -p "..." -n 128 --vram-budget 15000 --cache-profile hot.prof
 
 ```bash
 infer -m model-MTP.gguf -p "..." -n 128 --mtp            # 1 トークン先読み
-infer -m model-MTP.gguf -p "..." -n 128 --mtp --draft 2  # 2 トークン先読み（推奨上限）
+infer -m model-MTP.gguf -p "..." -n 128 --mtp --draft 2  # 2 トークン先読み（推奨）
 ```
 
 - 出力は通常デコードと完全一致（greedy ロスレス）。
-- 速度は条件依存: 計算律速（全 VRAM 常駐）で `--draft 2` が小幅有利、オフロード（fetch 律速）では不利。詳細は [`docs/mtp.md`](docs/mtp.md)。
-- `--draft >= 3` は既知の perf バグあり（出力は正しいが遅い）。実用は 1〜2。
+- 計算律速（モデル全量 VRAM 常駐）では `--draft 2`〜`3` で plain 比 **+30%程度**
+  （27B Q2, ctx=2000: 18.2 → 24.2 tok/s）。オフロード（fetch 律速）では不利。
+  詳細は [`docs/mtp.md`](docs/mtp.md)。
 
 ---
 
@@ -171,6 +172,6 @@ infer -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40000 --ex
 ## 7. メモ / 制限
 
 - 既定はサンプリング無し（greedy, `temp=0`）で再現性重視。
-- 大語彙（例: 248k）の K-quant 埋め込みは get_rows 用に F16 のデキャント版を VRAM に持つ（F32 比で半減）。
+- 大語彙（例: 248k）の K-quant 埋め込みは get_rows 用に Q8_0 の再量子化版を VRAM に持つ（F32 比 1/4）。
 - オフロードの RAM 階層は host pinned メモリを使う。単一の `cudaHostAlloc` には上限（環境依存, 例 ~15.5GB）があるため、エキスパートは複数チャンクに分けて pin する。
 - CUDA グラフ / Flash Attention は CUDA ビルドで既定有効。

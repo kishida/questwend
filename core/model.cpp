@@ -1,4 +1,4 @@
-#include "model.h"
+﻿#include "model.h"
 #include "gguf_util.h"
 
 #include "ggml.h"
@@ -85,8 +85,8 @@ ggml_backend_buffer * Model::load_weights(ggml_backend_t backend) {
         ep.mem_size = ggml_tensor_overhead() + 256;
         ep.no_alloc = true;
         embd_ctx_ = ggml_init(ep);
-        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_F16, te->ne[0], te->ne[1]);
-        ggml_set_name(tok_embd_rows_, "token_embd.f16");
+        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_Q8_0, te->ne[0], te->ne[1]);
+        ggml_set_name(tok_embd_rows_, "token_embd.q8_0");
         embd_buf_ = ggml_backend_alloc_ctx_tensors(embd_ctx_, backend);
         if (!embd_buf_) throw std::runtime_error("failed to alloc F32 token embedding");
     }
@@ -107,9 +107,9 @@ ggml_backend_buffer * Model::load_weights(ggml_backend_t backend) {
             const int64_t ne = ggml_nelements(te);
             f32buf.resize(ne);
             ggml_get_type_traits(te->type)->to_float(buf.data(), f32buf.data(), ne);
-            std::vector<ggml_fp16_t> f16buf(ne);
-            ggml_fp32_to_fp16_row(f32buf.data(), f16buf.data(), ne);
-            ggml_backend_tensor_set(tok_embd_rows_, f16buf.data(), 0, ne * sizeof(ggml_fp16_t));
+            std::vector<uint8_t> qbuf(ggml_nbytes(tok_embd_rows_));
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, f32buf.data(), qbuf.data(), 0, te->ne[1], te->ne[0], nullptr);
+            ggml_backend_tensor_set(tok_embd_rows_, qbuf.data(), 0, qbuf.size());
         }
     }
     for (auto & kv : files) if (kv.second) fclose((FILE *) kv.second);
@@ -133,8 +133,8 @@ void Model::load_weights_split(
         ep.mem_size = ggml_tensor_overhead() + 256;
         ep.no_alloc = true;
         embd_ctx_ = ggml_init(ep);
-        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_F16, te->ne[0], te->ne[1]);
-        ggml_set_name(tok_embd_rows_, "token_embd.f16");
+        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_Q8_0, te->ne[0], te->ne[1]);
+        ggml_set_name(tok_embd_rows_, "token_embd.q8_0");
         // will be allocated into out_gpu_buf below
     }
 
@@ -208,9 +208,9 @@ void Model::load_weights_split(
             const int64_t ne = ggml_nelements(te);
             f32buf.resize(ne);
             ggml_get_type_traits(te->type)->to_float(buf.data(), f32buf.data(), ne);
-            std::vector<ggml_fp16_t> f16buf(ne);
-            ggml_fp32_to_fp16_row(f32buf.data(), f16buf.data(), ne);
-            ggml_backend_tensor_set(tok_embd_rows_, f16buf.data(), 0, ne * sizeof(ggml_fp16_t));
+            std::vector<uint8_t> qbuf(ggml_nbytes(tok_embd_rows_));
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, f32buf.data(), qbuf.data(), 0, te->ne[1], te->ne[0], nullptr);
+            ggml_backend_tensor_set(tok_embd_rows_, qbuf.data(), 0, qbuf.size());
         }
     }
     for (auto & kv : files) if (kv.second) fclose((FILE *) kv.second);
@@ -266,8 +266,8 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
         ep.mem_size = ggml_tensor_overhead() + 256;
         ep.no_alloc = true;
         embd_ctx_ = ggml_init(ep);
-        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_F16, te->ne[0], te->ne[1]);
-        ggml_set_name(tok_embd_rows_, "token_embd.f16");
+        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_Q8_0, te->ne[0], te->ne[1]);
+        ggml_set_name(tok_embd_rows_, "token_embd.q8_0");
     }
 
     size_t gpu_size = 0;
@@ -312,9 +312,9 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
             const int64_t ne = ggml_nelements(te);
             f32buf.resize(ne);
             ggml_get_type_traits(te->type)->to_float(buf.data(), f32buf.data(), ne);
-            std::vector<ggml_fp16_t> f16buf(ne);
-            ggml_fp32_to_fp16_row(f32buf.data(), f16buf.data(), ne);
-            ggml_backend_tensor_set(tok_embd_rows_, f16buf.data(), 0, ne * sizeof(ggml_fp16_t));
+            std::vector<uint8_t> qbuf(ggml_nbytes(tok_embd_rows_));
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, f32buf.data(), qbuf.data(), 0, te->ne[1], te->ne[0], nullptr);
+            ggml_backend_tensor_set(tok_embd_rows_, qbuf.data(), 0, qbuf.size());
         }
     }
     for (auto & kv : files) if (kv.second) fclose((FILE *) kv.second);
