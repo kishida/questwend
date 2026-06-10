@@ -22,6 +22,7 @@ static void usage(const char * prog) {
     printf("  --reasoning <on|off>  thinking mode for chat (default on)\n");
     printf("  --mtp          MTP self-speculative greedy decode (models with a nextn block)\n");
     printf("  --draft <N>    MTP draft length (tokens drafted per verify; default 1)\n");
+    printf("  --embd-q8      use Q8_0 (not F16) for token embedding fallback (saves ~45%% VRAM)\n");
     printf("  -n <N>         max new tokens (default 128)\n");
     printf("  --n-ctx <N>    context length (default 4096)\n");
     printf("  --temp <f>     temperature (0 = greedy, default 0)\n");
@@ -41,7 +42,7 @@ int main(int argc, char ** argv) {
     int  max_tokens = 128, n_ctx = 4096, n_draft = 1;
     size_t vram_budget_mb = 0;
     bool interactive = false, info_only = false, chat = false, log_speed = false, force_cpu = false;
-    bool experts_ssd = false, reasoning = true, use_mtp = false;
+    bool experts_ssd = false, reasoning = true, use_mtp = false, embd_q8 = false;
     SamplerConfig sc;
     sc.temperature = 0.0f;  // CLI defaults to greedy for reproducibility
 
@@ -64,6 +65,7 @@ int main(int argc, char ** argv) {
         else if (a == "--reasoning" && i + 1 < argc) { std::string v = next(); reasoning = (v != "off" && v != "0" && v != "false"); }
         else if (a == "--mtp")              use_mtp = true;
         else if (a == "--draft" && i + 1 < argc) n_draft = std::stoi(next());
+        else if (a == "--embd-q8")          embd_q8 = true;
         else if (a == "--log-tokens-per-sec")    log_speed = true;
         else if (a == "--cpu")              force_cpu = true;
         else if (a == "--info")             info_only = true;
@@ -88,6 +90,7 @@ int main(int argc, char ** argv) {
         cfg.experts_ssd    = experts_ssd;
         // MTP needs the nextn block kept VRAM-resident (also the dev MTP test mode).
         cfg.use_mtp        = use_mtp || getenv("QWEN_MTP_TEST");
+        cfg.embd_q8        = embd_q8;
         Runtime rt(*model, cfg);
         Sampler smp(sc);
 

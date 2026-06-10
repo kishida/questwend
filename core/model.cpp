@@ -81,14 +81,22 @@ ggml_backend_buffer * Model::load_weights(ggml_backend_t backend) {
     tok_embd_rows_ = te;
     const bool need_f32_embd = te && te->type != GGML_TYPE_F32 && te->type != GGML_TYPE_F16;
     if (need_f32_embd) {
+        const ggml_type dst_type = embd_q8_ ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+        const double dst_mb = embd_q8_
+            ? te->ne[0] * te->ne[1] * 1.0625 / 1048576.0
+            : te->ne[0] * te->ne[1] * 2.0    / 1048576.0;
+        fprintf(stderr, "token_embd: %s is not GPU get_rows compatible, re-quantizing to %s "
+                "(%.0f MB -> %.0f MB)\n",
+                ggml_type_name(te->type), ggml_type_name(dst_type),
+                ggml_nbytes(te) / 1048576.0, dst_mb);
         ggml_init_params ep{};
         ep.mem_size = ggml_tensor_overhead() + 256;
         ep.no_alloc = true;
         embd_ctx_ = ggml_init(ep);
-        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_Q8_0, te->ne[0], te->ne[1]);
-        ggml_set_name(tok_embd_rows_, "token_embd.q8_0");
+        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, dst_type, te->ne[0], te->ne[1]);
+        ggml_set_name(tok_embd_rows_, embd_q8_ ? "token_embd.q8_0" : "token_embd.f16");
         embd_buf_ = ggml_backend_alloc_ctx_tensors(embd_ctx_, backend);
-        if (!embd_buf_) throw std::runtime_error("failed to alloc F32 token embedding");
+        if (!embd_buf_) throw std::runtime_error("failed to alloc token embedding fallback");
     }
 
     std::map<std::string, void *> files;
@@ -102,13 +110,17 @@ ggml_backend_buffer * Model::load_weights(ggml_backend_t backend) {
         read_tensor_bytes(kv.first, buf.data(), nb, files);
         ggml_backend_tensor_set(t, buf.data(), 0, nb);
 
-        // also populate the F32 token-embedding copy
+        // also populate the F16/Q8_0 token-embedding copy
         if (need_f32_embd && t == te) {
             const int64_t ne = ggml_nelements(te);
             f32buf.resize(ne);
             ggml_get_type_traits(te->type)->to_float(buf.data(), f32buf.data(), ne);
             std::vector<uint8_t> qbuf(ggml_nbytes(tok_embd_rows_));
-            ggml_quantize_chunk(GGML_TYPE_Q8_0, f32buf.data(), qbuf.data(), 0, te->ne[1], te->ne[0], nullptr);
+            if (embd_q8_) {
+                ggml_quantize_chunk(GGML_TYPE_Q8_0, f32buf.data(), qbuf.data(), 0, te->ne[1], te->ne[0], nullptr);
+            } else {
+                ggml_fp32_to_fp16_row(f32buf.data(), (ggml_fp16_t *) qbuf.data(), ne);
+            }
             ggml_backend_tensor_set(tok_embd_rows_, qbuf.data(), 0, qbuf.size());
         }
     }
@@ -129,12 +141,20 @@ void Model::load_weights_split(
     tok_embd_rows_ = te;
     const bool need_f32_embd = te && te->type != GGML_TYPE_F32 && te->type != GGML_TYPE_F16;
     if (need_f32_embd) {
+        const ggml_type dst_type = embd_q8_ ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+        const double dst_mb = embd_q8_
+            ? te->ne[0] * te->ne[1] * 1.0625 / 1048576.0
+            : te->ne[0] * te->ne[1] * 2.0    / 1048576.0;
+        fprintf(stderr, "token_embd: %s is not GPU get_rows compatible, re-quantizing to %s "
+                "(%.0f MB -> %.0f MB)\n",
+                ggml_type_name(te->type), ggml_type_name(dst_type),
+                ggml_nbytes(te) / 1048576.0, dst_mb);
         ggml_init_params ep{};
         ep.mem_size = ggml_tensor_overhead() + 256;
         ep.no_alloc = true;
         embd_ctx_ = ggml_init(ep);
-        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_Q8_0, te->ne[0], te->ne[1]);
-        ggml_set_name(tok_embd_rows_, "token_embd.q8_0");
+        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, dst_type, te->ne[0], te->ne[1]);
+        ggml_set_name(tok_embd_rows_, embd_q8_ ? "token_embd.q8_0" : "token_embd.f16");
         // will be allocated into out_gpu_buf below
     }
 
@@ -203,13 +223,17 @@ void Model::load_weights_split(
         if (is_offloaded_expert(kv.first)) cpu_bytes += nb;
         else                               gpu_bytes += nb;
 
-        // also populate the F32 token-embedding copy
+        // also populate the F16/Q8_0 token-embedding copy
         if (need_f32_embd && t == te) {
             const int64_t ne = ggml_nelements(te);
             f32buf.resize(ne);
             ggml_get_type_traits(te->type)->to_float(buf.data(), f32buf.data(), ne);
             std::vector<uint8_t> qbuf(ggml_nbytes(tok_embd_rows_));
-            ggml_quantize_chunk(GGML_TYPE_Q8_0, f32buf.data(), qbuf.data(), 0, te->ne[1], te->ne[0], nullptr);
+            if (embd_q8_) {
+                ggml_quantize_chunk(GGML_TYPE_Q8_0, f32buf.data(), qbuf.data(), 0, te->ne[1], te->ne[0], nullptr);
+            } else {
+                ggml_fp32_to_fp16_row(f32buf.data(), (ggml_fp16_t *) qbuf.data(), ne);
+            }
             ggml_backend_tensor_set(tok_embd_rows_, qbuf.data(), 0, qbuf.size());
         }
     }
@@ -262,12 +286,20 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
     tok_embd_rows_ = te;
     const bool need_f32_embd = te && te->type != GGML_TYPE_F32 && te->type != GGML_TYPE_F16;
     if (need_f32_embd) {
+        const ggml_type dst_type = embd_q8_ ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+        const double dst_mb = embd_q8_
+            ? te->ne[0] * te->ne[1] * 1.0625 / 1048576.0
+            : te->ne[0] * te->ne[1] * 2.0    / 1048576.0;
+        fprintf(stderr, "token_embd: %s is not GPU get_rows compatible, re-quantizing to %s "
+                "(%.0f MB -> %.0f MB)\n",
+                ggml_type_name(te->type), ggml_type_name(dst_type),
+                ggml_nbytes(te) / 1048576.0, dst_mb);
         ggml_init_params ep{};
         ep.mem_size = ggml_tensor_overhead() + 256;
         ep.no_alloc = true;
         embd_ctx_ = ggml_init(ep);
-        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, GGML_TYPE_Q8_0, te->ne[0], te->ne[1]);
-        ggml_set_name(tok_embd_rows_, "token_embd.q8_0");
+        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, dst_type, te->ne[0], te->ne[1]);
+        ggml_set_name(tok_embd_rows_, embd_q8_ ? "token_embd.q8_0" : "token_embd.f16");
     }
 
     size_t gpu_size = 0;
@@ -313,7 +345,11 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
             f32buf.resize(ne);
             ggml_get_type_traits(te->type)->to_float(buf.data(), f32buf.data(), ne);
             std::vector<uint8_t> qbuf(ggml_nbytes(tok_embd_rows_));
-            ggml_quantize_chunk(GGML_TYPE_Q8_0, f32buf.data(), qbuf.data(), 0, te->ne[1], te->ne[0], nullptr);
+            if (embd_q8_) {
+                ggml_quantize_chunk(GGML_TYPE_Q8_0, f32buf.data(), qbuf.data(), 0, te->ne[1], te->ne[0], nullptr);
+            } else {
+                ggml_fp32_to_fp16_row(f32buf.data(), (ggml_fp16_t *) qbuf.data(), ne);
+            }
             ggml_backend_tensor_set(tok_embd_rows_, qbuf.data(), 0, qbuf.size());
         }
     }

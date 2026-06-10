@@ -311,6 +311,7 @@ void Runtime::Impl::init() {
     // otherwise let them offload with the rest (saves VRAM). Must be set before
     // any load_weights_* call.
     model.set_keep_nextn_resident(cfg.use_mtp && model.hparams().has_mtp());
+    model.set_embd_q8(cfg.embd_q8);
 
     if (use_expert_offload && cfg.experts_ssd) {
         // ---- SSD tier: experts stay on disk; non-expert weights -> GPU ----

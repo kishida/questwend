@@ -101,7 +101,7 @@ public:
 
     // Token embedding tensor suitable for ggml_get_rows on any backend.
     // (CUDA get_rows does not support K-quant/IQ types, so a dequantized F16
-    //  copy is provided for those; otherwise the original tensor is returned.)
+    //  copy is provided for those; Q8_0 is used instead when set_embd_q8(true).)
     ggml_tensor * tok_embd_rows() const { return tok_embd_rows_; }
 
     // Allocate a backend buffer for all weights and upload their data from the
@@ -147,6 +147,10 @@ public:
     // Keep the MTP (nextn) block's experts VRAM-resident (set before load_weights_*).
     void set_keep_nextn_resident(bool v) { keep_nextn_resident_ = v; }
 
+    // Use Q8_0 instead of F16 for the get_rows embedding fallback (saves ~45% VRAM
+    // vs F16, but introduces additional quantization error). Set before load_weights_*.
+    void set_embd_q8(bool v) { embd_q8_ = v; }
+
     std::string summary() const;
     std::string debug_dump() const;
 
@@ -156,6 +160,7 @@ private:
     HParams hp_;
     Vocab   vocab_;
     bool    keep_nextn_resident_ = false;  // keep MTP nextn experts in VRAM (set by Runtime)
+    bool    embd_q8_             = false;  // use Q8_0 (vs F16) for get_rows embedding fallback
 
     std::string    path_;
     gguf_context * gguf_   = nullptr;        // KV metadata (first shard)

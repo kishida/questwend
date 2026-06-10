@@ -24,6 +24,7 @@ struct RuntimeConfig {
     bool   cache_profile_save = true; // false: load/prefetch only, never overwrite the profile
     bool   experts_ssd    = false;   // stream experts from the GGUF on SSD (no RAM copy)
     bool   use_mtp        = false;   // MTP self-speculative decode (keeps nextn block VRAM-resident)
+    bool   embd_q8        = false;   // use Q8_0 (not F16) for token embedding fallback (saves VRAM)
 };
 
 class Runtime {
