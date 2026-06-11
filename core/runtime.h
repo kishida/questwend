@@ -36,6 +36,13 @@ public:
     // the KV cache. Returns the logits (size n_vocab) for the LAST token.
     const std::vector<float> & decode(const std::vector<int32_t> & tokens);
 
+    // Vision: override the token embeddings of a span of the NEXT batched
+    // decode() call (e.g. the <|image_pad|> run) with precomputed embeddings.
+    // `data` must stay valid until that decode() returns; n_embd floats per
+    // token, `count` tokens starting at prompt index `first`. Cleared after use.
+    struct EmbdOverride { int first = 0; int count = 0; const float * data = nullptr; };
+    void set_embd_overrides(std::vector<EmbdOverride> ovr);
+
     // MTP (multi-token prediction): draft the token *after* `token`, using the
     // main hidden captured by the most recent decode(); advances the MTP KV.
     // Only valid when has_mtp(). Returns draft logits for the next-next token.

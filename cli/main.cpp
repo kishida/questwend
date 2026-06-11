@@ -3,12 +3,18 @@
 #include "runtime.h"
 #include "sampler.h"
 #include "chat.h"
+#include "vision.h"
+
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -23,6 +29,9 @@ static void usage(const char * prog) {
     printf("  --mtp          MTP self-speculative greedy decode (models with a nextn block)\n");
     printf("  --draft <N>    MTP draft length (tokens drafted per verify; default 1)\n");
     printf("  --embd-q8      use Q8_0 (not F16) for token embedding fallback (saves ~45%% VRAM)\n");
+    printf("  --image <path> attach an image to the prompt (requires a VL model + mmproj)\n");
+    printf("  --mmproj <path> vision tower GGUF (default: mmproj-*.gguf next to the model)\n");
+    printf("  --vision-test  encode --image with --mmproj and print embedding stats (no LLM)\n");
     printf("  -n <N>         max new tokens (default 128)\n");
     printf("  --n-ctx <N>    context length (default 4096)\n");
     printf("  --temp <f>     temperature (0 = greedy, default 0)\n");
@@ -38,11 +47,12 @@ static void usage(const char * prog) {
 }
 
 int main(int argc, char ** argv) {
-    std::string model_path, prompt, cache_profile;
+    std::string model_path, prompt, cache_profile, mmproj_path;
+    std::vector<std::string> image_paths;
     int  max_tokens = 128, n_ctx = 4096, n_draft = 1;
     size_t vram_budget_mb = 0;
     bool interactive = false, info_only = false, chat = false, log_speed = false, force_cpu = false;
-    bool experts_ssd = false, reasoning = true, use_mtp = false, embd_q8 = false;
+    bool experts_ssd = false, reasoning = true, use_mtp = false, embd_q8 = false, vision_test = false;
     SamplerConfig sc;
     sc.temperature = 0.0f;  // CLI defaults to greedy for reproducibility
 
@@ -66,11 +76,54 @@ int main(int argc, char ** argv) {
         else if (a == "--mtp")              use_mtp = true;
         else if (a == "--draft" && i + 1 < argc) n_draft = std::stoi(next());
         else if (a == "--embd-q8")          embd_q8 = true;
+        else if (a == "--image" && i + 1 < argc)  image_paths.push_back(next());
+        else if (a == "--mmproj" && i + 1 < argc) mmproj_path = next();
+        else if (a == "--vision-test")      vision_test = true;
         else if (a == "--log-tokens-per-sec")    log_speed = true;
         else if (a == "--cpu")              force_cpu = true;
         else if (a == "--info")             info_only = true;
         else if (a == "-h" || a == "--help"){ usage(argv[0]); return 0; }
     }
+    // standalone vision-tower test: encode images and print embedding stats
+    // (for numeric comparison against the Java reference implementation)
+    if (vision_test) {
+        if (mmproj_path.empty() || image_paths.empty()) {
+            fprintf(stderr, "--vision-test requires --mmproj <gguf> and --image <path>\n");
+            return 1;
+        }
+        try {
+            ggml_backend_t be = nullptr;
+            if (!force_cpu)
+                if (ggml_backend_dev_t d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))
+                    be = ggml_backend_dev_init(d, nullptr);
+            if (!be) be = ggml_backend_cpu_init();
+            {
+                auto enc = VisionEncoder::load(mmproj_path, be);
+                const int D = enc->n_embd(), T = enc->n_image_tokens();
+                for (const auto & ip : image_paths) {
+                    auto t0 = std::chrono::steady_clock::now();
+                    auto emb = enc->encode_image(ip);
+                    const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    double sum = 0, sq = 0;
+                    for (float v : emb) { sum += v; sq += (double) v * v; }
+                    printf("%s: %d tokens x %d dim in %.0f ms | mean %.6f rms %.6f\n",
+                           ip.c_str(), T, D, ms, sum / emb.size(), std::sqrt(sq / emb.size()));
+                    printf("  tok0   [0..7]:");
+                    for (int i = 0; i < 8; ++i) printf(" % .5f", emb[i]);
+                    printf("\n  tok%-4d[0..7]:", T - 1);
+                    for (int i = 0; i < 8; ++i) printf(" % .5f", emb[(size_t)(T - 1) * D + i]);
+                    printf("\n");
+                }
+            }
+            ggml_backend_free(be);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "error: %s\n", e.what());
+            return 1;
+        }
+        return 0;
+    }
+
     if (model_path.empty()) { usage(argv[0]); return 1; }
 
     try {
@@ -93,6 +146,47 @@ int main(int argc, char ** argv) {
         cfg.embd_q8        = embd_q8;
         Runtime rt(*model, cfg);
         Sampler smp(sc);
+
+        // ---- vision: load the mmproj tower and encode the images up front ----
+        ggml_backend_t vis_backend = nullptr;
+        std::unique_ptr<VisionEncoder> venc;
+        std::vector<std::vector<float>> vembs;
+        if (!image_paths.empty()) {
+            if (mmproj_path.empty()) {
+                // auto-discover mmproj-*.gguf next to the model
+                std::string dir = model_path;
+                const size_t sl = dir.find_last_of("/\\");
+                dir = sl == std::string::npos ? "." : dir.substr(0, sl);
+                for (const auto & e : std::filesystem::directory_iterator(dir)) {
+                    const std::string fn = e.path().filename().string();
+                    if (fn.rfind("mmproj", 0) == 0 && fn.size() > 5 &&
+                        fn.substr(fn.size() - 5) == ".gguf") {
+                        mmproj_path = e.path().string();
+                        break;
+                    }
+                }
+                if (mmproj_path.empty())
+                    throw std::runtime_error("--image given but no mmproj found (use --mmproj)");
+                fprintf(stderr, "mmproj: using %s\n", mmproj_path.c_str());
+            }
+            if (!force_cpu)
+                if (ggml_backend_dev_t d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))
+                    vis_backend = ggml_backend_dev_init(d, nullptr);
+            if (!vis_backend) vis_backend = ggml_backend_cpu_init();
+            venc = VisionEncoder::load(mmproj_path, vis_backend);
+            if (venc->n_embd() != (int) model->hparams().n_embd)
+                throw std::runtime_error("mmproj projection dim does not match the model n_embd");
+            for (const auto & ip : image_paths) {
+                auto t0 = std::chrono::steady_clock::now();
+                vembs.push_back(venc->encode_image(ip));
+                fprintf(stderr, "image: %s encoded to %d tokens in %.0f ms\n", ip.c_str(),
+                        venc->n_image_tokens(),
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count());
+            }
+            if (use_mtp) { fprintf(stderr, "warning: --mtp is not supported with images; using plain decode\n"); use_mtp = false; }
+            chat = true;   // images imply chat formatting
+        }
 
         // GDN equivalence check: multi-token prefill vs token-by-token must give
         // the same final-token logits (build_graph multi-token GDN == single step).
@@ -229,7 +323,24 @@ int main(int argc, char ** argv) {
             }
         } else {
             std::vector<int32_t> ids;
-            if (chat) {
+            if (chat && !image_paths.empty()) {
+                // multimodal one-shot: [images..., text] in a single user message
+                ChatMessage m;
+                m.role = "user";
+                for (int i = 0; i < (int) image_paths.size(); ++i)
+                    m.parts.push_back(ContentPart::make_image(i));
+                if (!prompt.empty()) m.parts.push_back(ContentPart::make_text(prompt));
+                ChatPromptOptions o;
+                o.reasoning      = reasoning;
+                o.n_image_tokens = venc->n_image_tokens();
+                o.add_vision_id  = image_paths.size() > 1;
+                auto cp = build_qwen_prompt(tok, { m }, o);
+                std::vector<Runtime::EmbdOverride> ovr;
+                for (const auto & sp : cp.image_spans)
+                    ovr.push_back({ sp.first, sp.count, vembs[sp.image_index].data() });
+                rt.set_embd_overrides(std::move(ovr));
+                ids = cp.ids;
+            } else if (chat) {
                 ids = build_chatml_tokens(tok, {{ "user", prompt }}, true, reasoning);
             } else {
                 if (prompt.empty()) prompt = "Hello";
@@ -238,6 +349,8 @@ int main(int argc, char ** argv) {
             }
             run(ids);
         }
+        venc.reset();
+        if (vis_backend) ggml_backend_free(vis_backend);
     } catch (const std::exception & e) {
         fprintf(stderr, "error: %s\n", e.what());
         return 1;

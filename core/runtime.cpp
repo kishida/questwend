@@ -144,6 +144,10 @@ struct Runtime::Impl {
     int n_ctx  = 0;
     int n_past = 0;
 
+    // vision: embedding overrides applied to the next batched decode (consumed
+    // by build_graph; the input tensors are filled in decode() after alloc)
+    std::vector<Runtime::EmbdOverride> embd_ovr;
+
     // decode_cached profiling (QWEN_PROF_DC): wall vs GPU-compute time
     double dc_wall_ms = 0, dc_gpu_ms = 0;
     uint64_t dc_tokens = 0;
@@ -809,6 +813,18 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
 
     ggml_tensor * cur;
     ggml_tensor * inpL = ggml_get_rows(ctx, model.tok_embd_rows(), inp_tokens);
+
+    // vision: splice precomputed image embeddings over the <|image_pad|> spans
+    if (!embd_ovr.empty() && !persistent) {
+        inpL = ggml_cont(ctx, inpL);   // ggml_set needs a writable contiguous dst
+        for (size_t k = 0; k < embd_ovr.size(); ++k) {
+            const auto & o = embd_ovr[k];
+            ggml_tensor * ov = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, o.count);
+            ggml_set_input(ov);
+            ggml_set_name(ov, ("inp_embd_ovr_" + std::to_string(k)).c_str());
+            inpL = ggml_set_2d(ctx, inpL, ov, inpL->nb[1], (size_t) o.first * inpL->nb[1]);
+        }
+    }
 
     for (int il = 0; il < (int) hp.n_main(); ++il) {
         ggml_tensor * inpSA = inpL;
@@ -2284,6 +2300,13 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     }
     ggml_backend_tensor_set(inp_mask_t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
 
+    // vision: upload the image embeddings for each override span
+    for (size_t k = 0; k < embd_ovr.size(); ++k) {
+        ggml_tensor * ov = ggml_graph_get_tensor(gf, ("inp_embd_ovr_" + std::to_string(k)).c_str());
+        if (ov) ggml_backend_tensor_set(ov, embd_ovr[k].data, 0, ggml_nbytes(ov));
+    }
+    embd_ovr.clear();   // one-shot: applies to this batch only
+
     enum ggml_status status;
     if (sched) {
         status = ggml_backend_sched_graph_compute(sched, gf);
@@ -2316,6 +2339,11 @@ Runtime::~Runtime() = default;
 
 const std::vector<float> & Runtime::decode(const std::vector<int32_t> & tokens) {
     return impl_->decode(tokens);
+}
+void Runtime::set_embd_overrides(std::vector<EmbdOverride> ovr) {
+    if (!ovr.empty() && (impl_->ecache && !impl_->sched))
+        throw std::runtime_error("images are not supported with --experts-ssd yet");
+    impl_->embd_ovr = std::move(ovr);
 }
 const std::vector<float> & Runtime::mtp_draft(int32_t token) { return impl_->mtp_draft(token); }
 bool Runtime::has_mtp() const { return impl_->model.hparams().has_mtp(); }

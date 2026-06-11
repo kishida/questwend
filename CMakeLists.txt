@@ -35,8 +35,10 @@ add_library(qwencpp_core STATIC
     core/expert_cache.cpp
     core/sampler.cpp
     core/chat.cpp
+    core/vision.cpp
 )
 target_include_directories(qwencpp_core PUBLIC core)
+target_include_directories(qwencpp_core PRIVATE third_party/stb)
 target_link_libraries(qwencpp_core PUBLIC ggml)
 
 # ---- CLI ----
