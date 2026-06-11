@@ -14,7 +14,27 @@
 #include <thread>
 #include <vector>
 
+#ifdef __APPLE__
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 namespace qwencpp {
+
+#ifdef __APPLE__
+// Is `p` a dereferenceable host pointer (mapped in our address space)?
+// Metal shared buffers (unified memory) expose real host memory at
+// tensor->data; private buffers hold an unmapped virtual placeholder
+// (allocated from 0x400 up, inside PAGEZERO -- never mapped).
+static bool ptr_is_mapped(const void * p) {
+    if (!p) return false;
+    const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+    char vec = 0;
+    void * al = (void *) ((uintptr_t) p & ~(uintptr_t) (pg - 1));
+    return mincore(al, pg, &vec) == 0;
+}
+#endif
 
 static const char * role_fmt(ExpertCache::Role r) {
     switch (r) {
@@ -126,6 +146,20 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
     if (!buf_) throw std::runtime_error("ExpertCache: failed to alloc VRAM slot pools");
     ggml_backend_buffer_set_usage(buf_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
+#ifdef __APPLE__
+    // Unified memory (Metal shared buffers): the slot pools are host-writable,
+    // so SSD misses can be pread() straight into the slot -- no staging buffer,
+    // no memcpy, no stdio buffering.
+    if (ssd_ && !getenv("QWEN_NO_DIRECT_FETCH")) {
+        int n_direct = 0;
+        for (auto & p : pools_)
+            if (ptr_is_mapped(p.t->data)) { p.host = (uint8_t *) p.t->data; ++n_direct; }
+        if (n_direct)
+            fprintf(stderr, "expert cache: zero-copy SSD reads (unified memory, %d/%zu pools)\n",
+                    n_direct, pools_.size());
+    }
+#endif
+
     size_t resident = 0;
     for (int s = 0; s < (int) sigs.size(); ++s)
         resident += sigs[s].slab * (size_t) pools_[s].n_slots;
@@ -138,9 +172,17 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
 
 ExpertCache::~ExpertCache() {
     for (auto & kv : files_) if (kv.second) fclose((FILE *) kv.second);
+#ifdef __APPLE__
+    for (auto & kv : fds_) if (kv.second >= 0) close(kv.second);
+#endif
     if (stage_buf_) ggml_backend_buffer_free(stage_buf_);
     if (buf_) ggml_backend_buffer_free(buf_);
     if (ctx_) ggml_free(ctx_);
+}
+
+uint8_t * ExpertCache::host_of(const ggml_tensor * t) const {
+    for (const auto & p : pools_) if (p.t == t) return p.host;
+    return nullptr;
 }
 
 // Return a host pointer to at least `nbytes` of staging memory. Prefers a pinned
@@ -187,9 +229,28 @@ void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst
 
     const void * hsrc;
     if (ssd_) {
+        const size_t off = foff_[role][layer] + (size_t) expert * nb2;
+#ifdef __APPLE__
+        // unified memory: pread straight into the slot (no staging, no memcpy)
+        if (uint8_t * hp = host_of(dst)) {
+            const std::string & path = fpath_[role][layer];
+            auto it = fds_.find(path);
+            int fd;
+            if (it == fds_.end()) {
+                fd = open(path.c_str(), O_RDONLY);
+                fds_[path] = fd;
+            } else fd = it->second;
+            if (fd < 0) throw std::runtime_error("ExpertCache: failed to open shard: " + path);
+            if (pread(fd, hp + (size_t) slot * nb2, nb2, (off_t) off) != (ssize_t) nb2)
+                throw std::runtime_error("ExpertCache: SSD pread failed");
+            stats_.fetch_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            stats_.fetch_bytes += nb2;
+            return;
+        }
+#endif
         // SSD tier: read the slab into a pinned staging buffer, then H2D from it.
         void * stage = stage_host(nb2);
-        const size_t off = foff_[role][layer] + (size_t) expert * nb2;
         void *& fp = files_[fpath_[role][layer]];
         if (!fp) {
             fp = (void *) fopen(fpath_[role][layer].c_str(), "rb");
@@ -263,7 +324,8 @@ int ExpertCache::reserve_victim(Pool & pool, int key) {
 }
 
 // Read all reserved jobs' slabs from SSD in parallel (each worker uses its own
-// file handles), then upload them to their VRAM slots serially (one GPU stream).
+// file handles). On unified memory the workers pread straight into the VRAM
+// slot (zero-copy); otherwise they stage and the slabs are uploaded serially.
 void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
     const int n = (int) jobs.size();
     if (n == 0) return;
@@ -274,14 +336,29 @@ void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
 
     auto worker = [&](int tid) {
         std::unordered_map<std::string, FILE *> tf;   // per-thread file cache
+#ifdef __APPLE__
+        std::unordered_map<std::string, int> tfd;     // per-thread fd cache (direct path)
+#endif
         for (int j = tid; j < n; j += nthreads) {
             const FetchJob & job = jobs[j];
             const size_t nb2 = job.pool->t->nb[2];
-            stage[j].resize(nb2);
             const std::string & path = fpath_[job.role][layer];
+            const size_t off = foff_[job.role][layer] + (size_t) job.expert * nb2;
+#ifdef __APPLE__
+            if (job.pool->host) {
+                auto it = tfd.find(path);
+                int fd;
+                if (it == tfd.end()) { fd = open(path.c_str(), O_RDONLY); tfd[path] = fd; }
+                else fd = it->second;
+                if (fd < 0 ||
+                    pread(fd, job.pool->host + (size_t) job.slot * nb2, nb2, (off_t) off) != (ssize_t) nb2)
+                    ok = false;
+                continue;
+            }
+#endif
+            stage[j].resize(nb2);
             FILE *& f = tf[path];
             if (!f) { f = fopen(path.c_str(), "rb"); if (!f) { ok = false; continue; } }
-            const size_t off = foff_[job.role][layer] + (size_t) job.expert * nb2;
 #ifdef _WIN32
             if (_fseeki64(f, (long long) off, SEEK_SET) != 0 ||
 #else
@@ -290,6 +367,9 @@ void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
                 fread(stage[j].data(), 1, nb2, f) != nb2) ok = false;
         }
         for (auto & kv : tf) if (kv.second) fclose(kv.second);
+#ifdef __APPLE__
+        for (auto & kv : tfd) if (kv.second >= 0) close(kv.second);
+#endif
     };
 
     std::vector<std::thread> ts;
@@ -300,6 +380,7 @@ void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
     if (!ok) throw std::runtime_error("ExpertCache: parallel SSD read failed");
 
     for (int j = 0; j < n; ++j) {
+        if (jobs[j].pool->host) continue;   // already written in place
         ggml_tensor * dst = jobs[j].pool->t;
         ggml_backend_tensor_set(dst, stage[j].data(), (size_t) jobs[j].slot * dst->nb[2], stage[j].size());
     }

@@ -92,6 +92,8 @@ public:
 private:
     struct Pool {
         ggml_tensor * t = nullptr;          // [ne0, ne1, n_slots], one type
+        uint8_t *     host = nullptr;       // host-visible slot memory (unified-memory
+                                            // backends only): SSD reads go straight in
         int           role = 0;
         int           n_slots = 0;
         std::unordered_map<int, int> key2slot;  // key = layer*n_expert+expert
@@ -109,6 +111,7 @@ private:
     int  reserve_victim(Pool & pool, int key);   // evict + claim a slot, no fetch
     void fetch_slab(Role role, int layer, int expert, ggml_tensor * dst, int slot);
     void fetch_parallel(int layer, std::vector<FetchJob> & jobs);  // SSD: parallel pread + serial H2D
+    uint8_t * host_of(const ggml_tensor * t) const;  // pool host ptr for a slot tensor (or null)
 
     Model &        model_;
     ggml_backend_t backend_ = nullptr;   // GPU backend (for async H2D on its stream)
@@ -121,6 +124,7 @@ private:
     std::vector<size_t>      foff_[N_ROLE];   // file offset of expert tensor (role,layer)
     std::vector<std::string> fpath_[N_ROLE];  // shard file of expert tensor (role,layer)
     std::unordered_map<std::string, void *> files_;  // path -> FILE* (lazy open)
+    std::unordered_map<std::string, int>    fds_;    // path -> fd (zero-copy pread path)
 
     int n_layer_  = 0;
     int n_expert_ = 0;
