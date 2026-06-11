@@ -210,7 +210,7 @@ void Model::load_weights_split(
     if (need_f32_embd) {
         if (ggml_tallocr_alloc(&gpu_talloc, tok_embd_rows_) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("tallocr alloc failed (embd.f32)");
-        embd_buf_ = out_gpu_buf;  // owned by out_gpu_buf, don't free separately
+        // lives inside out_gpu_buf (caller-owned); embd_buf_ stays null here
     }
 
     // ---- CPU (expert) buffers: chunked so each stays under the single
@@ -351,7 +351,7 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
     if (need_f32_embd) {
         if (ggml_tallocr_alloc(&talloc, tok_embd_rows_) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("tallocr alloc failed (ssd embd.f32)");
-        embd_buf_ = out_gpu_buf;
+        // lives inside out_gpu_buf (caller-owned); embd_buf_ stays null here
     }
 
     std::map<std::string, void *> files;

@@ -29,6 +29,7 @@ struct Runtime::Impl {
     // Primary compute backend (GPU or CPU).
     ggml_backend_t        backend     = nullptr;
     ggml_backend_buffer_t weights_buf = nullptr;
+    bool weights_buf_owned = false;   // split/ssd: ours; single-backend: Model frees it
 
     // Phase B: CPU backend + sched for expert weight offloading.
     // When active, expert tensors live in expert_cpu_buf (CPU pinned memory)
@@ -190,6 +191,8 @@ struct Runtime::Impl {
         ecache.reset();
         if (m_galloc)       ggml_gallocr_free(m_galloc);
         if (m_ctx)          ggml_free(m_ctx);
+        if (r_galloc)       ggml_gallocr_free(r_galloc);
+        if (r_ctx)          ggml_free(r_ctx);
         if (v_galloc)       ggml_gallocr_free(v_galloc);
         if (v_ctx)          ggml_free(v_ctx);
         if (ckpt_buf)       ggml_backend_buffer_free(ckpt_buf);
@@ -209,12 +212,11 @@ struct Runtime::Impl {
         if (dctx)           ggml_free(dctx);
         if (st_buf)         ggml_backend_buffer_free(st_buf);
         if (st_ctx)         ggml_free(st_ctx);
-        // expert_cpu_bufs and weights_buf are owned here (not by Model in split mode)
+        // expert_cpu_bufs and weights_buf are owned here (not by Model) in
+        // split/ssd mode; in single-backend mode Model owns and frees weights_buf.
         for (auto b : expert_cpu_bufs) if (b) ggml_backend_buffer_free(b);
         if (cpu_backend)    ggml_backend_free(cpu_backend);
-        // In single-backend mode, weights_buf is owned by Model; in split mode it's ours.
-        // Model::~Model() also tries to free weights_buf_ -- that one is the original
-        // Model-side buf which is nullptr in split mode. Safe.
+        if (weights_buf_owned && weights_buf) ggml_backend_buffer_free(weights_buf);
         if (backend)        ggml_backend_free(backend);
     }
 
@@ -317,6 +319,7 @@ void Runtime::Impl::init() {
         // ---- SSD tier: experts stay on disk; non-expert weights -> GPU ----
         ssd_mode = true;
         model.load_weights_ssd(backend, weights_buf);
+        weights_buf_owned = true;
         reuse_graph = false;   // every token goes through the per-token cache path
         fprintf(stderr, "expert offload: ON (SSD tier, decode via VRAM cache; prefill token-by-token)\n");
     } else if (use_expert_offload) {
@@ -339,6 +342,7 @@ void Runtime::Impl::init() {
 
         // Load weights: non-expert → GPU, expert → CPU (pinned).
         model.load_weights_split(backend, cpu_buft, weights_buf, expert_cpu_bufs);
+        weights_buf_owned = true;
 
         // Create backend scheduler: GPU first (higher priority), CPU fallback.
         // The sched routes ops to GPU for GPU-backend tensors and CPU for CPU-backend tensors.
