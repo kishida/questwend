@@ -108,6 +108,7 @@ struct Runtime::Impl {
     // k+1-token verify outputs: per-position logits (vL) and main hidden (vH).
     std::vector<std::vector<float>> vL, vH;
     std::vector<int32_t>  vA;   // per-position argmax (GPU-computed in the fast path)
+    bool                  v_from_batch = false;   // last verify ran the batched (ckpt-capable) path
     std::vector<float>    mtp_block_hidden;   // MTP block output hidden (for chaining drafts)
 
     // persistent MTP draft graph on a dedicated backend instance (own CUDA-graph
@@ -1191,10 +1192,19 @@ void Runtime::Impl::mtp_resync(int32_t token) {
 void Runtime::Impl::decode_verify_cached(const std::vector<int32_t> & toks) {
     const int T = (int) toks.size();
     const int n_used = model.hparams().n_expert_used;
+    const bool gdn = model.hparams().has_gdn;
     if (ecache->min_slots() >= T * n_used) {
-        // batched path: fills vH and vA (GPU argmax, no logits readback)
+        // batched path: fills vH and vA (GPU argmax, no logits readback).
+        // GDN states are checkpointed per verify token so a partial accept can
+        // restore an intermediate state instead of re-decoding (same as the
+        // resident decode_verify path).
+        if (gdn) init_ckpts(T);
+        gdn_ckpt = gdn ? T : 0;
         decode_cached_batch(toks.data(), T, /*want_logits=*/false, /*verify=*/true);
+        gdn_ckpt = 0;
+        v_from_batch = true;
     } else {
+        v_from_batch = false;
         // pools too small to hold all tokens' experts at once: token-by-token,
         // with host argmax over the full logits.
         vL.assign(T, {}); vH.assign(T, {});
@@ -1362,7 +1372,7 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
         auto ts0 = pclk::now();
         if (a == K) {
             // full accept: the verify forward already left the correct state
-        } else if (use_ckpt) {
+        } else if (use_ckpt || (gdn && v_from_batch)) {
             restore_ckpt(a);                   // GDN state after verify token a (= x,d_1..d_a)
             n_past = p + a + 1;                // KV[p..p+a] from verify is valid; drop the rest
         } else if (gdn) {
