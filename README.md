@@ -163,17 +163,57 @@ infer -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40000 --ex
 
 ---
 
-## 6. ドキュメント
+## 6. 環境変数（デバッグ / チューニング）
+
+通常は不要。プロファイルや A/B 検証、トラブルシュート用。
+
+### プロファイリング
+
+| 変数 | 効果 |
+|---|---|
+| `QWEN_PROF=1` | 単発デコード（decode_reuse）の所要時間内訳を表示 |
+| `QWEN_PROF_DC=1` | オフロード decode の wall / GPU計算 / ホスト時間を exit 時に表示 |
+| `QWEN_PROF_MTP=1` | MTP の per-cycle フェーズ分解（draft / verify / settle / resync）を表示 |
+| `QWEN_PROF_MTP2=1` | MTP draft 1回ごとの compute / readback 時間（100回平均）を表示 |
+
+### 動作切り替え（A/B・フォールバック）
+
+| 変数 | 効果 |
+|---|---|
+| `QWEN_NO_FLASH=1` | fused flash attention を無効化 |
+| `QWEN_NO_REUSE=1` | 単発デコードの永続グラフ再利用（CUDA グラフ化）を無効化 |
+| `QWEN_NO_DIRECT_FETCH=1` | ユニファイドメモリへのゼロコピー SSD 読みを無効化（staging 経路に戻す） |
+| `QWEN_SYNC_FETCH=1` | RAM 階層の H2D を同期コピーに（async DMA の A/B 用） |
+| `QWEN_PREFETCH_THREADS=N` | SSD 並列読みのワーカー数（既定 8, 1〜64） |
+| `QWEN_GGML_DEBUG=1` | ggml の生ログを全表示（既定は DEBUG/INFO 破棄、同一 WARN 連続は1回） |
+
+### 実験的 / テスト
+
+| 変数 | 効果 |
+|---|---|
+| `QWEN_BATCH=1` | SSD 階層の prefill をバッチ実行（既定 token-by-token; MTP verify は常にバッチ） |
+| `QWEN_BATCH_CHUNK=N` | 上記バッチのチャンク長を固定 |
+| `QWEN_FASTCACHE=1` | 楽観単一グラフデコード（全 expert 常駐前提 + ミス時フォールバック; 実験的） |
+| `QWEN_GDN_TEST=1` | GDN の multi-token / token-by-token 等価性チェックを実行して終了 |
+| `QWEN_MTP_TEST=1` | MTP の draft 受理率計測モード（`--mtp` なしでも nextn を常駐させる） |
+| `QWEN_MTP_NOACCEPT=1` | MTP の draft 受理を強制無効化（= 出力は plain と一致するはず。ロスレス確認用） |
+
+---
+
+## 7. ドキュメント
 
 - [`docs/mtp.md`](docs/mtp.md) — MTP（自己推測デコード）の実装・評価・ベンチ
+- [`docs/metal_unified_memory.md`](docs/metal_unified_memory.md) — 48GB Mac で 122B-A10B を動かすチューニング記録（Metal / ユニファイドメモリ / ゼロコピー SSD 読み）
 - [`offload_optimize.md`](offload_optimize.md) — エキスパート・オフロードの高速化（pinned/async/グラフ融合）実測ログ
 - [`docs/gpu_performance_guide.md`](docs/gpu_performance_guide.md) — GPU パフォーマンス指針
 
 ---
 
-## 7. メモ / 制限
+## 8. メモ / 制限
 
 - 既定はサンプリング無し（greedy, `temp=0`）で再現性重視。
 - 大語彙（例: 248k）の K-quant 埋め込みは、バックエンドの get_rows がその型に非対応の場合のみ F16 変換版を VRAM に持つ（実質ロスレス）。CUDA は K-quant/IQ 非対応のため変換が走る。Metal / CPU はネイティブ対応なのでコピー自体を作らない（メモリ節約）。VRAM が厳しい場合は `--embd-q8` で Q8_0 化（F16 比 約半分、わずかな量子化誤差あり）。
 - オフロードの RAM 階層は host pinned メモリを使う。単一の `cudaHostAlloc` には上限（環境依存, 例 ~15.5GB）があるため、エキスパートは複数チャンクに分けて pin する。
 - CUDA グラフ / Flash Attention は CUDA ビルドで既定有効。
+- `--cache-profile` は CLI では実行のたびに上書き保存される（サーバーは読み込みのみ）。アクセスパターンの異なる実行（MTP と plain 等）を混ぜるとプロファイルが汚れるので、ベスト状態のファイルをコピーして固定する運用を推奨。
+- ユニファイドメモリ（Apple Silicon）では SSD 階層のミスをスロット実メモリへ直接 `pread` する（ゼロコピー）。チャットテンプレートは ChatML 固定の最小実装（jinja 未対応; tool / 画像入力は未対応）。
