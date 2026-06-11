@@ -1542,18 +1542,23 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     const int   T         = n_tokens;
     const int   n_kv      = n_past + T;
 
-    // temp carry tensors sized for this batch (bridge seg A->B and layer->layer)
+    // temp carry tensors sized for this batch (bridge seg A->B and layer->layer).
+    // ffn_in/resid/weights are double-buffered (parity by layer) so the fused
+    // segB(L)+segA(L+1) graph has no write-after-read hazard (mirrors decode_cached).
     ggml_init_params tp{};
-    tp.mem_size = ggml_tensor_overhead() * 8 + 256;
+    tp.mem_size = ggml_tensor_overhead() * 12 + 256;
     tp.no_alloc = true;
     ggml_context * tctx = ggml_init(tp);
-    ggml_tensor * h_b      = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
-    ggml_tensor * ffn_in_b = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
-    ggml_tensor * resid_b  = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
-    ggml_tensor * weights_b= ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_used, T);
-    ggml_tensor * slot_g_b = ggml_new_tensor_2d(tctx, GGML_TYPE_I32, n_used, T);
-    ggml_tensor * slot_u_b = ggml_new_tensor_2d(tctx, GGML_TYPE_I32, n_used, T);
-    ggml_tensor * slot_d_b = ggml_new_tensor_2d(tctx, GGML_TYPE_I32, n_used, T);
+    ggml_tensor * h_b       = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
+    ggml_tensor * ffn_in_b  = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
+    ggml_tensor * resid_b   = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
+    ggml_tensor * weights_b = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_used, T);
+    ggml_tensor * ffn_in_b2 = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
+    ggml_tensor * resid_b2  = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
+    ggml_tensor * weights_b2= ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_used, T);
+    ggml_tensor * slot_g_b  = ggml_new_tensor_2d(tctx, GGML_TYPE_I32, n_used, T);
+    ggml_tensor * slot_u_b  = ggml_new_tensor_2d(tctx, GGML_TYPE_I32, n_used, T);
+    ggml_tensor * slot_d_b  = ggml_new_tensor_2d(tctx, GGML_TYPE_I32, n_used, T);
     ggml_backend_buffer_t tbuf = ggml_backend_alloc_ctx_tensors(tctx, backend);
     if (!tbuf) throw std::runtime_error("decode_cached_batch: temp alloc failed");
 
@@ -1585,13 +1590,14 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
 
     std::vector<int32_t> sel(n_used * T), sg(n_used * T), su(n_used * T), sd(n_used * T);
 
-    for (int il = 0; il < (int) hp.n_main(); ++il) {
+    ggml_tensor * carry_ffn[2] = { ffn_in_b,  ffn_in_b2  };
+    ggml_tensor * carry_res[2] = { resid_b,   resid_b2   };
+    ggml_tensor * carry_wgt[2] = { weights_b, weights_b2 };
+
+    // Append seg A (attention/GDN + router, all T tokens) for layer `il`; writes
+    // the layer's parity carry and exposes `selected` for host readback.
+    auto build_segA = [&](ggml_context * ctx, ggml_cgraph * gf, int il) -> ggml_tensor * {
         const bool recurrent = hp.is_recurrent(il);
-
-        // ===== seg A: attention/GDN + router (all T tokens) =====
-        ggml_context * ctx = new_ctx();
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-
         ggml_tensor * inp_pos = nullptr, * inp_mask = nullptr;
         if (!recurrent) {
             inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
@@ -1661,15 +1667,50 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_set_output(selected);
         ggml_build_forward_expand(gf, selected);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, ffn_in_b));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, resid_b));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, weights, weights_b));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, carry_ffn[il & 1]));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, carry_res[il & 1]));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, weights, carry_wgt[il & 1]));
+        return selected;
+    };
 
-        run(ctx, gf);
-        if (!recurrent) {
+    // Append seg B (batched expert matmuls + residual) for layer `il`; writes h_b.
+    // mul_mat_id takes the whole batch at once (ids [n_used, T]); the weighted
+    // sum over n_used mirrors build_moe's batched path.
+    auto build_segB = [&](ggml_context * ctx, ggml_cgraph * gf, int il) {
+        ggml_tensor * ffn_l = carry_ffn[il & 1];
+        ggml_tensor * x3   = ggml_reshape_3d(ctx, ffn_l, n_embd, 1, T);
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3, slot_u_b);
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3, slot_g_b);
+        ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, slot_d_b); // [n_embd, n_used, T]
+        experts = ggml_mul(ctx, experts, ggml_reshape_3d(ctx, carry_wgt[il & 1], 1, n_used, T));
+        ggml_tensor * moe_out = nullptr;
+        for (int i = 0; i < n_used; ++i) {
+            ggml_tensor * v = ggml_view_2d(ctx, experts, n_embd, T, experts->nb[2], (size_t) i * experts->nb[1]);
+            moe_out = i ? ggml_add(ctx, moe_out, v) : v;
+        }
+        if (n_used == 1) moe_out = ggml_cont(ctx, moe_out);
+
+        if (ggml_tensor * up_sh = Wopt("blk.%d.ffn_up_shexp.weight", il)) {
+            ggml_tensor * g  = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), ffn_l);
+            ggml_tensor * u  = ggml_mul_mat(ctx, up_sh, ffn_l);
+            ggml_tensor * sh = ggml_mul_mat(ctx, W("blk.%d.ffn_down_shexp.weight", il),
+                                            ggml_mul(ctx, ggml_silu(ctx, g), u));
+            ggml_tensor * sgt = ggml_sigmoid(ctx, ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp_shexp.weight", il), ffn_l));
+            moe_out = ggml_add(ctx, moe_out, ggml_mul(ctx, sh, sgt));
+        }
+        ggml_tensor * h_new = ggml_add(ctx, moe_out, carry_res[il & 1]);         // [n_embd, T]
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, h_b));
+    };
+
+    // Set the attention pos/mask inputs of a graph (no-op for GDN-only graphs).
+    auto set_attn_inputs = [&](ggml_cgraph * gf) {
+        if (ggml_tensor * ip = ggml_graph_get_tensor(gf, "inp_pos")) {
             std::vector<int32_t> pos(T);
             for (int i = 0; i < T; ++i) pos[i] = n_past + i;
-            ggml_backend_tensor_set(inp_pos, pos.data(), 0, T * sizeof(int32_t));
+            ggml_backend_tensor_set(ip, pos.data(), 0, T * sizeof(int32_t));
+        }
+        if (ggml_tensor * im = ggml_graph_get_tensor(gf, "inp_mask")) {
             std::vector<ggml_fp16_t> mask((size_t) n_kv * T);
             const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
             for (int i = 0; i < T; ++i) {
@@ -1677,53 +1718,45 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                 for (int j = 0; j < n_kv; ++j)
                     mask[(size_t) i * n_kv + j] = (j <= abs_i) ? z : ninf;
             }
-            ggml_backend_tensor_set(inp_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+            ggml_backend_tensor_set(im, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
         }
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
-            throw std::runtime_error("decode_cached_batch: seg A compute failed");
+    };
 
+    // Read back layer `il`'s router selection, make the union of selected
+    // experts resident, and upload the slot ids for seg B.
+    auto ensure_layer = [&](ggml_tensor * selected, int il) {
         ggml_backend_tensor_get(selected, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
-        ggml_free(ctx);
-
-        // ===== host: make the union of selected experts resident =====
         ecache->ensure(il, sel.data(), n_used * T, sg.data(), su.data(), sd.data());
         ggml_backend_tensor_set(slot_g_b, sg.data(), 0, (size_t) n_used * T * sizeof(int32_t));
         ggml_backend_tensor_set(slot_u_b, su.data(), 0, (size_t) n_used * T * sizeof(int32_t));
         ggml_backend_tensor_set(slot_d_b, sd.data(), 0, (size_t) n_used * T * sizeof(int32_t));
+    };
 
-        // ===== seg B: expert matmuls + residual (all T tokens, batched) =====
-        // mul_mat_id takes the whole batch at once (ids [n_used, T]); the
-        // weighted sum over n_used mirrors build_moe's batched path.
-        ctx = new_ctx();
-        gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-        {
-            ggml_tensor * x3   = ggml_reshape_3d(ctx, ffn_in_b, n_embd, 1, T);
-            ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3, slot_u_b);
-            ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3, slot_g_b);
-            ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
-            ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, slot_d_b); // [n_embd, n_used, T]
-            experts = ggml_mul(ctx, experts, ggml_reshape_3d(ctx, weights_b, 1, n_used, T));
-            ggml_tensor * moe_out = nullptr;
-            for (int i = 0; i < n_used; ++i) {
-                ggml_tensor * v = ggml_view_2d(ctx, experts, n_embd, T, experts->nb[2], (size_t) i * experts->nb[1]);
-                moe_out = i ? ggml_add(ctx, moe_out, v) : v;
-            }
-            if (n_used == 1) moe_out = ggml_cont(ctx, moe_out);
+    const int N = (int) hp.n_main();
 
-            if (ggml_tensor * up_sh = Wopt("blk.%d.ffn_up_shexp.weight", il)) {
-                ggml_tensor * g  = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), ffn_in_b);
-                ggml_tensor * u  = ggml_mul_mat(ctx, up_sh, ffn_in_b);
-                ggml_tensor * sh = ggml_mul_mat(ctx, W("blk.%d.ffn_down_shexp.weight", il),
-                                                ggml_mul(ctx, ggml_silu(ctx, g), u));
-                ggml_tensor * sgt = ggml_sigmoid(ctx, ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp_shexp.weight", il), ffn_in_b));
-                moe_out = ggml_add(ctx, moe_out, ggml_mul(ctx, sh, sgt));
-            }
-            ggml_tensor * h_new = ggml_add(ctx, moe_out, resid_b);              // [n_embd, T]
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, h_b));
-        }
+    // seg A(0) on its own, then fuse segB(L)+segA(L+1) per step so each layer
+    // boundary is a single GPU submit instead of two (mirrors decode_cached).
+    {
+        ggml_context * ctx = new_ctx();
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+        ggml_tensor * selected = build_segA(ctx, gf, 0);
         run(ctx, gf);
+        set_attn_inputs(gf);
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
-            throw std::runtime_error("decode_cached_batch: seg B compute failed");
+            throw std::runtime_error("decode_cached_batch: seg A0 compute failed");
+        ensure_layer(selected, 0);
+        ggml_free(ctx);
+    }
+    for (int il = 0; il < N; ++il) {
+        ggml_context * ctx = new_ctx();
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+        build_segB(ctx, gf, il);
+        ggml_tensor * nsel = (il + 1 < N) ? build_segA(ctx, gf, il + 1) : nullptr;
+        run(ctx, gf);
+        set_attn_inputs(gf);
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("decode_cached_batch: fused segB/segA compute failed");
+        if (nsel) ensure_layer(nsel, il + 1);
         ggml_free(ctx);
     }
 
