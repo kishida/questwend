@@ -163,6 +163,13 @@ int main(int argc, char ** argv) {
         using clk = std::chrono::steady_clock;
         auto secs = [](clk::duration d){ return std::chrono::duration<double>(d).count(); };
         auto run = [&](const std::vector<int32_t> & ids) {
+            // template debugging: dump the rendered prompt (QWEN_DUMP_PROMPT=1)
+            if (getenv("QWEN_DUMP_PROMPT")) {
+                std::string s;
+                for (int32_t t : ids) s += tok.decode(t);
+                fprintf(stderr, "---- prompt (%zu tokens) ----\n%s\n---- end prompt ----\n",
+                        ids.size(), s.c_str());
+            }
             // MTP self-speculative greedy decode
             if (use_mtp && rt.has_mtp()) {
                 int generated = 0;

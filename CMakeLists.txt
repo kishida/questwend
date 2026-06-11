@@ -34,6 +34,7 @@ add_library(qwencpp_core STATIC
     core/runtime.cpp
     core/expert_cache.cpp
     core/sampler.cpp
+    core/chat.cpp
 )
 target_include_directories(qwencpp_core PUBLIC core)
 target_link_libraries(qwencpp_core PUBLIC ggml)
