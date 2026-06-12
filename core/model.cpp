@@ -495,6 +495,9 @@ std::unique_ptr<Model> Model::load(const std::string & path) {
 }
 
 void Model::load_hparams() {
+    hp_.general_name = gguf_str(gguf_, "general.name", "");
+    hp_.file_type    = gguf_u32(gguf_, "general.file_type", 0);
+
     const std::string arch = gguf_str(gguf_, "general.architecture", "unknown");
     hp_.arch = arch_from_string(arch);
     if (hp_.arch == Arch::UNKNOWN) {

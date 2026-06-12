@@ -144,6 +144,11 @@ struct Runtime::Impl {
     int n_ctx  = 0;
     int n_past = 0;
 
+    // prompt prefix cache bookkeeping: the tokens behind n_past / the recurrent
+    // state. Appended by the public decode() wrapper and by generate_mtp's
+    // confirmed tokens; cleared by reset().
+    std::vector<int32_t> kv_toks;
+
     // vision: embedding overrides applied to the next batched decode (consumed
     // by build_graph; the input tensors are filled in decode() after alloc)
     std::vector<Runtime::EmbdOverride> embd_ovr;
@@ -1420,6 +1425,19 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
     const int P = (int) prompt.size();
     const int n_embd = hp.n_embd;
     static const bool no_batch_prefill = getenv("QWEN_MTP_NO_BATCH_PREFILL") != nullptr;
+
+    // continuation from a cached prefix (n_past > 0): the main KV / GDN state
+    // and the MTP KV already cover the previous tokens, and mtp_hidden holds
+    // the last cached token's hidden. Pair it with the first new token so the
+    // nextn KV chain stays gapless across requests.
+    if (n_past > 0 && P > 0) {
+        std::vector<Runtime::EmbdOverride> bovr;
+        for (const auto & o : embd_ovr)
+            if (o.first == 0) bovr.push_back({ 0, 1, o.data });
+        if (!bovr.empty()) mtp_prefill_batch(&prompt[0], mtp_hidden.data(), 1, bovr);
+        else               mtp_resync(prompt[0]);
+    }
+
     if (P > 1 && (!no_batch_prefill || !embd_ovr.empty())) {
         const std::vector<Runtime::EmbdOverride> povr = embd_ovr;   // decode() consumes the member
         bh_all.clear();
@@ -1453,6 +1471,7 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
             if (i + 1 < P) mtp_resync(prompt[i + 1]);   // KV only, no head
         }
     }
+    kv_toks.insert(kv_toks.end(), prompt.begin(), prompt.end());
     int32_t x = argmax(mlog);            // first generated token
     // invariant at loop top: n_past = pos(x), mtp_past = pos(x)-1, mtp_hidden = h_{pos(x)-1}
     int generated = 0;
@@ -1495,13 +1514,6 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
         accepted_drafts += a;
         const int32_t x_new = vA[a];           // correction (or bonus token if a==K)
 
-        bool stop = false;
-        for (int j = 0; j < a; ++j) {          // emit accepted drafts
-            if (!on_token(drafts[j])) { stop = true; break; }
-            if (++generated >= max_new) { stop = true; break; }
-        }
-        if (stop) break;
-
         // ---- settle main KV / recurrent state to the a+1 confirmed tokens ----
         auto ts0 = pclk::now();
         if (a == K) {
@@ -1531,6 +1543,18 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
         }
         mtp_hidden = vH[a];                    // h_{p+a}: draft context for x_new
         ms_resync += msec(pclk::now() - tr0);
+
+        kv_toks.push_back(x);                  // the a+1 confirmed tokens now in KV
+        for (int j = 0; j < a; ++j) kv_toks.push_back(drafts[j]);
+
+        // emit accepted drafts AFTER settle/resync, so an early exit (stop
+        // token, budget) leaves the state consistent with kv_toks for reuse
+        bool stop = false;
+        for (int j = 0; j < a; ++j) {
+            if (!on_token(drafts[j])) { stop = true; break; }
+            if (++generated >= max_new) { stop = true; break; }
+        }
+        if (stop) break;
         x = x_new;
     }
     if (prof && steps > 0)
@@ -2505,7 +2529,9 @@ Runtime::Runtime(Model & model, const RuntimeConfig & cfg)
 Runtime::~Runtime() = default;
 
 const std::vector<float> & Runtime::decode(const std::vector<int32_t> & tokens) {
-    return impl_->decode(tokens);
+    const std::vector<float> & l = impl_->decode(tokens);
+    impl_->kv_toks.insert(impl_->kv_toks.end(), tokens.begin(), tokens.end());
+    return l;
 }
 void Runtime::set_embd_overrides(std::vector<EmbdOverride> ovr) {
     impl_->embd_ovr = std::move(ovr);
@@ -2516,7 +2542,8 @@ void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int
                            const std::function<bool(int32_t)> & on_token) {
     impl_->generate_mtp(prompt, max_new, n_draft, on_token);
 }
-void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->zero_states(); }
+void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->kv_toks.clear(); impl_->zero_states(); }
 int  Runtime::n_past() const { return impl_->n_past; }
+const std::vector<int32_t> & Runtime::kv_tokens() const { return impl_->kv_toks; }
 
 } // namespace qwencpp

@@ -191,7 +191,8 @@ let history = [];
 let busy = false;
 
 fetch('/v1/models').then(r=>r.json()).then(j=>{
-  document.getElementById('model').textContent = (j.data && j.data[0] && j.data[0].id) || '';
+  const m = j.data && j.data[0];
+  document.getElementById('model').textContent = (m && (m.display || m.id)) || '';
 }).catch(()=>{});
 
 function addMsg(role, text, imgs){
@@ -306,8 +307,9 @@ function renderAssistant(el, txt){
 function showStats(el, t){
   const s = document.createElement('div'); s.className = 'stats';
   const f = (x)=> (x||0).toFixed(1);
+  const cached = t.cached_tokens ? `, ${t.cached_tokens} cached` : '';
   s.textContent = `TTFT ${Math.round(t.ttft_ms||0)} ms · prefill ${f(t.prefill_tps)} tok/s `
-    + `(${t.prompt_tokens} in) · gen ${f(t.gen_tps)} tok/s · ${t.completion_tokens} out`;
+    + `(${t.prompt_tokens} in${cached}) · gen ${f(t.gen_tps)} tok/s · ${t.completion_tokens} out`;
   el.appendChild(s);
   document.getElementById('chat').scrollTop = 1e9;
 }
@@ -450,11 +452,104 @@ int main(int argc, char ** argv) {
     if (mtp) fprintf(stderr, "MTP self-speculative decode ON (draft=%d)\n", n_draft);
 
     const std::string model_id = "qwencpp:" + std::string(arch_name(model->hparams().arch));
+
+    // Build a human-readable display name: "Qwen3-30B-A3B Q8_0(qwen3)"
+    auto ftype_label = [](uint32_t ft) -> const char * {
+        // Values match llama_ftype (what GGUF general.file_type actually stores)
+        switch (ft) {
+            case  0: return "F32";      case  1: return "F16";
+            case  2: return "Q4_0";     case  3: return "Q4_1";
+            case  7: return "Q8_0";     case  8: return "Q5_0";
+            case  9: return "Q5_1";     case 10: return "Q2_K";
+            case 11: return "Q3_K_S";   case 12: return "Q3_K_M";
+            case 13: return "Q3_K_L";   case 14: return "Q4_K_S";
+            case 15: return "Q4_K_M";   case 16: return "Q5_K_S";
+            case 17: return "Q5_K_M";   case 18: return "Q6_K";
+            case 19: return "IQ2_XXS";  case 20: return "IQ2_XS";
+            case 21: return "IQ3_XXS";  case 22: return "IQ1_S";
+            case 23: return "IQ4_NL";   case 24: return "IQ3_S";
+            case 25: return "IQ2_S";    case 26: return "IQ4_XS";
+            case 27: return "IQ1_M";    case 28: return "BF16";
+            default: return "";
+        }
+    };
+    const std::string model_display = [&]() {
+        const auto & hp = model->hparams();
+        const char * ft = ftype_label(hp.file_type);
+        std::string d;
+        if (!hp.general_name.empty()) d = hp.general_name;
+        if (ft && *ft) { if (!d.empty()) d += ' '; d += ft; }
+        d += '('; d += arch_name(hp.arch); d += ')';
+        return d;
+    }();
     const int32_t eos    = model->vocab().eos_id;
     const int32_t im_end = tok->token_to_id("<|im_end|>");
     auto is_stop = [&](int32_t t){ return t == eos || (im_end >= 0 && t == im_end); };
 
     std::mutex infer_mtx;   // runtime is single-threaded + stateful
+
+    // ---- single-slot prompt prefix cache (guarded by infer_mtx) ----
+    // The runtime keeps the KV cache / GDN state of the previous request. If
+    // the new prompt's tokens start with exactly rt->kv_tokens(), skip
+    // re-prefilling them and decode only the tail. Image spans inside the
+    // reused prefix must hold the same image as last time (byte hash); a span
+    // straddling the reuse boundary forces a full reset.
+    struct ImgSpan { int first; int count; uint64_t hash; };
+    auto kv_imgs = std::make_shared<std::vector<ImgSpan>>();
+    auto prepare_prompt = [&rt, &tok, kv_imgs](std::vector<int32_t> & prompt,
+                                               std::vector<Runtime::EmbdOverride> & ovr,
+                                               std::vector<ImgSpan> spans) -> int {
+        const auto & kv = rt->kv_tokens();
+        size_t n = 0;
+        if (!prompt.empty()) {
+            const size_t lim = std::min(kv.size(), prompt.size() - 1);   // keep >= 1 tail token
+            while (n < lim && kv[n] == prompt[n]) ++n;
+        }
+        // Token ids can diverge while the text is identical (the model may emit
+        // a non-canonical BPE split, e.g. " "+" " where re-tokenization gives
+        // "  "). Fall back to text-level alignment: if the rest of the cached
+        // tokens decodes to exactly the text of the next prompt tokens, reuse
+        // the whole cache and place the seam on a prompt-token boundary.
+        bool covered = !kv.empty() && n == kv.size();   // prompt[0..n) holds ALL cached tokens
+        if (n > 0 && !covered) {
+            std::string skv, sp;
+            for (size_t i = n; i < kv.size(); ++i) skv += tok->decode(kv[i]);
+            size_t j = n;
+            while (j < prompt.size() - 1 && sp.size() < skv.size()) sp += tok->decode(prompt[j++]);
+            if (sp == skv) { n = j; covered = true; }   // prompt[0..j) covers all of kv
+        }
+        bool ok = covered;                      // GDN state cannot rewind: full reuse only
+        if (!ok && !kv.empty() && getenv("QWEN_CACHE_DEBUG")) {
+            const std::string a = n < kv.size()     ? tok->decode(kv[n])     : "<end>";
+            const std::string b = n < prompt.size() ? tok->decode(prompt[n]) : "<end>";
+            fprintf(stderr, "prefix cache miss: matched %zu of kv=%zu prompt=%zu (kv[%zu]=%d '%s' prompt[%zu]=%d '%s')\n",
+                    n, kv.size(), prompt.size(),
+                    n, n < kv.size() ? kv[n] : -1, a.c_str(),
+                    n, n < prompt.size() ? prompt[n] : -1, b.c_str());
+        }
+        if (ok) for (const auto & s : spans)    // image span straddling the boundary
+            if (s.first < (int) n && s.first + s.count > (int) n) { ok = false; break; }
+        if (ok) {                               // images inside the prefix must be unchanged
+            std::vector<const ImgSpan *> in;
+            for (const auto & s : spans) if (s.first + s.count <= (int) n) in.push_back(&s);
+            ok = in.size() == kv_imgs->size();
+            for (size_t i = 0; ok && i < in.size(); ++i) {
+                const auto & p = (*kv_imgs)[i];
+                ok = in[i]->first == p.first && in[i]->count == p.count && in[i]->hash == p.hash;
+            }
+        }
+        if (!ok) { rt->reset(); n = 0; }
+        if (n > 0) {
+            prompt.erase(prompt.begin(), prompt.begin() + n);
+            std::vector<Runtime::EmbdOverride> tail;
+            for (const auto & o : ovr)
+                if (o.first >= (int) n) tail.push_back({ o.first - (int) n, o.count, o.data });
+            ovr = std::move(tail);
+            fprintf(stderr, "prefix cache: reusing %zu tokens, prefilling %zu\n", n, prompt.size());
+        }
+        *kv_imgs = std::move(spans);
+        return (int) n;
+    };
 
     // Parse OpenAI-style messages: plain string content, multimodal content
     // arrays (text / image_url with base64 data URIs), assistant tool_calls,
@@ -542,7 +637,8 @@ int main(int argc, char ** argv) {
 
     srv.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
         json j = {{"object", "list"}, {"data", json::array({
-            {{"id", model_id}, {"object", "model"}, {"owned_by", "qwencpp"}}
+            {{"id", model_id}, {"object", "model"}, {"owned_by", "qwencpp"},
+             {"display", model_display}}
         })}};
         res.set_content(j.dump(), "application/json");
     });
@@ -567,6 +663,9 @@ int main(int argc, char ** argv) {
         std::vector<ChatMessage> messages;
         ChatPromptOptions copts;
         copts.reasoning = reasoning;
+        // keep past <think> blocks so the re-rendered history tokenizes
+        // identically to what was generated -> the prompt prefix cache hits
+        copts.preserve_thinking = true;
         ChatPrompt cp;
         auto vembs = std::make_shared<std::vector<std::vector<float>>>();
         std::vector<Runtime::EmbdOverride> ovr;
@@ -592,7 +691,21 @@ int main(int argc, char ** argv) {
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");
             return;
         }
-        const auto & prompt = cp.ids;
+        // image spans + content hashes for the prefix cache
+        std::vector<ImgSpan> spans;
+        {
+            std::vector<uint64_t> ih;
+            for (const auto & ib : images) {
+                uint64_t h = 1469598103934665603ull;            // FNV-1a
+                for (uint8_t b : ib) { h ^= b; h *= 1099511628211ull; }
+                ih.push_back(h);
+            }
+            for (const auto & sp : cp.image_spans)
+                spans.push_back({ sp.first, sp.count, ih[sp.image_index] });
+        }
+
+        std::vector<int32_t> prompt = cp.ids;
+        const int n_prompt_full = (int) prompt.size();
         const bool req_mtp = mtp;
 
         if (stream) {
@@ -608,6 +721,8 @@ int main(int argc, char ** argv) {
                 std::string text;   // accumulated output (for tool-call parsing)
                 std::shared_ptr<std::vector<std::vector<float>>> vembs;   // keep image embds alive
                 std::vector<Runtime::EmbdOverride> ovr;
+                std::vector<ImgSpan> spans;       // image spans for the prefix cache
+                int n_cached = 0;                 // prompt tokens reused from the cache
                 int generated = 0, max_tokens = 0, prompt_tokens = 0;
                 bool started = false, finished = false;
                 clk::time_point t0, t_prefill, t_first;
@@ -619,6 +734,7 @@ int main(int argc, char ** argv) {
             st->prompt_tokens = (int) prompt.size();
             st->vembs = vembs;
             st->ovr   = std::move(ovr);
+            st->spans = std::move(spans);
 
             res.set_chunked_content_provider("text/event-stream",
                 [&, st, id, req_mtp, n_draft](size_t, httplib::DataSink & sink) -> bool {
@@ -630,12 +746,14 @@ int main(int argc, char ** argv) {
                         };
                         const double prefill_ms = ms(st->t0, st->t_prefill);
                         const double gen_ms     = ms(st->t_prefill, t_end);
+                        const int n_prefilled = st->prompt_tokens - st->n_cached;
                         json timings = {
                             {"prompt_tokens",     st->prompt_tokens},
+                            {"cached_tokens",     st->n_cached},
                             {"completion_tokens", st->generated},
                             {"ttft_ms",     ms(st->t0, st->t_first)},
-                            {"prefill_tps", prefill_ms > 0 ? st->prompt_tokens * 1000.0 / prefill_ms : 0.0},
-                            {"gen_tps",     gen_ms     > 0 ? st->generated     * 1000.0 / gen_ms     : 0.0},
+                            {"prefill_tps", prefill_ms > 0 ? n_prefilled  * 1000.0 / prefill_ms : 0.0},
+                            {"gen_tps",     gen_ms     > 0 ? st->generated * 1000.0 / gen_ms    : 0.0},
                         };
                         // tool calls: parse the accumulated text; if any, emit them as a
                         // final delta and finish with "tool_calls"
@@ -672,7 +790,7 @@ int main(int argc, char ** argv) {
                             if (st->started) return false;
                             st->started = true;
                             st->t0 = clk::now();
-                            rt->reset();
+                            st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans));
                             if (!st->ovr.empty()) rt->set_embd_overrides(st->ovr);   // vision
                             st->t_prefill = st->t_first = st->t0;   // defaults if 0 tokens
                             bool first = true;
@@ -694,7 +812,7 @@ int main(int argc, char ** argv) {
                         if (!st->started) {
                             st->started = true;
                             st->t0 = clk::now();
-                            rt->reset();
+                            st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans));
                             if (!st->ovr.empty()) rt->set_embd_overrides(st->ovr);   // vision
                             st->logits = rt->decode(st->prompt);
                             st->t_prefill = clk::now();
@@ -717,6 +835,7 @@ int main(int argc, char ** argv) {
                         return true;
                     } catch (const std::exception & e) {
                         fprintf(stderr, "stream error: %s\n", e.what());
+                        rt->reset();   // state unknown: invalidate the prefix cache
                         return finish();
                     }
                 });
@@ -725,12 +844,12 @@ int main(int argc, char ** argv) {
 
         // non-streaming
         std::string text;
-        int generated = 0;
+        int generated = 0, n_cached = 0;
         using clk = std::chrono::steady_clock;
         clk::time_point t0, t_prefill = {}, t_end = {};
         try {
             std::lock_guard<std::mutex> lk(infer_mtx);
-            rt->reset();
+            n_cached = prepare_prompt(prompt, ovr, std::move(spans));
             t0 = clk::now();
             if (req_mtp) {
                 t_prefill = t0;
@@ -759,6 +878,7 @@ int main(int argc, char ** argv) {
             t_end = clk::now();
         } catch (const std::exception & e) {
             fprintf(stderr, "generation error: %s\n", e.what());  // return what we have
+            rt->reset();   // state unknown: invalidate the prefix cache
             if (t_end == clk::time_point{}) t_end = clk::now();
         }
         auto ms = [](clk::time_point a, clk::time_point b) {
@@ -784,13 +904,14 @@ int main(int argc, char ** argv) {
             {"choices", json::array({
                 {{"index", 0}, {"message", msg},
                  {"finish_reason", calls.empty() ? "stop" : "tool_calls"}}})},
-            {"usage", {{"prompt_tokens", (int) prompt.size()},
+            {"usage", {{"prompt_tokens", n_prompt_full},
                        {"completion_tokens", generated},
-                       {"total_tokens", (int) prompt.size() + generated}}},
-            {"timings", {{"prompt_tokens", (int) prompt.size()},
+                       {"total_tokens", n_prompt_full + generated}}},
+            {"timings", {{"prompt_tokens", n_prompt_full},
+                         {"cached_tokens", n_cached},
                          {"completion_tokens", generated},
                          {"ttft_ms", prefill_ms},
-                         {"prefill_tps", prefill_ms > 0 ? prompt.size() * 1000.0 / prefill_ms : 0.0},
+                         {"prefill_tps", prefill_ms > 0 ? (n_prompt_full - n_cached) * 1000.0 / prefill_ms : 0.0},
                          {"gen_tps", gen_ms > 0 ? generated * 1000.0 / gen_ms : 0.0}}}
         };
         res.set_content(resp.dump(), "application/json");

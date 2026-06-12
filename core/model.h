@@ -61,6 +61,10 @@ struct HParams {
     uint32_t full_attn_interval = 4; // attention every `interval` layers ((il+1)%interval==0)
     uint32_t nextn_predict_layers = 0;
 
+    // GGUF metadata (display / identification)
+    std::string  general_name;  // general.name
+    uint32_t     file_type = 0; // general.file_type (ggml_ftype enum value)
+
     bool is_moe() const { return n_expert > 0; }
     // Main transformer stack excludes the trailing MTP (next-token-prediction) blocks.
     uint32_t n_main()  const { return n_layer - nextn_predict_layers; }

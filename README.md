@@ -162,6 +162,8 @@ infer-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15000
 
 > MTP はモデルロード時に nextn ブロックを VRAM 常駐させるため、リクエスト単位ではなく**サーバー起動フラグ**で指定します。ストリーミング/非ストリーミングの両方に対応。
 
+> **プロンプト・プレフィックスキャッシュ**: 前リクエストの KV キャッシュ / GDN 状態をサーバーが保持し、新しいプロンプトが前回の「プロンプト + 生成」の続き（通常のチャット継続）なら差分トークンだけを prefill する。会話が長くなっても各ターンの prefill コストは新規入力分のみ。`timings.cached_tokens`（UI では `N cached`）で再利用量を確認できる。トークン分割が再トークナイズで揺れた場合はテキストレベルで照合して吸収。画像はバイト列ハッシュで同一性を確認（別画像なら全 prefill）。履歴の `<think>` ブロックはキャッシュ一致のため保持して再構成する（`preserve_thinking`）。途中ターンの編集や別会話への切り替えは自動でフルリセット。
+
 ---
 
 ## 5. 分割（sharded）GGUF
@@ -197,6 +199,7 @@ infer -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40000 --ex
 | `QWEN_SYNC_FETCH=1` | RAM 階層の H2D を同期コピーに（async DMA の A/B 用） |
 | `QWEN_PREFETCH_THREADS=N` | SSD 並列読みのワーカー数（既定 8, 1〜64） |
 | `QWEN_GGML_DEBUG=1` | ggml の生ログを全表示（既定は DEBUG/INFO 破棄、同一 WARN 連続は1回） |
+| `QWEN_CACHE_DEBUG=1` | サーバーのプレフィックスキャッシュがミスしたとき分岐位置とトークンを表示 |
 
 ### 実験的 / テスト
 

@@ -57,6 +57,13 @@ public:
     void reset();                 // clear KV cache / position
     int  n_past() const;
 
+    // Tokens currently represented in the KV cache / recurrent state, in order.
+    // Maintained across decode() / generate_mtp(); cleared by reset(). Enables
+    // prompt prefix reuse: if a new prompt extends exactly these tokens, the
+    // caller may skip reset() and decode only the tail (GDN state cannot be
+    // rewound, so reuse requires the full token list to be a prompt prefix).
+    const std::vector<int32_t> & kv_tokens() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
