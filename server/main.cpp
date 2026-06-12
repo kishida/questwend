@@ -580,8 +580,7 @@ int main(int argc, char ** argv) {
             return;
         }
         const auto & prompt = cp.ids;
-        // MTP prefill cannot inject image embeddings yet: plain decode for image requests
-        const bool req_mtp = mtp && ovr.empty();
+        const bool req_mtp = mtp;
 
         if (stream) {
             res.set_header("Content-Type", "text/event-stream");
@@ -661,6 +660,7 @@ int main(int argc, char ** argv) {
                             st->started = true;
                             st->t0 = clk::now();
                             rt->reset();
+                            if (!st->ovr.empty()) rt->set_embd_overrides(st->ovr);   // vision
                             st->t_prefill = st->t_first = st->t0;   // defaults if 0 tokens
                             bool first = true;
                             rt->generate_mtp(st->prompt, st->max_tokens, n_draft, [&](int32_t t) -> bool {
@@ -721,6 +721,7 @@ int main(int argc, char ** argv) {
             t0 = clk::now();
             if (req_mtp) {
                 t_prefill = t0;
+                if (!ovr.empty()) rt->set_embd_overrides(ovr);   // vision
                 bool first = true;
                 rt->generate_mtp(prompt, max_tokens, n_draft, [&](int32_t t) -> bool {
                     if (is_stop(t) || rt->n_past() + 1 >= n_ctx) return false;

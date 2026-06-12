@@ -156,9 +156,8 @@ infer-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15000
 | `--no-mmproj` | mmproj があっても画像入力を無効化 |
 | `--cpu` | CPU バックエンドを強制 |
 
-> 画像は OpenAI 形式（`content` 配列の `image_url` に base64 data URI）で受け付け。ブラウザ UI にも 📎 ボタンあり。
+> 画像は OpenAI 形式（`content` 配列の `image_url` に base64 data URI）で受け付け。ブラウザ UI にも 📎 ボタンあり。MTP 有効時もそのまま画像入力可。
 > tool calling は `tools` を渡すと `<tool_call>` 出力を OpenAI の `tool_calls` に変換して返す（`finish_reason: "tool_calls"`）。`role:"tool"` の応答メッセージにも対応。
-> MTP 有効時、画像付きリクエストはそのリクエストだけ通常デコードにフォールバックする。
 
 > MTP はモデルロード時に nextn ブロックを VRAM 常駐させるため、リクエスト単位ではなく**サーバー起動フラグ**で指定します。ストリーミング/非ストリーミングの両方に対応。
 
@@ -202,8 +201,9 @@ infer -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40000 --ex
 
 | 変数 | 効果 |
 |---|---|
-| `QWEN_BATCH=1` | SSD 階層の prefill をバッチ実行（既定 token-by-token; MTP verify は常にバッチ） |
-| `QWEN_BATCH_CHUNK=N` | 上記バッチのチャンク長を固定 |
+| `QWEN_NO_BATCH_PREFILL=1` | SSD 階層の prefill を旧来の token-by-token に戻す（既定はバッチチャンク実行） |
+| `QWEN_BATCH_CHUNK=N` | SSD バッチ prefill のチャンク長を固定（既定はプールサイズから自動、最大 256） |
+| `QWEN_MTP_NO_BATCH_PREFILL=1` | MTP の prefill を旧来の token-by-token に戻す（既定はバッチ。画像入力時はバッチ強制） |
 | `QWEN_FASTCACHE=1` | 楽観単一グラフデコード（全 expert 常駐前提 + ミス時フォールバック; 実験的） |
 | `QWEN_GDN_TEST=1` | GDN の multi-token / token-by-token 等価性チェックを実行して終了 |
 | `QWEN_MTP_TEST=1` | MTP の draft 受理率計測モード（`--mtp` なしでも nextn を常駐させる） |
@@ -229,4 +229,4 @@ infer -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40000 --ex
 - `--cache-profile` は CLI では実行のたびに上書き保存される（サーバーは読み込みのみ）。アクセスパターンの異なる実行（MTP と plain 等）を混ぜるとプロファイルが汚れるので、ベスト状態のファイルをコピーして固定する運用を推奨。
 - ユニファイドメモリ（Apple Silicon）では SSD 階層のミスをスロット実メモリへ直接 `pread` する（ゼロコピー）。
 - チャットテンプレートは Qwen3.6 公式テンプレート等価のロジックを直接実装（jinja エンジンは不使用）。tools・`<think>` 分割・画像プレースホルダ・reasoning on/off に対応。動画入力は未対応。
-- 画像 + MTP の併用は未対応（MTP のプレフィルがトークン逐次のため。画像付きは自動で通常デコードにフォールバック）。
+- prefill はバッチ実行（通常デコード・MTP・SSD オフロードとも）。MTP の prefill はメイン一括 forward で全トークンの hidden を取得し、nextn KV もバッチ構築するため、画像 + MTP の併用も可。

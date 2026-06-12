@@ -184,7 +184,6 @@ int main(int argc, char ** argv) {
                         std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t0).count());
             }
-            if (use_mtp) { fprintf(stderr, "warning: --mtp is not supported with images; using plain decode\n"); use_mtp = false; }
             chat = true;   // images imply chat formatting
         }
 

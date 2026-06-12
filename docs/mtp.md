@@ -291,6 +291,34 @@ MTP は 10 tok/s と逆転していた。`QWEN_PROF_MTP` の per-cycle 分解で
 
 ---
 
+## 4.8 バッチプレフィル（prefill の刷新）
+
+従来の MTP prefill はトークン逐次だった: `decode({tok_i})`（メイン 1 トークン）+
+`mtp_resync(tok_{i+1})`（nextn 1 トークン）× P 回。生成は速くても長いプロンプトで
+立ち上がりが遅い、画像埋め込みを注入できない、という 2 つの問題があった。
+
+現在は 2 段のバッチで処理する:
+
+1. **メイン一括 forward** — `decode(prompt)` をそのまま使い、全トークンの最終 hidden
+   （pre-output-norm）を一括キャプチャ（`bh_all`）。SSD オフロード時はチャンク分割の
+   `decode_cached_batch` 経由（チャンク毎に hidden を追記）。画像 embedding override も
+   この経路がそのまま処理する。
+2. **nextn KV のバッチ構築** — `build_mtp` を T トークン化し、`(tok_{i+1}, h_i)` の組を
+   512 トークンずつ 1 グラフで流して MTP KV を書く（headless、ロジット読み戻しなし）。
+   画像スパンは nextn 側の `emb(tok)` にも splice する（draft 品質のため。出力の正しさは
+   verify が保証）。
+
+実測（27B-UD-Q2_K_XL, 322 トークンプロンプト, RTX 4060 Ti, ウォーム）:
+prefill 込みの総時間 **17.6s → 1.7s（約 10 倍）**。出力・受理率は不変
+（数値経路はむしろ plain のバッチ prefill と一致するようになった）。
+
+SSD 階層の plain prefill も同じバッチチャンク経路がデフォルトになった
+（35B + 画像 600 トークンで 7.7 → 11.3 tok/s。ヒット率が低い環境では SSD 帯域律速）。
+旧挙動は `QWEN_MTP_NO_BATCH_PREFILL=1` / `QWEN_NO_BATCH_PREFILL=1` で戻せる。
+副産物として **画像 + MTP の併用**（CLI / サーバーとも）が解禁された。
+
+---
+
 ## 5. 使い方
 
 ```bash

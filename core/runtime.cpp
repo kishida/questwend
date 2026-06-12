@@ -148,6 +148,11 @@ struct Runtime::Impl {
     // by build_graph; the input tensors are filled in decode() after alloc)
     std::vector<Runtime::EmbdOverride> embd_ovr;
 
+    // MTP batched prefill: while set, batched decodes append every token's final
+    // hidden (pre-output-norm) to bh_all so the nextn KV can be built in batches.
+    bool               want_bh_all = false;
+    std::vector<float> bh_all;     // [n_captured * n_embd], appended per batch
+
     // decode_cached profiling (QWEN_PROF_DC): wall vs GPU-compute time
     double dc_wall_ms = 0, dc_gpu_ms = 0;
     uint64_t dc_tokens = 0;
@@ -252,12 +257,17 @@ struct Runtime::Impl {
     const std::vector<float> & decode_reuse(int32_t token);
 
     // MTP draft: predict the token after `token`, given the captured main hidden.
+    // n_tokens > 1 runs the nextn block over a whole batch (KV prefill); ovr/n_ovr
+    // splice image embeddings over the token embeddings (spans relative to `tok`).
     ggml_tensor * build_mtp(ggml_context * ctx, ggml_cgraph * gf,
                             ggml_tensor * h, ggml_tensor * tok, ggml_tensor * pos, ggml_tensor * mask,
-                            int n_kv);
+                            int n_kv, int n_tokens = 1,
+                            const Runtime::EmbdOverride * ovr = nullptr, int n_ovr = 0);
     const std::vector<float> & mtp_draft(int32_t token);
     int32_t mtp_draft_fast(int32_t token, bool need_hidden);   // persistent graph, argmax-only readback
     void mtp_resync(int32_t token);                            // KV-write only (headless, no readback)
+    void mtp_prefill_batch(const int32_t * toks, const float * hiddens, int T,
+                           const std::vector<Runtime::EmbdOverride> & ovr);
     void init_ckpts(int T);
     void restore_ckpt(int t);
     void capture_main_hidden(ggml_cgraph * gf, int col);
@@ -280,9 +290,11 @@ struct Runtime::Impl {
                                    ggml_tensor * weights);
     const std::vector<float> & decode_cached(int32_t token, const float * embd_override = nullptr);
     // Batched prefill over the cache: process up to a pool-sized chunk of tokens
-    // in one segmented forward (instead of token-by-token).
+    // in one segmented forward (instead of token-by-token). ovr/n_ovr overwrite
+    // image-span rows of the embed output (spans relative to `toks`).
     void decode_cached_batch(const int32_t * toks, int n_tokens, bool want_logits,
-                             bool verify = false);
+                             bool verify = false,
+                             const Runtime::EmbdOverride * ovr = nullptr, int n_ovr = 0);
 };
 
 void Runtime::Impl::init() {
@@ -326,7 +338,7 @@ void Runtime::Impl::init() {
         model.load_weights_ssd(backend, weights_buf);
         weights_buf_owned = true;
         reuse_graph = false;   // every token goes through the per-token cache path
-        fprintf(stderr, "expert offload: ON (SSD tier, decode via VRAM cache; prefill token-by-token)\n");
+        fprintf(stderr, "expert offload: ON (SSD tier, decode via VRAM cache; prefill in batched chunks)\n");
     } else if (use_expert_offload) {
         // Create a CPU backend for expert weights.
         cpu_backend = ggml_backend_cpu_init();
@@ -930,7 +942,7 @@ void Runtime::Impl::capture_main_hidden(ggml_cgraph * gf, int col) {
 // for the token *after* `tok`.
 ggml_tensor * Runtime::Impl::build_mtp(ggml_context * ctx, ggml_cgraph * gf,
         ggml_tensor * h, ggml_tensor * tok, ggml_tensor * pos, ggml_tensor * mask,
-        int n_kv) {
+        int n_kv, int n_tokens, const Runtime::EmbdOverride * ovr, int n_ovr) {
     const auto & hp = model.hparams();
     const int L           = (int) hp.n_main();      // MTP block index
     const int n_embd      = hp.n_embd;
@@ -938,15 +950,27 @@ ggml_tensor * Runtime::Impl::build_mtp(ggml_context * ctx, ggml_cgraph * gf,
     const int n_head_kv   = hp.n_head_kv;
     const int n_embd_head = hp.n_embd_head;
     const float eps       = hp.rms_eps;
+    const int   T         = n_tokens;
 
     // h' = eh_proj( concat( hnorm(h), enorm(emb(tok)) ) )
-    ggml_tensor * emb = ggml_get_rows(ctx, model.tok_embd_rows(), tok);            // [n_embd,1]
+    ggml_tensor * emb = ggml_get_rows(ctx, model.tok_embd_rows(), tok);            // [n_embd,T]
+    // vision: splice the image embeddings over the <|image_pad|> token rows so
+    // the nextn KV sees the same inputs as the main stack
+    if (n_ovr > 0) {
+        emb = ggml_cont(ctx, emb);
+        for (int k = 0; k < n_ovr; ++k) {
+            ggml_tensor * ov = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, ovr[k].count);
+            ggml_set_input(ov);
+            ggml_set_name(ov, ("mtp_embd_ovr_" + std::to_string(k)).c_str());
+            emb = ggml_set_2d(ctx, emb, ov, emb->nb[1], (size_t) ovr[k].first * emb->nb[1]);
+        }
+    }
     ggml_tensor * e   = ggml_mul(ctx, ggml_rms_norm(ctx, emb, eps), W("blk.%d.nextn.enorm.weight", L));
-    ggml_tensor * h2  = ggml_reshape_2d(ctx, h, n_embd, 1);
+    ggml_tensor * h2  = ggml_reshape_2d(ctx, h, n_embd, T);
     ggml_tensor * hn  = ggml_mul(ctx, ggml_rms_norm(ctx, h2, eps), W("blk.%d.nextn.hnorm.weight", L));
     // eh_proj expects [ enorm(emb) ; hnorm(hidden) ]  (embedding first)
-    ggml_tensor * combined = ggml_concat(ctx, e, hn, 0);                            // [2*n_embd,1]
-    ggml_tensor * cur = ggml_mul_mat(ctx, W("blk.%d.nextn.eh_proj.weight", L), combined); // [n_embd,1]
+    ggml_tensor * combined = ggml_concat(ctx, e, hn, 0);                            // [2*n_embd,T]
+    ggml_tensor * cur = ggml_mul_mat(ctx, W("blk.%d.nextn.eh_proj.weight", L), combined); // [n_embd,T]
 
     // transformer block (gated attention + dense FFN), gated like qwen35
     ggml_tensor * inpSA = cur;
@@ -954,18 +978,18 @@ ggml_tensor * Runtime::Impl::build_mtp(ggml_context * ctx, ggml_cgraph * gf,
 
     ggml_tensor * Qf = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", L), x);
     const size_t es = ggml_element_size(Qf);
-    ggml_tensor * Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head, 1,
+    ggml_tensor * Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head, T,
             es * n_embd_head * 2, es * n_embd_head * 2 * n_head, 0);
-    ggml_tensor * gate_t = ggml_view_3d(ctx, Qf, n_embd_head, n_head, 1,
+    ggml_tensor * gate_t = ggml_view_3d(ctx, Qf, n_embd_head, n_head, T,
             es * n_embd_head * 2, es * n_embd_head * 2 * n_head, es * n_embd_head);
-    gate_t = ggml_cont_2d(ctx, gate_t, n_embd_head * n_head, 1);
-    ggml_tensor * K = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", L), x), n_embd_head, n_head_kv, 1);
-    ggml_tensor * V = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", L), x), n_embd_head, n_head_kv, 1);
+    gate_t = ggml_cont_2d(ctx, gate_t, n_embd_head * n_head, T);
+    ggml_tensor * K = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", L), x), n_embd_head, n_head_kv, T);
+    ggml_tensor * V = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", L), x), n_embd_head, n_head_kv, T);
     Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", L));
     K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", L));
     Q = ggml_rope_ext(ctx, Q, pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX, 0, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     K = ggml_rope_ext(ctx, K, pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX, 0, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    ggml_tensor * att = build_attn(ctx, gf, L, Q, K, V, mask, 1, n_kv);   // KV write uses n_past (= mtp_past, set by caller)
+    ggml_tensor * att = build_attn(ctx, gf, L, Q, K, V, mask, T, n_kv);   // KV write uses n_past (= mtp_past, set by caller)
     att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
     cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", L), att);
     cur = ggml_add(ctx, cur, inpSA);
@@ -974,7 +998,7 @@ ggml_tensor * Runtime::Impl::build_mtp(ggml_context * ctx, ggml_cgraph * gf,
     ggml_tensor * ff;
     if (hp.is_moe()) {
         // MoE nextn block (e.g. Qwen3.6-35B-A3B-MTP): experts are VRAM-resident.
-        ff = build_moe(ctx, gf, L, ffn_in, 1);
+        ff = build_moe(ctx, gf, L, ffn_in, T);
     } else {
         ggml_tensor * gt = ggml_mul_mat(ctx, W("blk.%d.ffn_gate.weight", L), ffn_in);
         ggml_tensor * up = ggml_mul_mat(ctx, W("blk.%d.ffn_up.weight",   L), ffn_in);
@@ -1201,6 +1225,66 @@ void Runtime::Impl::mtp_resync(int32_t token) {
         throw std::runtime_error("mtp_resync: compute failed");
     mtp_past += 1;
 }
+
+// Batched MTP KV prefill: one headless nextn forward over T tokens (tok[i] paired
+// with the main hidden of the previous prompt position, hiddens + i*n_embd),
+// writing MTP KV entries mtp_past..mtp_past+T-1. Equivalent to T mtp_resync
+// calls but with a single graph build/submit. `ovr` spans are relative to `toks`.
+void Runtime::Impl::mtp_prefill_batch(const int32_t * toks, const float * hiddens, int T,
+                                      const std::vector<Runtime::EmbdOverride> & ovr) {
+    const int n_embd = model.hparams().n_embd;
+    const int n_kv   = mtp_past + T;
+
+    ggml_init_params gp{};
+    gp.mem_size = ggml_tensor_overhead() * GRAPH_SIZE + ggml_graph_overhead_custom(GRAPH_SIZE, false);
+    gp.no_alloc = true;
+    ggml_context * ctx = ggml_init(gp);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+
+    ggml_tensor * h_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T); ggml_set_input(h_in);
+    ggml_tensor * t_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);         ggml_set_input(t_in);
+    ggml_tensor * p_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);         ggml_set_input(p_in);
+    ggml_tensor * m_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, T);   ggml_set_input(m_in);
+
+    const int saved = n_past;
+    n_past = mtp_past;                 // build_attn writes MTP KV at this position
+    mtp_headless = true;
+    build_mtp(ctx, gf, h_in, t_in, p_in, m_in, n_kv, T, ovr.data(), (int) ovr.size());
+    mtp_headless = false;
+    n_past = saved;
+
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(ga, gf)) {
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        throw std::runtime_error("mtp_prefill_batch: gallocr alloc failed");
+    }
+
+    ggml_backend_tensor_set(h_in, hiddens, 0, (size_t) T * n_embd * sizeof(float));
+    ggml_backend_tensor_set(t_in, toks, 0, T * sizeof(int32_t));
+    std::vector<int32_t> pos(T);
+    for (int i = 0; i < T; ++i) pos[i] = mtp_past + i;
+    ggml_backend_tensor_set(p_in, pos.data(), 0, T * sizeof(int32_t));
+    std::vector<ggml_fp16_t> mask((size_t) n_kv * T);
+    const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+    for (int i = 0; i < T; ++i) {
+        const int abs_i = mtp_past + i;
+        for (int j = 0; j < n_kv; ++j)
+            mask[(size_t) i * n_kv + j] = (j <= abs_i) ? z : ninf;
+    }
+    ggml_backend_tensor_set(m_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    for (size_t k = 0; k < ovr.size(); ++k) {
+        ggml_tensor * ov = ggml_graph_get_tensor(gf, ("mtp_embd_ovr_" + std::to_string(k)).c_str());
+        if (ov) ggml_backend_tensor_set(ov, ovr[k].data, 0, ggml_nbytes(ov));
+    }
+
+    const ggml_status st = ggml_backend_graph_compute(backend, gf);
+    ggml_gallocr_free(ga);
+    ggml_free(ctx);
+    if (st != GGML_STATUS_SUCCESS)
+        throw std::runtime_error("mtp_prefill_batch: compute failed");
+    mtp_past += T;
+}
 // Offload verify: run the 2-token main forward through the VRAM expert cache.
 // Uses the batched cache path when the pools can hold both tokens' experts at
 // once; otherwise falls back to two single-token decodes (still correct, just
@@ -1328,12 +1412,46 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
     // keeps the backup + re-decode path: its verify runs through the cache).
     const bool use_ckpt = gdn && !ecache;
 
-    // prefill token-by-token: builds main KV + MTP KV (so drafts have history)
+    // prefill: one batched main forward captures every token's hidden (bh_all),
+    // then batched headless nextn forwards build the MTP KV (so drafts have
+    // history). Token-by-token fallback via QWEN_MTP_NO_BATCH_PREFILL (image
+    // embedding overrides require the batched path).
     std::vector<float> mlog;
     const int P = (int) prompt.size();
-    for (int i = 0; i < P; ++i) {
-        mlog = decode({ prompt[i] });
-        if (i + 1 < P) mtp_resync(prompt[i + 1]);   // KV only, no head
+    const int n_embd = hp.n_embd;
+    static const bool no_batch_prefill = getenv("QWEN_MTP_NO_BATCH_PREFILL") != nullptr;
+    if (P > 1 && (!no_batch_prefill || !embd_ovr.empty())) {
+        const std::vector<Runtime::EmbdOverride> povr = embd_ovr;   // decode() consumes the member
+        bh_all.clear();
+        want_bh_all = true;
+        mlog = decode(prompt);             // chunking + embd overrides handled inside
+        want_bh_all = false;
+        // MTP KV for prompt positions 0..P-2: token i+1 paired with hidden h_i
+        const int MCHUNK = 512;            // bounds the [n_kv, T] mask allocation
+        int i = 0;
+        while (i < P - 1) {
+            const int t = std::min(MCHUNK, P - 1 - i);
+            // image spans clipped to this chunk, shifted to the nextn token
+            // array (its token j is prompt[i+1+j])
+            std::vector<Runtime::EmbdOverride> ovr;
+            for (const auto & o : povr) {
+                const int lo = std::max(o.first, i + 1);
+                const int hi = std::min(o.first + o.count, i + 1 + t);
+                if (lo < hi) ovr.push_back({ lo - (i + 1), hi - lo,
+                                             o.data + (size_t) (lo - o.first) * n_embd });
+            }
+            mtp_prefill_batch(&prompt[i + 1], bh_all.data() + (size_t) i * n_embd, t, ovr);
+            i += t;
+        }
+        mtp_hidden.assign(bh_all.begin() + (size_t) (P - 1) * n_embd,
+                          bh_all.begin() + (size_t) P * n_embd);
+        bh_all.clear();
+        bh_all.shrink_to_fit();
+    } else {
+        for (int i = 0; i < P; ++i) {
+            mlog = decode({ prompt[i] });
+            if (i + 1 < P) mtp_resync(prompt[i + 1]);   // KV only, no head
+        }
     }
     int32_t x = argmax(mlog);            // first generated token
     // invariant at loop top: n_past = pos(x), mtp_past = pos(x)-1, mtp_hidden = h_{pos(x)-1}
@@ -1555,7 +1673,8 @@ ggml_tensor * Runtime::Impl::build_moe_cached(ggml_context * ctx, ggml_cgraph * 
 // token-by-token path. n_tokens is bounded so a layer's distinct experts fit the
 // pool. Only the last token's logits are produced (when want_logits).
 void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool want_logits,
-                                        bool verify) {
+                                        bool verify,
+                                        const Runtime::EmbdOverride * ovr, int n_ovr) {
     const auto & hp = model.hparams();
     const int n_embd      = hp.n_embd;
     const int n_exp       = hp.n_expert;
@@ -1613,6 +1732,13 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             throw std::runtime_error("decode_cached_batch: embed compute failed");
         ggml_free(ctx);
     }
+
+    // vision: overwrite the image-span rows of the embed output with the
+    // precomputed image embeddings (spans are relative to `toks`)
+    for (int k = 0; k < n_ovr; ++k)
+        ggml_backend_tensor_set(h_b, ovr[k].data,
+            (size_t) ovr[k].first * n_embd * sizeof(float),
+            (size_t) ovr[k].count * n_embd * sizeof(float));
 
     std::vector<int32_t> sel(n_used * T), sg(n_used * T), su(n_used * T), sd(n_used * T);
 
@@ -1784,6 +1910,13 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             throw std::runtime_error("decode_cached_batch: fused segB/segA compute failed");
         if (nsel) ensure_layer(nsel, il + 1);
         ggml_free(ctx);
+    }
+
+    // MTP batched prefill: append every token's final hidden (pre-output-norm)
+    if (want_bh_all) {
+        const size_t base = bh_all.size();
+        bh_all.resize(base + (size_t) T * n_embd);
+        ggml_backend_tensor_get(h_b, bh_all.data() + base, 0, (size_t) T * n_embd * sizeof(float));
     }
 
     // ---- final norm + output projection (last token only) ----
@@ -2231,36 +2364,46 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     // SSD tier has no CPU-expert sched path: run prefill as batched chunks via
     // the cache (chunk bounded so a layer's distinct experts fit the pools).
     if (ecache && !sched) {
-        // Batched prefill (QWEN_BATCH) processes a chunk of tokens through one
-        // segmented forward (seg A attention/GDN/router for all tokens -> one
-        // expert-residency sync -> seg B expert matmuls). Now argmax-equivalent to
-        // the token-by-token path for both plain-attn (qwen3moe) and GDN MoE models
-        // (the prior divergence was a router-readback bug, since fixed). It is opt-in
-        // because in the SSD tier it is *slower* than token-by-token: seg B is still
-        // per-token, and the per-chunk union-of-experts fetch defeats the async
-        // prefetch pipeline. The code path is retained for the MTP 2-token verify,
-        // where the union is tiny and mostly already resident.
-        if (getenv("QWEN_BATCH") && embd_ovr.empty()) {
-            int chunk = ecache->min_slots() / (model.hparams().n_expert_used > 0 ? model.hparams().n_expert_used : 1);
-            if (chunk < 1)   chunk = 1;
-            if (chunk > 256) chunk = 256;
-            if (const char * c = getenv("QWEN_BATCH_CHUNK")) { int v = atoi(c); if (v >= 1) chunk = v; }
-            int i = 0;
-            while (i < n_tokens) {
-                const int t = std::min(chunk, n_tokens - i);
-                decode_cached_batch(&tokens[i], t, /*want_logits=*/ i + t >= n_tokens);
-                i += t;
-            }
+        // Batched prefill: each chunk runs one segmented forward (seg A
+        // attention/GDN/router for all tokens -> one expert-residency sync per
+        // layer -> batched seg B expert matmuls). Argmax-equivalent to the
+        // token-by-token path; one fetch per distinct expert per layer serves
+        // the whole chunk, and per-layer GPU submits replace per-token ones.
+        // Opt out with QWEN_NO_BATCH_PREFILL (not available while capturing
+        // per-token hiddens for the MTP batched prefill).
+        static const bool no_batch = getenv("QWEN_NO_BATCH_PREFILL") != nullptr;
+        if (no_batch && !want_bh_all) {
+            // token-by-token, with per-token image-embedding override lookup
+            auto override_for = [&](int i) -> const float * {
+                for (const auto & o : embd_ovr)
+                    if (i >= o.first && i < o.first + o.count)
+                        return o.data + (size_t) (i - o.first) * model.hparams().n_embd;
+                return nullptr;
+            };
+            for (int i = 0; i < n_tokens; ++i) decode_cached(tokens[i], override_for(i));
+            embd_ovr.clear();
             return logits;
         }
-        // vision: per-token embedding override lookup for the image spans
-        auto override_for = [&](int i) -> const float * {
-            for (const auto & o : embd_ovr)
-                if (i >= o.first && i < o.first + o.count)
-                    return o.data + (size_t) (i - o.first) * model.hparams().n_embd;
-            return nullptr;
-        };
-        for (int i = 0; i < n_tokens; ++i) decode_cached(tokens[i], override_for(i));
+        const int n_embd = model.hparams().n_embd;
+        int chunk = ecache->min_slots() / (model.hparams().n_expert_used > 0 ? model.hparams().n_expert_used : 1);
+        if (chunk < 1)   chunk = 1;
+        if (chunk > 256) chunk = 256;
+        if (const char * c = getenv("QWEN_BATCH_CHUNK")) { int v = atoi(c); if (v >= 1) chunk = v; }
+        int i = 0;
+        while (i < n_tokens) {
+            const int t = std::min(chunk, n_tokens - i);
+            // image spans clipped to this chunk (chunk-relative)
+            std::vector<Runtime::EmbdOverride> ovr;
+            for (const auto & o : embd_ovr) {
+                const int lo = std::max(o.first, i);
+                const int hi = std::min(o.first + o.count, i + t);
+                if (lo < hi) ovr.push_back({ lo - i, hi - lo,
+                                             o.data + (size_t) (lo - o.first) * n_embd });
+            }
+            decode_cached_batch(&tokens[i], t, /*want_logits=*/ i + t >= n_tokens, /*verify=*/false,
+                                ovr.empty() ? nullptr : ovr.data(), (int) ovr.size());
+            i += t;
+        }
         embd_ovr.clear();
         return logits;
     }
@@ -2335,6 +2478,19 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     const size_t off = (size_t) (n_tokens - 1) * logits_t->nb[1];
     ggml_backend_tensor_get(logits_t, logits.data(), off, n_vocab * sizeof(float));
     capture_main_hidden(gf, n_tokens - 1);
+
+    // MTP batched prefill: append every token's final hidden (pre-output-norm)
+    if (want_bh_all) {
+        ggml_tensor * h = ggml_graph_get_tensor(gf, "main_hidden");
+        if (h) {
+            const int ne = (int) h->ne[0];
+            const size_t base = bh_all.size();
+            bh_all.resize(base + (size_t) n_tokens * ne);
+            for (int i = 0; i < n_tokens; ++i)
+                ggml_backend_tensor_get(h, bh_all.data() + base + (size_t) i * ne,
+                                        (size_t) i * h->nb[1], ne * sizeof(float));
+        }
+    }
 
     n_past += n_tokens;
     ggml_free(ctx);
