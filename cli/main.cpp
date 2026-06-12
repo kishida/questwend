@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-using namespace qwencpp;
+using namespace questwend;
 
 static void usage(const char * prog) {
     printf("usage: %s -m <model.gguf> [options]\n", prog);

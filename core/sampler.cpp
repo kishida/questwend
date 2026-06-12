@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace qwencpp {
+namespace questwend {
 
 Sampler::Sampler(const SamplerConfig & cfg) : cfg_(cfg) {
     uint32_t seed = cfg_.seed;
@@ -68,4 +68,4 @@ int32_t Sampler::sample(const std::vector<float> & logits) {
     return work_.back().second;
 }
 
-} // namespace qwencpp
+} // namespace questwend

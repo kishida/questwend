@@ -4,7 +4,7 @@
 
 #include <cstring>
 
-namespace qwencpp {
+namespace questwend {
 
 bool gguf_has(const gguf_context * ctx, const std::string & key) {
     return gguf_find_key(ctx, key.c_str()) >= 0;
@@ -86,4 +86,4 @@ std::vector<int32_t> gguf_i32_array(const gguf_context * ctx, const std::string 
     return out;
 }
 
-} // namespace qwencpp
+} // namespace questwend

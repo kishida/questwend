@@ -18,7 +18,7 @@
 #include <thread>
 #include <vector>
 
-namespace qwencpp {
+namespace questwend {
 
 static const int GRAPH_SIZE = 16384;
 
@@ -2674,4 +2674,4 @@ void Runtime::load_state(const std::function<void(void *, size_t)> & src) {
     impl_->mtp_hidden = std::move(hidden);
 }
 
-} // namespace qwencpp
+} // namespace questwend

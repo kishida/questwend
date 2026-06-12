@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace qwencpp {
+namespace questwend {
 
 class Model;
 
@@ -93,4 +93,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace qwencpp
+} // namespace questwend

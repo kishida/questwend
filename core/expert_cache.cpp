@@ -20,7 +20,7 @@
 #include <unistd.h>
 #endif
 
-namespace qwencpp {
+namespace questwend {
 
 #ifdef __APPLE__
 // Is `p` a dereferenceable host pointer (mapped in our address space)?
@@ -531,4 +531,4 @@ void ExpertCache::ensure(int layer, const int32_t * expert_ids, int n,
     fetch_parallel(layer, jobs);
 }
 
-} // namespace qwencpp
+} // namespace questwend

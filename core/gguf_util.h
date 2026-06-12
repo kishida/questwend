@@ -9,7 +9,7 @@
 
 struct gguf_context;
 
-namespace qwencpp {
+namespace questwend {
 
 // Read a single-valued metadata key. Returns `def` if the key is missing.
 std::string  gguf_str (const gguf_context * ctx, const std::string & key, const std::string & def = "");
@@ -27,4 +27,4 @@ std::vector<float> gguf_f32_array(const gguf_context * ctx, const std::string & 
 // Read an int32 array (e.g. tokenizer.ggml.token_type).
 std::vector<int32_t> gguf_i32_array(const gguf_context * ctx, const std::string & key);
 
-} // namespace qwencpp
+} // namespace questwend

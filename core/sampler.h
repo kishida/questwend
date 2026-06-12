@@ -6,7 +6,7 @@
 #include <random>
 #include <vector>
 
-namespace qwencpp {
+namespace questwend {
 
 struct SamplerConfig {
     float    temperature = 0.8f;   // <= 0 => greedy
@@ -28,4 +28,4 @@ private:
     std::vector<std::pair<float, int32_t>> work_;  // (logit, id)
 };
 
-} // namespace qwencpp
+} // namespace questwend

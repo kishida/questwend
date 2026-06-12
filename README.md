@@ -1,4 +1,4 @@
-# qwencpp
+# QuestWend
 
 Qwen3 / Qwen3.5 / Qwen3.6 をスクラッチ実装した推論エンジン（vendored ggml の上に構築）。
 

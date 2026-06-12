@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <limits>
 
-namespace qwencpp {
+namespace questwend {
 
 // ---- UTF-8 helpers ----
 static void utf8_append(std::string & s, uint32_t cp) {
@@ -207,4 +207,4 @@ std::string Tokenizer::decode(const std::vector<int32_t> & tokens) const {
     return out;
 }
 
-} // namespace qwencpp
+} // namespace questwend

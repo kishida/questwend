@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace qwencpp {
+namespace questwend {
 
 struct Vocab;
 
@@ -37,4 +37,4 @@ private:
     std::vector<int32_t>     bpe_encode_piece(const std::string & piece) const;
 };
 
-} // namespace qwencpp
+} // namespace questwend

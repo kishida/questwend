@@ -13,7 +13,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace qwencpp {
+namespace questwend {
 
 const char * arch_name(Arch a) {
     switch (a) {
@@ -417,10 +417,10 @@ static std::vector<std::string> discover_shards(const std::string & path) {
 
 // ggml log filter: the default callback prints every level. ggml's DEBUG/INFO
 // output is internal chatter (Metal device/init/free banners, a DEBUG line per
-// buffer allocation, ...) that drowns qwencpp's own status lines, so drop both
+// buffer allocation, ...) that drowns questwend's own status lines, so drop both
 // and keep WARN/ERROR (collapsing a WARN repeated per-allocation to one line).
 // QWEN_GGML_DEBUG=1 restores the full firehose.
-static void qwencpp_ggml_log(ggml_log_level level, const char * text, void * /*user*/) {
+static void questwend_ggml_log(ggml_log_level level, const char * text, void * /*user*/) {
     static bool debug = getenv("QWEN_GGML_DEBUG") != nullptr;
     static ggml_log_level last_level = GGML_LOG_LEVEL_INFO;
     static std::string last_warn;
@@ -435,7 +435,7 @@ static void qwencpp_ggml_log(ggml_log_level level, const char * text, void * /*u
 }
 
 std::unique_ptr<Model> Model::load(const std::string & path) {
-    ggml_log_set(qwencpp_ggml_log, nullptr);
+    ggml_log_set(questwend_ggml_log, nullptr);
 
     auto m = std::unique_ptr<Model>(new Model());
     m->path_ = path;
@@ -618,4 +618,4 @@ std::string Model::summary() const {
     return os.str();
 }
 
-} // namespace qwencpp
+} // namespace questwend

@@ -19,7 +19,7 @@ infer -m Qwen3.5-122B-A10B-UD-Q3_K_M-00001-of-00003.gguf \
 
 ボトルネックの変遷: ホストオーバーヘッド+ミスフェッチ律速（wall 115ms = GPU 20ms + その他 95ms）
 → **GPU 計算律速**（wall 66ms = GPU 64ms + ホスト 3ms）。
-ここから先は ggml の Metal カーネル効率の世界で、qwencpp 側の伸びしろはほぼ無い。
+ここから先は ggml の Metal カーネル効率の世界で、QuestWend 側の伸びしろはほぼ無い。
 
 ## 効いた施策（コミット順）
 

@@ -1,13 +1,13 @@
 # 画像入力（Qwen3-VL / mmproj）対応計画
 
 検証済みの Java 参照実装（`qwenjava/Mmproj.java`, `VISION_PLAN.md`）を仕様書として、
-qwencpp に画像入力を実装する。Java 版と違い ViT forward は **ggml グラフ（GPU）** で実装する
+QuestWend に画像入力を実装する。Java 版と違い ViT forward は **ggml グラフ（GPU）** で実装する
 （Java CPU 版は ViT 19s → GPU なら 1s 未満の見込み）。
 
 - ターゲット: `D:\dev\gguf\unsloth\Qwen3.5-0.8B-GGUF`（`Qwen3.5-0.8B-Q8_0.gguf` + `mmproj-F32.gguf`）
 - テスト画像: `C:\Users\naoki\Desktop\09ptRcFn.jpg large.jpg`
 - チャットテンプレートは jinja を vendor せず、**Qwen テンプレート等価ロジックを直接実装**する
-  （qwencpp は Qwen 専用エンジンなので汎用 jinja は不要、という判断。nlohmann/json はサーバーで使用済み）
+  （QuestWend は Qwen 専用エンジンなので汎用 jinja は不要、という判断。nlohmann/json はサーバーで使用済み）
 
 ## アーキテクチャ要点（Java 版で検証済みの事実）
 

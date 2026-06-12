@@ -1,7 +1,7 @@
 # MTP (Multi-Token Prediction / nextn) — 実装と評価まとめ
 
 Qwen3.5/3.6 系の一部モデルに含まれる **nextn ブロック**（MTP module）を使った
-**自己推測デコード（self-speculative greedy decode）** を qwencpp に実装した記録。
+**自己推測デコード（self-speculative greedy decode）** を QuestWend に実装した記録。
 
 - 関連コミット: `fc0378d`（MTP本体）, `fe7de96`（推測ループ `--mtp`）,
   `eb11017`（batched cache の router バグ修正）, `805d244`（offload/MoE-MTP対応）

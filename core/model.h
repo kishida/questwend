@@ -18,7 +18,7 @@ typedef struct ggml_backend *             ggml_backend_t;
 typedef struct ggml_backend_buffer *      ggml_backend_buffer_t;
 typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
 
-namespace qwencpp {
+namespace questwend {
 
 enum class Arch {
     UNKNOWN,
@@ -191,4 +191,4 @@ private:
                            std::map<std::string, void *> & files) const;
 };
 
-} // namespace qwencpp
+} // namespace questwend

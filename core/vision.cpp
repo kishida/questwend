@@ -20,7 +20,7 @@
 #include <map>
 #include <stdexcept>
 
-namespace qwencpp {
+namespace questwend {
 
 static const int VIS_GRAPH_SIZE = 4096;
 
@@ -428,4 +428,4 @@ std::vector<float> VisionEncoder::encode_bytes(const uint8_t * data, size_t size
     return out;
 }
 
-} // namespace qwencpp
+} // namespace questwend

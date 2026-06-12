@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-namespace qwencpp {
+namespace questwend {
 
 struct ContentPart {
     enum class Kind { Text, Image };
@@ -82,4 +82,4 @@ inline std::vector<int32_t> build_chatml_tokens(
     return build_qwen_prompt(tok, messages, o).ids;
 }
 
-} // namespace qwencpp
+} // namespace questwend

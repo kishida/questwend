@@ -2,7 +2,7 @@
 
 #include <stdexcept>
 
-namespace qwencpp {
+namespace questwend {
 
 namespace {
 
@@ -258,4 +258,4 @@ ChatPrompt build_qwen_prompt(const Tokenizer & tok,
     return out;
 }
 
-} // namespace qwencpp
+} // namespace questwend

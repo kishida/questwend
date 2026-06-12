@@ -26,7 +26,7 @@
 #include <string>
 
 using json = nlohmann::json;
-using namespace qwencpp;
+using namespace questwend;
 
 // FIFO mutex with a waiter count: lets a generating request detect that
 // someone is queued (time-slice handoff) and guarantees the waiter actually
@@ -151,7 +151,7 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>qwencpp chat</title>
+<title>QuestWend chat</title>
 <style>
   :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#e6e8ee; --muted:#8b93a7; --accent:#5b8cff; }
   * { box-sizing:border-box; }
@@ -193,7 +193,7 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
 </head>
 <body>
 <header>
-  <b>qwencpp</b><span class="model" id="model">…</span>
+  <b>QuestWend</b><span class="model" id="model">…</span>
   <span class="spacer"></span>
   <label>temp <input type="number" id="temp" value="0.7" step="0.1" min="0" max="2"></label>
   <label>max <input type="number" id="maxtok" value="512" step="64" min="1"></label>
@@ -489,7 +489,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "warning: --mtp requested but model has no nextn block; using plain decode\n");
     if (mtp) fprintf(stderr, "MTP self-speculative decode ON (draft=%d)\n", n_draft);
 
-    const std::string model_id = "qwencpp:" + std::string(arch_name(model->hparams().arch));
+    const std::string model_id = "questwend:" + std::string(arch_name(model->hparams().arch));
 
     // Build a human-readable display name: "Qwen3-30B-A3B Q8_0(qwen3)"
     auto ftype_label = [](uint32_t ft) -> const char * {
@@ -860,7 +860,7 @@ int main(int argc, char ** argv) {
 
     srv.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
         json j = {{"object", "list"}, {"data", json::array({
-            {{"id", model_id}, {"object", "model"}, {"owned_by", "qwencpp"},
+            {{"id", model_id}, {"object", "model"}, {"owned_by", "questwend"},
              {"display", model_display}}
         })}};
         res.set_content(j.dump(), "application/json");
@@ -1300,7 +1300,7 @@ int main(int argc, char ** argv) {
     srv.set_write_timeout(600, 0);
     srv.set_keep_alive_timeout(600);
 
-    fprintf(stderr, "qwencpp server: http://%s:%d  (chat UI at /, model: %s)\n",
+    fprintf(stderr, "QuestWend server: http://%s:%d  (chat UI at /, model: %s)\n",
             host.c_str(), port, model_id.c_str());
     const bool ok = srv.listen(host.c_str(), port);
     if (!ok) fprintf(stderr, "failed to bind %s:%d\n", host.c_str(), port);

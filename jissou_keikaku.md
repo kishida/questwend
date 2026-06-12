@@ -74,7 +74,7 @@
 ## 2. モジュール構成（spec.md 準拠 + 補足）
 
 ```
-qwencpp/
+QuestWend/
   core/
     engine.{h,cpp}      外部API（pimpl）          §Engine API
     model.{h,cpp}       GGUFロード/メタ/テンソル配置   ← gguf.cpp流用 + Java GGUFReader.java参照

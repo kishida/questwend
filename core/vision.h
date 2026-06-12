@@ -15,7 +15,7 @@
 
 typedef struct ggml_backend * ggml_backend_t;
 
-namespace qwencpp {
+namespace questwend {
 
 class VisionEncoder {
 public:
@@ -49,4 +49,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace qwencpp
+} // namespace questwend

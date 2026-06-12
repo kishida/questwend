@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(qwencpp LANGUAGES C CXX)
+project(questwend LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,7 +27,7 @@ endif()
 add_subdirectory(third_party/ggml)
 
 # ---- core engine library ----
-add_library(qwencpp_core STATIC
+add_library(questwend_core STATIC
     core/gguf_util.cpp
     core/model.cpp
     core/tokenizer.cpp
@@ -37,13 +37,13 @@ add_library(qwencpp_core STATIC
     core/chat.cpp
     core/vision.cpp
 )
-target_include_directories(qwencpp_core PUBLIC core)
-target_include_directories(qwencpp_core PRIVATE third_party/stb)
-target_link_libraries(qwencpp_core PUBLIC ggml)
+target_include_directories(questwend_core PUBLIC core)
+target_include_directories(questwend_core PRIVATE third_party/stb)
+target_link_libraries(questwend_core PUBLIC ggml)
 
 # ---- CLI ----
 add_executable(infer cli/main.cpp)
-target_link_libraries(infer PRIVATE qwencpp_core)
+target_link_libraries(infer PRIVATE questwend_core)
 
 # ---- Server (OpenAI-compatible) ----
 add_executable(infer-server server/main.cpp third_party/cpp-httplib/httplib.cpp)
@@ -51,7 +51,7 @@ target_include_directories(infer-server PRIVATE
     third_party/cpp-httplib
     third_party/nlohmann
 )
-target_link_libraries(infer-server PRIVATE qwencpp_core)
+target_link_libraries(infer-server PRIVATE questwend_core)
 find_package(Threads REQUIRED)
 target_link_libraries(infer-server PRIVATE Threads::Threads)
 if(WIN32)
