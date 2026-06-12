@@ -54,6 +54,13 @@ struct TicketLock {
     }
 };
 
+// dump JSON replacing invalid UTF-8 instead of throwing: a token budget can
+// cut the output mid multi-byte character (byte-level BPE), and json::dump()
+// on that fragment would otherwise escape the handler as an HTTP 500.
+static std::string dumpj(const nlohmann::json & j) {
+    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
 static std::string now_id(const char * prefix) {
     auto t = std::chrono::system_clock::now().time_since_epoch().count();
     return std::string(prefix) + std::to_string(t);
@@ -487,7 +494,8 @@ int main(int argc, char ** argv) {
     const bool mtp = use_mtp && rt->has_mtp();
     if (use_mtp && !rt->has_mtp())
         fprintf(stderr, "warning: --mtp requested but model has no nextn block; using plain decode\n");
-    if (mtp) fprintf(stderr, "MTP self-speculative decode ON (draft=%d)\n", n_draft);
+    if (mtp) fprintf(stderr, "MTP self-speculative decode ON (draft=%d; greedy only -"
+                             " request sampling parameters are ignored)\n", n_draft);
 
     const std::string model_id = "questwend:" + std::string(arch_name(model->hparams().arch));
 
@@ -931,6 +939,15 @@ int main(int argc, char ** argv) {
         const int n_prompt_full = (int) prompt.size();
         const bool req_mtp = mtp;
 
+        // the prompt must fit the context window with room to generate
+        if (n_prompt_full >= n_ctx) {
+            res.status = 400;
+            res.set_content(json{{"error", "prompt is " + std::to_string(n_prompt_full) +
+                " tokens but the context window is " + std::to_string(n_ctx) +
+                " (start the server with a larger --n-ctx)"}}.dump(), "application/json");
+            return;
+        }
+
         if (stream) {
             res.set_header("Content-Type", "text/event-stream");
             res.set_header("Cache-Control", "no-cache");
@@ -943,6 +960,7 @@ int main(int argc, char ** argv) {
                 std::vector<int32_t> prompt;
                 std::vector<float> logits;
                 std::string text;   // accumulated output (for tool-call parsing)
+                std::string utf8_pend;            // incomplete UTF-8 tail held between chunks
                 std::shared_ptr<std::vector<std::vector<float>>> vembs;   // keep image embds alive
                 std::vector<Runtime::EmbdOverride> ovr;
                 std::vector<ImgSpan> spans;       // image spans for the prefix cache
@@ -1011,13 +1029,13 @@ int main(int argc, char ** argv) {
                             json tchunk = {{"id", id}, {"object", "chat.completion.chunk"},
                                 {"model", model_id}, {"choices", json::array({
                                     {{"index", 0}, {"delta", {{"tool_calls", tcs}}}, {"finish_reason", nullptr}}})}};
-                            ev += "data: " + tchunk.dump() + "\n\n";
+                            ev += "data: " + dumpj(tchunk) + "\n\n";
                             fr = "tool_calls";
                         }
                         json fin = {{"id", id}, {"object", "chat.completion.chunk"},
                             {"model", model_id}, {"timings", timings}, {"choices", json::array({
                                 {{"index", 0}, {"delta", json::object()}, {"finish_reason", fr}}})}};
-                        ev += "data: " + fin.dump() + "\n\ndata: [DONE]\n\n";
+                        ev += "data: " + dumpj(fin) + "\n\ndata: [DONE]\n\n";
                         sink.write(ev.data(), ev.size());
                         st->finished = true;
                         sink.done();
@@ -1027,10 +1045,27 @@ int main(int argc, char ** argv) {
                         if (st->generated == 0) st->t_first = clk::now();
                         std::string piece = tok->decode(t);
                         st->text += piece;
+                        // hold back a trailing incomplete UTF-8 sequence: with
+                        // byte-level BPE a multi-byte character can span tokens,
+                        // and each SSE chunk must be valid UTF-8 on its own
+                        piece = st->utf8_pend + piece;
+                        st->utf8_pend.clear();
+                        size_t keep = piece.size();
+                        for (size_t i = 0; i < 4 && i < piece.size(); ++i) {
+                            const unsigned char c = (unsigned char) piece[piece.size() - 1 - i];
+                            if ((c & 0x80) == 0) break;            // ASCII: complete
+                            if ((c & 0xC0) == 0xC0) {              // lead byte, i continuations after it
+                                const size_t need = (c & 0xF8) == 0xF0 ? 4 : (c & 0xF0) == 0xE0 ? 3 : 2;
+                                if (i + 1 < need) keep = piece.size() - 1 - i;   // incomplete
+                                break;
+                            }                                      // else continuation: scan back
+                        }
+                        if (keep < piece.size()) { st->utf8_pend = piece.substr(keep); piece.erase(keep); }
+                        if (piece.empty()) return true;            // nothing complete to send yet
                         json chunk = {{"id", id}, {"object", "chat.completion.chunk"},
                             {"model", model_id}, {"choices", json::array({
                                 {{"index", 0}, {"delta", {{"content", piece}}}, {"finish_reason", nullptr}}})}};
-                        std::string ev = "data: " + chunk.dump() + "\n\n";
+                        std::string ev = "data: " + dumpj(chunk) + "\n\n";
                         return sink.write(ev.data(), ev.size());
                     };
                     try {
@@ -1292,7 +1327,7 @@ int main(int argc, char ** argv) {
                          {"prefill_tps", prefill_ms > 0 ? (n_prompt_full - n_cached) * 1000.0 / prefill_ms : 0.0},
                          {"gen_tps", gen_ms > 0 ? generated * 1000.0 / gen_ms : 0.0}}}
         };
-        res.set_content(resp.dump(), "application/json");
+        res.set_content(dumpj(resp), "application/json");
     });
 
     // generous timeouts: a single token (esp. SSD/offload prefill) can take a while
