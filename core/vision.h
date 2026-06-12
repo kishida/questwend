@@ -32,6 +32,9 @@ public:
     // run the vision tower. Returns [n_image_tokens * n_embd] floats.
     std::vector<float> encode_image(const std::string & image_path);
 
+    // Same, from an in-memory encoded image (JPEG/PNG/... bytes).
+    std::vector<float> encode_bytes(const uint8_t * data, size_t size);
+
     // Same, from raw RGB8 pixels (h x w x 3, row-major).
     std::vector<float> encode_rgb(const uint8_t * rgb, int w, int h);
 

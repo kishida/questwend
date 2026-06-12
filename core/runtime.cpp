@@ -278,7 +278,7 @@ struct Runtime::Impl {
                                    ggml_tensor * ffn_in, ggml_tensor * slot_g,
                                    ggml_tensor * slot_u, ggml_tensor * slot_d,
                                    ggml_tensor * weights);
-    const std::vector<float> & decode_cached(int32_t token);
+    const std::vector<float> & decode_cached(int32_t token, const float * embd_override = nullptr);
     // Batched prefill over the cache: process up to a pool-sized chunk of tokens
     // in one segmented forward (instead of token-by-token).
     void decode_cached_batch(const int32_t * toks, int n_tokens, bool want_logits,
@@ -1846,7 +1846,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
 //   seg B: expert matmuls on cache slots + shared expert + residual
 // Correctness follows the *actual* routing; the cache only changes where the
 // expert weights are fetched from (VRAM hit vs CPU/SSD miss).
-const std::vector<float> & Runtime::Impl::decode_cached(int32_t token) {
+const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const float * embd_override) {
     const auto & hp = model.hparams();
     const int n_embd      = hp.n_embd;
     const int n_used      = hp.n_expert_used;
@@ -1878,7 +1878,10 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token) {
     };
 
     // ---- seg 0: token embedding -> p_h ----
-    {
+    if (embd_override) {
+        // vision: this position's embedding is a precomputed image embedding
+        ggml_backend_tensor_set(p_h, embd_override, 0, (size_t) n_embd * sizeof(float));
+    } else {
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
         ggml_tensor * inp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
@@ -2237,7 +2240,7 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
         // per-token, and the per-chunk union-of-experts fetch defeats the async
         // prefetch pipeline. The code path is retained for the MTP 2-token verify,
         // where the union is tiny and mostly already resident.
-        if (getenv("QWEN_BATCH")) {
+        if (getenv("QWEN_BATCH") && embd_ovr.empty()) {
             int chunk = ecache->min_slots() / (model.hparams().n_expert_used > 0 ? model.hparams().n_expert_used : 1);
             if (chunk < 1)   chunk = 1;
             if (chunk > 256) chunk = 256;
@@ -2250,7 +2253,15 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
             }
             return logits;
         }
-        for (int i = 0; i < n_tokens; ++i) decode_cached(tokens[i]);
+        // vision: per-token embedding override lookup for the image spans
+        auto override_for = [&](int i) -> const float * {
+            for (const auto & o : embd_ovr)
+                if (i >= o.first && i < o.first + o.count)
+                    return o.data + (size_t) (i - o.first) * model.hparams().n_embd;
+            return nullptr;
+        };
+        for (int i = 0; i < n_tokens; ++i) decode_cached(tokens[i], override_for(i));
+        embd_ovr.clear();
         return logits;
     }
 
@@ -2341,8 +2352,6 @@ const std::vector<float> & Runtime::decode(const std::vector<int32_t> & tokens) 
     return impl_->decode(tokens);
 }
 void Runtime::set_embd_overrides(std::vector<EmbdOverride> ovr) {
-    if (!ovr.empty() && (impl_->ecache && !impl_->sched))
-        throw std::runtime_error("images are not supported with --experts-ssd yet");
     impl_->embd_ovr = std::move(ovr);
 }
 const std::vector<float> & Runtime::mtp_draft(int32_t token) { return impl_->mtp_draft(token); }

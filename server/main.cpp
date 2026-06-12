@@ -8,12 +8,17 @@
 #include "runtime.h"
 #include "sampler.h"
 #include "chat.h"
+#include "vision.h"
+
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #include "httplib.h"
 #include "json.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -24,6 +29,91 @@ using namespace qwencpp;
 static std::string now_id(const char * prefix) {
     auto t = std::chrono::system_clock::now().time_since_epoch().count();
     return std::string(prefix) + std::to_string(t);
+}
+
+static std::vector<uint8_t> base64_decode(const std::string & in) {
+    static int8_t tbl[256];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < 256; ++i) tbl[i] = -1;
+        const char * cs = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; ++i) tbl[(uint8_t) cs[i]] = (int8_t) i;
+        init = true;
+    }
+    std::vector<uint8_t> out;
+    out.reserve(in.size() * 3 / 4);
+    int acc = 0, bits = 0;
+    for (char c : in) {
+        if (c == '=' || c == '\n' || c == '\r') continue;
+        const int8_t v = tbl[(uint8_t) c];
+        if (v < 0) continue;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((uint8_t) ((acc >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+// Parse Qwen3.6-format tool calls out of generated text:
+//   <tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>...\n</function>\n</tool_call>
+// Returns the text with the tool-call blocks removed; parsed calls go to `calls`
+// as (name, arguments-json-string). Reasoning (<think>...</think>) is skipped.
+struct ParsedToolCall { std::string name; std::string arguments; };
+static std::string parse_tool_calls(const std::string & text, std::vector<ParsedToolCall> & calls) {
+    size_t scan = 0;
+    const size_t think_end = text.rfind("</think>");
+    if (think_end != std::string::npos) scan = think_end + 8;
+
+    std::string out = text.substr(0, scan);
+    size_t pos = scan;
+    while (true) {
+        const size_t tc = text.find("<tool_call>", pos);
+        if (tc == std::string::npos) { out += text.substr(pos); break; }
+        const size_t tce = text.find("</tool_call>", tc);
+        if (tce == std::string::npos) { out += text.substr(pos); break; }
+        out += text.substr(pos, tc - pos);
+        const std::string block = text.substr(tc, tce - tc);
+
+        ParsedToolCall call;
+        const size_t fn = block.find("<function=");
+        if (fn != std::string::npos) {
+            const size_t fe = block.find('>', fn);
+            if (fe != std::string::npos) {
+                call.name = block.substr(fn + 10, fe - fn - 10);
+                json args = json::object();
+                size_t pp = fe;
+                while (true) {
+                    const size_t ps = block.find("<parameter=", pp);
+                    if (ps == std::string::npos) break;
+                    const size_t pe = block.find('>', ps);
+                    const size_t pc = block.find("</parameter>", ps);
+                    if (pe == std::string::npos || pc == std::string::npos) break;
+                    const std::string key = block.substr(ps + 11, pe - ps - 11);
+                    std::string val = block.substr(pe + 1, pc - pe - 1);
+                    // values are wrapped in newlines by the format
+                    if (!val.empty() && val.front() == '\n') val.erase(0, 1);
+                    if (!val.empty() && val.back() == '\n')  val.pop_back();
+                    // non-string JSON values were serialized as JSON; try to recover
+                    json jv;
+                    try {
+                        jv = json::parse(val);
+                        if (jv.is_string()) jv = val;   // quoted string stays raw
+                    } catch (...) { jv = val; }
+                    args[key] = jv;
+                    pp = pc + 12;
+                }
+                call.arguments = args.dump();
+                calls.push_back(std::move(call));
+            }
+        }
+        pos = tce + 12;
+    }
+    // trim trailing whitespace left by block removal
+    while (!out.empty() && (out.back() == '\n' || out.back() == ' ')) out.pop_back();
+    return out;
 }
 
 // Minimal self-contained chat UI (served at GET /). Talks to the server's own
@@ -65,7 +155,12 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
   .send { background:var(--accent); color:#fff; border:none; border-radius:10px; padding:10px 18px;
          font-size:15px; cursor:pointer; }
   .send:disabled { opacity:.5; cursor:default; }
+  .attach { background:var(--panel); color:var(--txt); border:1px solid var(--line); border-radius:10px;
+         padding:10px 12px; font-size:15px; cursor:pointer; }
   .hint { color:var(--muted); font-size:12px; text-align:center; margin-top:8px; }
+  #thumbs { max-width:780px; margin:0 auto 6px; padding:0 16px; display:flex; gap:8px; }
+  #thumbs img { height:56px; border-radius:8px; border:1px solid var(--line); cursor:pointer; }
+  .msg .body img { max-height:160px; border-radius:8px; display:block; margin:4px 0; }
 </style>
 </head>
 <body>
@@ -79,7 +174,10 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
 </header>
 <div id="chat"><div class="wrap" id="list"></div></div>
 <footer>
+  <div id="thumbs"></div>
   <div class="inrow">
+    <button class="attach" id="attach" title="attach image">&#128206;</button>
+    <input type="file" id="file" accept="image/*" multiple style="display:none">
     <textarea id="input" rows="1" placeholder="Message…  (Enter to send, Shift+Enter for newline)"></textarea>
     <button class="send" id="send">Send</button>
   </div>
@@ -96,13 +194,37 @@ fetch('/v1/models').then(r=>r.json()).then(j=>{
   document.getElementById('model').textContent = (j.data && j.data[0] && j.data[0].id) || '';
 }).catch(()=>{});
 
-function addMsg(role, text){
+function addMsg(role, text, imgs){
   const m = document.createElement('div'); m.className = 'msg ' + role;
   const who = document.createElement('div'); who.className = 'who'; who.textContent = role==='user'?'You':'AI';
-  const body = document.createElement('div'); body.className = 'body'; body.textContent = text;
+  const body = document.createElement('div'); body.className = 'body';
+  if(imgs) for(const u of imgs){ const im = document.createElement('img'); im.src = u; body.appendChild(im); }
+  if(text) body.appendChild(document.createTextNode(text));
   m.appendChild(who); m.appendChild(body); list.appendChild(m);
   document.getElementById('chat').scrollTop = 1e9;
   return body;
+}
+
+// pending image attachments (data URIs)
+let pendingImgs = [];
+const thumbs = document.getElementById('thumbs');
+const fileInput = document.getElementById('file');
+document.getElementById('attach').addEventListener('click', ()=> fileInput.click());
+fileInput.addEventListener('change', ()=>{
+  for(const f of fileInput.files){
+    const r = new FileReader();
+    r.onload = ()=>{ pendingImgs.push(r.result); renderThumbs(); };
+    r.readAsDataURL(f);
+  }
+  fileInput.value = '';
+});
+function renderThumbs(){
+  thumbs.innerHTML = '';
+  pendingImgs.forEach((u, i)=>{
+    const im = document.createElement('img'); im.src = u; im.title = 'click to remove';
+    im.addEventListener('click', ()=>{ pendingImgs.splice(i,1); renderThumbs(); });
+    thumbs.appendChild(im);
+  });
 }
 function autosize(){ input.style.height='auto'; input.style.height = Math.min(input.scrollHeight,200)+'px'; }
 input.addEventListener('input', autosize);
@@ -112,10 +234,16 @@ document.getElementById('clear').addEventListener('click', ()=>{ history=[]; lis
 
 async function send(){
   const text = input.value.trim();
-  if(!text || busy) return;
+  if((!text && !pendingImgs.length) || busy) return;
   busy = true; sendBtn.disabled = true;
-  history.push({role:'user', content:text});
-  addMsg('user', text);
+  let content = text;
+  if(pendingImgs.length){
+    content = pendingImgs.map(u=>({type:'image_url', image_url:{url:u}}));
+    if(text) content.push({type:'text', text});
+  }
+  history.push({role:'user', content});
+  addMsg('user', text, pendingImgs);
+  pendingImgs = []; renderThumbs();
   input.value=''; autosize();
   const body = addMsg('assistant', '');
   let acc = '';
@@ -201,6 +329,8 @@ int main(int argc, char ** argv) {
     bool use_mtp = false;
     bool embd_q8 = false;
     int  n_draft = 1;
+    std::string mmproj_path;
+    bool no_mmproj = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -215,6 +345,8 @@ int main(int argc, char ** argv) {
         else if (a == "--mtp")              use_mtp = true;
         else if (a == "--draft" && i + 1 < argc) n_draft = std::stoi(argv[++i]);
         else if (a == "--embd-q8")          embd_q8 = true;
+        else if (a == "--mmproj" && i + 1 < argc) mmproj_path = argv[++i];
+        else if (a == "--no-mmproj")        no_mmproj = true;
         else if (a == "--cpu")              force_cpu = true;
     }
     if (model_path.empty()) {
@@ -230,6 +362,8 @@ int main(int argc, char ** argv) {
             "  --mtp               MTP self-speculative decode (models with a nextn block)\n"
             "  --draft <N>         MTP draft length (default 1)\n"
             "  --embd-q8           use Q8_0 (not F16) for embedding fallback (saves ~45%% VRAM)\n"
+            "  --mmproj <gguf>     vision tower for image input (default: mmproj-*.gguf next to the model)\n"
+            "  --no-mmproj         disable image input even if an mmproj file is present\n"
             "  --cpu               force CPU backend\n", argv[0]);
         return 1;
     }
@@ -255,6 +389,46 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // ---- vision tower (image input): explicit --mmproj or auto-discovery ----
+    ggml_backend_t vis_backend = nullptr;
+    std::unique_ptr<VisionEncoder> venc;
+    std::mutex vis_mtx;   // the encoder graph is single-threaded
+    if (!no_mmproj) {
+        if (mmproj_path.empty()) {
+            std::string dir = model_path;
+            const size_t sl = dir.find_last_of("/\\");
+            dir = sl == std::string::npos ? "." : dir.substr(0, sl);
+            try {
+                for (const auto & e : std::filesystem::directory_iterator(dir)) {
+                    const std::string fn = e.path().filename().string();
+                    if (fn.rfind("mmproj", 0) == 0 && fn.size() > 5 &&
+                        fn.substr(fn.size() - 5) == ".gguf") {
+                        mmproj_path = e.path().string();
+                        break;
+                    }
+                }
+            } catch (...) {}
+        }
+        if (!mmproj_path.empty()) {
+            try {
+                if (!force_cpu)
+                    if (ggml_backend_dev_t d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))
+                        vis_backend = ggml_backend_dev_init(d, nullptr);
+                if (!vis_backend) vis_backend = ggml_backend_cpu_init();
+                venc = VisionEncoder::load(mmproj_path, vis_backend);
+                if (venc->n_embd() != (int) model->hparams().n_embd) {
+                    fprintf(stderr, "mmproj: projection dim mismatch, disabling image input\n");
+                    venc.reset();
+                } else {
+                    fprintf(stderr, "image input: ON (%s)\n", mmproj_path.c_str());
+                }
+            } catch (const std::exception & e) {
+                fprintf(stderr, "mmproj load failed (%s), image input disabled\n", e.what());
+                venc.reset();
+            }
+        }
+    }
+
     // MTP self-speculative decode is active only if requested AND the model has a
     // nextn block; otherwise fall back to plain decoding.
     const bool mtp = use_mtp && rt->has_mtp();
@@ -269,12 +443,61 @@ int main(int argc, char ** argv) {
 
     std::mutex infer_mtx;   // runtime is single-threaded + stateful
 
-    auto parse_messages = [](const json & body) {
+    // Parse OpenAI-style messages: plain string content, multimodal content
+    // arrays (text / image_url with base64 data URIs), assistant tool_calls,
+    // reasoning_content, and tool-role messages. Image bytes go to `images`.
+    auto parse_messages = [](const json & body, std::vector<std::vector<uint8_t>> & images) {
         std::vector<ChatMessage> msgs;
-        if (body.contains("messages")) {
-            for (auto & m : body["messages"]) {
-                msgs.push_back({ m.value("role", "user"), m.value("content", "") });
+        if (!body.contains("messages")) return msgs;
+        for (auto & m : body["messages"]) {
+            ChatMessage cm;
+            cm.role = m.value("role", "user");
+            const auto & c = m.contains("content") ? m["content"] : json();
+            if (c.is_string()) {
+                cm.content = c.get<std::string>();
+            } else if (c.is_array()) {
+                for (auto & item : c) {
+                    const std::string type = item.value("type", "");
+                    if (type == "text" || item.contains("text")) {
+                        cm.parts.push_back(ContentPart::make_text(item.value("text", "")));
+                    } else if (type == "image_url" || item.contains("image_url")) {
+                        std::string url = item.contains("image_url") && item["image_url"].is_object()
+                            ? item["image_url"].value("url", "")
+                            : item.value("image_url", "");
+                        const size_t comma = url.find(',');
+                        if (url.rfind("data:", 0) != 0 || comma == std::string::npos)
+                            throw std::runtime_error("image_url must be a base64 data URI");
+                        images.push_back(base64_decode(url.substr(comma + 1)));
+                        cm.parts.push_back(ContentPart::make_image((int) images.size() - 1));
+                    } else {
+                        throw std::runtime_error("unsupported content part type: " + type);
+                    }
+                }
             }
+            if (m.contains("reasoning_content") && m["reasoning_content"].is_string()) {
+                cm.reasoning_content = m["reasoning_content"].get<std::string>();
+                cm.has_reasoning = true;
+            }
+            if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
+                for (auto & tc : m["tool_calls"]) {
+                    const auto & fn = tc.contains("function") ? tc["function"] : tc;
+                    ToolCall call;
+                    call.name = fn.value("name", "");
+                    json args = json::object();
+                    if (fn.contains("arguments")) {
+                        if (fn["arguments"].is_string()) {
+                            try { args = json::parse(fn["arguments"].get<std::string>()); } catch (...) {}
+                        } else if (fn["arguments"].is_object()) {
+                            args = fn["arguments"];
+                        }
+                    }
+                    for (auto & kv : args.items())
+                        call.arguments.push_back({ kv.key(),
+                            kv.value().is_string() ? kv.value().get<std::string>() : kv.value().dump() });
+                    cm.tool_calls.push_back(std::move(call));
+                }
+            }
+            msgs.push_back(std::move(cm));
         }
         return msgs;
     };
@@ -316,7 +539,6 @@ int main(int argc, char ** argv) {
         try { body = json::parse(req.body); }
         catch (...) { res.status = 400; res.set_content(R"({"error":"invalid json"})", "application/json"); return; }
 
-        const auto messages   = parse_messages(body);
         const int  max_tokens = body.value("max_tokens", 512);
         const bool stream      = body.value("stream", false);
         const SamplerConfig sc = make_sampler(body);
@@ -326,7 +548,40 @@ int main(int argc, char ** argv) {
         bool reasoning = reasoning_default;
         if (body.contains("reasoning")) reasoning = body["reasoning"].get<bool>();
         else if (body.contains("enable_thinking")) reasoning = body["enable_thinking"].get<bool>();
-        auto prompt = build_chatml_tokens(*tok, messages, true, reasoning);
+
+        // ---- parse messages (text / images / tool calls) and build the prompt ----
+        std::vector<std::vector<uint8_t>> images;
+        std::vector<ChatMessage> messages;
+        ChatPromptOptions copts;
+        copts.reasoning = reasoning;
+        ChatPrompt cp;
+        auto vembs = std::make_shared<std::vector<std::vector<float>>>();
+        std::vector<Runtime::EmbdOverride> ovr;
+        try {
+            messages = parse_messages(body, images);
+            if (body.contains("tools") && body["tools"].is_array())
+                for (auto & t : body["tools"]) copts.tools_json.push_back(t.dump());
+            if (!images.empty()) {
+                if (!venc) throw std::runtime_error("image input not available (no mmproj loaded)");
+                copts.n_image_tokens = venc->n_image_tokens();
+                copts.add_vision_id  = images.size() > 1;
+            }
+            cp = build_qwen_prompt(*tok, messages, copts);
+            if (!images.empty()) {
+                std::lock_guard<std::mutex> vl(vis_mtx);
+                for (const auto & ib : images)
+                    vembs->push_back(venc->encode_bytes(ib.data(), ib.size()));
+            }
+            for (const auto & sp : cp.image_spans)
+                ovr.push_back({ sp.first, sp.count, (*vembs)[sp.image_index].data() });
+        } catch (const std::exception & e) {
+            res.status = 400;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+            return;
+        }
+        const auto & prompt = cp.ids;
+        // MTP prefill cannot inject image embeddings yet: plain decode for image requests
+        const bool req_mtp = mtp && ovr.empty();
 
         if (stream) {
             res.set_header("Content-Type", "text/event-stream");
@@ -338,6 +593,9 @@ int main(int argc, char ** argv) {
                 Sampler smp;
                 std::vector<int32_t> prompt;
                 std::vector<float> logits;
+                std::string text;   // accumulated output (for tool-call parsing)
+                std::shared_ptr<std::vector<std::vector<float>>> vembs;   // keep image embds alive
+                std::vector<Runtime::EmbdOverride> ovr;
                 int generated = 0, max_tokens = 0, prompt_tokens = 0;
                 bool started = false, finished = false;
                 clk::time_point t0, t_prefill, t_first;
@@ -347,9 +605,11 @@ int main(int argc, char ** argv) {
             st->prompt = prompt;
             st->max_tokens = max_tokens;
             st->prompt_tokens = (int) prompt.size();
+            st->vembs = vembs;
+            st->ovr   = std::move(ovr);
 
             res.set_chunked_content_provider("text/event-stream",
-                [&, st, id, mtp, n_draft](size_t, httplib::DataSink & sink) -> bool {
+                [&, st, id, req_mtp, n_draft](size_t, httplib::DataSink & sink) -> bool {
                     if (st->finished) return false;
                     auto finish = [&]() -> bool {
                         const auto t_end = clk::now();
@@ -365,10 +625,29 @@ int main(int argc, char ** argv) {
                             {"prefill_tps", prefill_ms > 0 ? st->prompt_tokens * 1000.0 / prefill_ms : 0.0},
                             {"gen_tps",     gen_ms     > 0 ? st->generated     * 1000.0 / gen_ms     : 0.0},
                         };
+                        // tool calls: parse the accumulated text; if any, emit them as a
+                        // final delta and finish with "tool_calls"
+                        std::vector<ParsedToolCall> calls;
+                        parse_tool_calls(st->text, calls);
+                        std::string ev;
+                        const char * fr = "stop";
+                        if (!calls.empty()) {
+                            json tcs = json::array();
+                            for (size_t k = 0; k < calls.size(); ++k)
+                                tcs.push_back({{"index", (int) k}, {"id", id + "-tc" + std::to_string(k)},
+                                               {"type", "function"},
+                                               {"function", {{"name", calls[k].name},
+                                                             {"arguments", calls[k].arguments}}}});
+                            json tchunk = {{"id", id}, {"object", "chat.completion.chunk"},
+                                {"model", model_id}, {"choices", json::array({
+                                    {{"index", 0}, {"delta", {{"tool_calls", tcs}}}, {"finish_reason", nullptr}}})}};
+                            ev += "data: " + tchunk.dump() + "\n\n";
+                            fr = "tool_calls";
+                        }
                         json fin = {{"id", id}, {"object", "chat.completion.chunk"},
                             {"model", model_id}, {"timings", timings}, {"choices", json::array({
-                                {{"index", 0}, {"delta", json::object()}, {"finish_reason", "stop"}}})}};
-                        std::string ev = "data: " + fin.dump() + "\n\ndata: [DONE]\n\n";
+                                {{"index", 0}, {"delta", json::object()}, {"finish_reason", fr}}})}};
+                        ev += "data: " + fin.dump() + "\n\ndata: [DONE]\n\n";
                         sink.write(ev.data(), ev.size());
                         st->finished = true;
                         sink.done();
@@ -377,7 +656,7 @@ int main(int argc, char ** argv) {
                     try {
                         // ---- MTP self-speculative decode: stream the whole run in one
                         // blocking provider call, emitting an SSE chunk per token ----
-                        if (mtp) {
+                        if (req_mtp) {
                             if (st->started) return false;
                             st->started = true;
                             st->t0 = clk::now();
@@ -388,6 +667,7 @@ int main(int argc, char ** argv) {
                                 if (is_stop(t) || rt->n_past() + 1 >= n_ctx) return false;
                                 if (first) { st->t_prefill = st->t_first = clk::now(); first = false; }
                                 std::string piece = tok->decode(t);
+                                st->text += piece;
                                 json chunk = {{"id", id}, {"object", "chat.completion.chunk"},
                                     {"model", model_id}, {"choices", json::array({
                                         {{"index", 0}, {"delta", {{"content", piece}}}, {"finish_reason", nullptr}}})}};
@@ -402,6 +682,7 @@ int main(int argc, char ** argv) {
                             st->started = true;
                             st->t0 = clk::now();
                             rt->reset();
+                            if (!st->ovr.empty()) rt->set_embd_overrides(st->ovr);   // vision
                             st->logits = rt->decode(st->prompt);
                             st->t_prefill = clk::now();
                             st->t_first   = st->t_prefill;   // overwritten on the first emitted token
@@ -412,6 +693,7 @@ int main(int argc, char ** argv) {
                             return finish();
                         if (st->generated == 0) st->t_first = clk::now();
                         std::string piece = tok->decode(next);
+                        st->text += piece;
                         json chunk = {{"id", id}, {"object", "chat.completion.chunk"},
                             {"model", model_id}, {"choices", json::array({
                                 {{"index", 0}, {"delta", {{"content", piece}}}, {"finish_reason", nullptr}}})}};
@@ -437,7 +719,7 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lk(infer_mtx);
             rt->reset();
             t0 = clk::now();
-            if (mtp) {
+            if (req_mtp) {
                 t_prefill = t0;
                 bool first = true;
                 rt->generate_mtp(prompt, max_tokens, n_draft, [&](int32_t t) -> bool {
@@ -449,6 +731,7 @@ int main(int argc, char ** argv) {
                 });
             } else {
                 Sampler smp(sc);
+                if (!ovr.empty()) rt->set_embd_overrides(ovr);   // vision
                 auto logits = rt->decode(prompt);
                 t_prefill = clk::now();
                 for (int t = 0; t < max_tokens; ++t) {
@@ -469,11 +752,24 @@ int main(int argc, char ** argv) {
         };
         const double prefill_ms = ms(t0, t_prefill);
         const double gen_ms     = ms(t_prefill, t_end);
+        // tool calls: parse the output; strip the blocks from content if any
+        std::vector<ParsedToolCall> calls;
+        const std::string content = parse_tool_calls(text, calls);
+        json msg = {{"role", "assistant"}};
+        msg["content"] = calls.empty() ? text : content;
+        if (!calls.empty()) {
+            json tcs = json::array();
+            for (size_t k = 0; k < calls.size(); ++k)
+                tcs.push_back({{"id", id + "-tc" + std::to_string(k)}, {"type", "function"},
+                               {"function", {{"name", calls[k].name},
+                                             {"arguments", calls[k].arguments}}}});
+            msg["tool_calls"] = tcs;
+        }
         json resp = {
             {"id", id}, {"object", "chat.completion"}, {"model", model_id},
             {"choices", json::array({
-                {{"index", 0}, {"message", {{"role", "assistant"}, {"content", text}}},
-                 {"finish_reason", "stop"}}})},
+                {{"index", 0}, {"message", msg},
+                 {"finish_reason", calls.empty() ? "stop" : "tool_calls"}}})},
             {"usage", {{"prompt_tokens", (int) prompt.size()},
                        {"completion_tokens", generated},
                        {"total_tokens", (int) prompt.size() + generated}}},
@@ -493,9 +789,9 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "qwencpp server: http://%s:%d  (chat UI at /, model: %s)\n",
             host.c_str(), port, model_id.c_str());
-    if (!srv.listen(host.c_str(), port)) {
-        fprintf(stderr, "failed to bind %s:%d\n", host.c_str(), port);
-        return 1;
-    }
-    return 0;
+    const bool ok = srv.listen(host.c_str(), port);
+    if (!ok) fprintf(stderr, "failed to bind %s:%d\n", host.c_str(), port);
+    venc.reset();
+    if (vis_backend) ggml_backend_free(vis_backend);
+    return ok ? 0 : 1;
 }

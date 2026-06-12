@@ -407,4 +407,19 @@ std::vector<float> VisionEncoder::encode_image(const std::string & image_path) {
     return out;
 }
 
+std::vector<float> VisionEncoder::encode_bytes(const uint8_t * data, size_t size) {
+    int w_px = 0, h_px = 0, comp = 0;
+    uint8_t * rgb = stbi_load_from_memory(data, (int) size, &w_px, &h_px, &comp, 3);
+    if (!rgb) throw std::runtime_error("vision: failed to decode image data");
+    std::vector<float> out;
+    try {
+        out = encode_rgb(rgb, w_px, h_px);
+    } catch (...) {
+        stbi_image_free(rgb);
+        throw;
+    }
+    stbi_image_free(rgb);
+    return out;
+}
+
 } // namespace qwencpp
