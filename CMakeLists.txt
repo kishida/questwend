@@ -10,16 +10,16 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ---- options ----
-option(QWENCPP_CUDA  "Enable CUDA backend"  OFF)
-option(QWENCPP_METAL "Enable Metal backend" OFF)
+option(QW_CUDA  "Enable CUDA backend"  OFF)
+option(QW_METAL "Enable Metal backend" OFF)
 
-if(QWENCPP_CUDA)
+if(QW_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
     # ggml defaults CUDA graphs OFF for standalone builds ("llama.cpp only");
     # enable them to eliminate per-kernel launch overhead during decode.
     set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
 endif()
-if(QWENCPP_METAL)
+if(QW_METAL)
     set(GGML_METAL ON CACHE BOOL "" FORCE)
 endif()
 
@@ -42,18 +42,18 @@ target_include_directories(questwend_core PRIVATE third_party/stb)
 target_link_libraries(questwend_core PUBLIC ggml)
 
 # ---- CLI ----
-add_executable(infer cli/main.cpp)
-target_link_libraries(infer PRIVATE questwend_core)
+add_executable(qw-cli cli/main.cpp)
+target_link_libraries(qw-cli PRIVATE questwend_core)
 
 # ---- Server (OpenAI-compatible) ----
-add_executable(infer-server server/main.cpp third_party/cpp-httplib/httplib.cpp)
-target_include_directories(infer-server PRIVATE
+add_executable(qw-server server/main.cpp third_party/cpp-httplib/httplib.cpp)
+target_include_directories(qw-server PRIVATE
     third_party/cpp-httplib
     third_party/nlohmann
 )
-target_link_libraries(infer-server PRIVATE questwend_core)
+target_link_libraries(qw-server PRIVATE questwend_core)
 find_package(Threads REQUIRED)
-target_link_libraries(infer-server PRIVATE Threads::Threads)
+target_link_libraries(qw-server PRIVATE Threads::Threads)
 if(WIN32)
-    target_link_libraries(infer-server PRIVATE ws2_32)
+    target_link_libraries(qw-server PRIVATE ws2_32)
 endif()

@@ -26,7 +26,7 @@ ggmlを`add_subdirectory()`で取り込むと、**CUDA Graphがコンパイル�
 
 ```cmake
 # CMakeLists.txt
-if(QWENCPP_CUDA)
+if(QW_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
     set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)  # ← 必須
 endif()
@@ -290,7 +290,7 @@ if (prof) {
 }
 ```
 
-使用方法: `QWEN_PROF=1 ./infer -m model.gguf -p "..." -n 10`
+使用方法: `QWEN_PROF=1 ./qw-cli -m model.gguf -p "..." -n 10`
 
 ---
 

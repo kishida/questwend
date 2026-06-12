@@ -4,7 +4,7 @@
 **M4 Pro 48GB** で `--experts-ssd` により実行する。
 
 ```bash
-infer -m Qwen3.5-122B-A10B-UD-Q3_K_M-00001-of-00003.gguf \
+qw-cli -m Qwen3.5-122B-A10B-UD-Q3_K_M-00001-of-00003.gguf \
   -p "..." -n 100 --vram-budget 36000 --experts-ssd \
   --cache-profile q122b.prof --log-tokens-per-sec
 ```
@@ -59,7 +59,7 @@ infer -m Qwen3.5-122B-A10B-UD-Q3_K_M-00001-of-00003.gguf \
 - **`--cache-profile` は CLI では実行のたびに上書き保存される**。
   アクセスパターンの異なる実行（MTP、別タスク）を挟むとプロファイルが汚れて
   ヒット率が落ちる。ベスト状態のファイルをコピーして固定するのを推奨
-  （`infer-server` は読み込みのみで上書きしない）。
+  （`qw-server` は読み込みのみで上書きしない）。
 - `--vram-budget` は recommendedMaxWorkingSetSize（48GB機で ~38.6GB）から
   非エキスパート重み（~7GB）+ KV + 計算バッファを引いた範囲に収める。
   超えると確保毎に WARN が出る（ログフィルタで1回に集約される）。
@@ -74,7 +74,7 @@ infer -m Qwen3.5-122B-A10B-UD-Q3_K_M-00001-of-00003.gguf \
 [README](../README.md) の環境変数一覧を参照。このチューニングで主に使ったもの:
 
 ```bash
-QWEN_PROF_DC=1   infer ...   # decode_cached の wall / GPU / host 分解（exit時に表示）
-QWEN_PROF_MTP=1  infer ...   # MTP の per-cycle フェーズ分解（draft/verify/settle/resync）
-QWEN_GGML_DEBUG=1 infer ...  # ggml の生ログ（確保毎の DEBUG 等）を全部表示
+QWEN_PROF_DC=1   qw-cli ...   # decode_cached の wall / GPU / host 分解（exit時に表示）
+QWEN_PROF_MTP=1  qw-cli ...   # MTP の per-cycle フェーズ分解（draft/verify/settle/resync）
+QWEN_GGML_DEBUG=1 qw-cli ...  # ggml の生ログ（確保毎の DEBUG 等）を全部表示
 ```
