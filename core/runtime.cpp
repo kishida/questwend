@@ -279,7 +279,8 @@ struct Runtime::Impl {
     void decode_verify(const std::vector<int32_t> & toks);        // T-token forward -> vL/vH
     void decode_verify_cached(const std::vector<int32_t> & toks); // offload variant (decode_cached_batch)
     void generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
-                      const std::function<bool(int32_t)> & on_token);
+                      const std::function<bool(int32_t)> & on_token,
+                      int32_t * out_pending = nullptr);
 
     // ---- Phase B v2 dynamic-cache decode (single token) ----
     void init_cache();
@@ -1398,7 +1399,8 @@ void Runtime::Impl::decode_verify(const std::vector<int32_t> & toks) {
 // verifies them with one (n_draft+1)-token main forward, and accepts the longest
 // matching prefix. n_draft=1 reduces exactly to the 2-token verify.
 void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
-                                 const std::function<bool(int32_t)> & on_token) {
+                                 const std::function<bool(int32_t)> & on_token,
+                                 int32_t * out_pending) {
     const auto & hp = model.hparams();
     const bool gdn = hp.has_gdn;
     const int  K   = n_draft < 1 ? 1 : n_draft;
@@ -1478,7 +1480,7 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
     long steps = 0, draft_forwards = 0, accepted_drafts = 0;
 
     while (generated < max_new) {
-        if (!on_token(x)) break;
+        if (!on_token(x)) { if (out_pending) *out_pending = x; break; }
         if (++generated >= max_new) break;
 
         const int p   = n_past;            // x lands at main position p
@@ -1551,7 +1553,12 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
         // token, budget) leaves the state consistent with kv_toks for reuse
         bool stop = false;
         for (int j = 0; j < a; ++j) {
-            if (!on_token(drafts[j])) { stop = true; break; }
+            if (!on_token(drafts[j])) {
+                // drafts[j..a-1] are confirmed in kv_toks but were never
+                // delivered; x_new is the next undecoded token after them
+                if (out_pending) *out_pending = x_new;
+                stop = true; break;
+            }
             if (++generated >= max_new) { stop = true; break; }
         }
         if (stop) break;
@@ -2539,8 +2546,9 @@ void Runtime::set_embd_overrides(std::vector<EmbdOverride> ovr) {
 const std::vector<float> & Runtime::mtp_draft(int32_t token) { return impl_->mtp_draft(token); }
 bool Runtime::has_mtp() const { return impl_->model.hparams().has_mtp(); }
 void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
-                           const std::function<bool(int32_t)> & on_token) {
-    impl_->generate_mtp(prompt, max_new, n_draft, on_token);
+                           const std::function<bool(int32_t)> & on_token,
+                           int32_t * out_pending) {
+    impl_->generate_mtp(prompt, max_new, n_draft, on_token, out_pending);
 }
 void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->kv_toks.clear(); impl_->zero_states(); }
 int  Runtime::n_past() const { return impl_->n_past; }

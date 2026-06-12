@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -26,6 +27,32 @@
 
 using json = nlohmann::json;
 using namespace qwencpp;
+
+// FIFO mutex with a waiter count: lets a generating request detect that
+// someone is queued (time-slice handoff) and guarantees the waiter actually
+// gets the runtime when the holder yields (std::mutex makes no such promise).
+struct TicketLock {
+    std::mutex m;
+    std::condition_variable cv;
+    uint64_t next = 0, serving = 0;
+    int waiting = 0;
+    void lock() {
+        std::unique_lock<std::mutex> lk(m);
+        const uint64_t t = next++;
+        ++waiting;
+        cv.wait(lk, [&] { return serving == t; });
+        --waiting;
+    }
+    void unlock() {
+        std::lock_guard<std::mutex> lk(m);
+        ++serving;
+        cv.notify_all();
+    }
+    bool contended() {
+        std::lock_guard<std::mutex> lk(m);
+        return waiting > 0;
+    }
+};
 
 static std::string now_id(const char * prefix) {
     auto t = std::chrono::system_clock::now().time_since_epoch().count();
@@ -336,6 +363,7 @@ int main(int argc, char ** argv) {
     bool no_mmproj = false;
     int  cache_slots = 0;
     std::string cache_slots_dir;
+    int  time_slice = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -354,6 +382,7 @@ int main(int argc, char ** argv) {
         else if (a == "--no-mmproj")        no_mmproj = true;
         else if (a == "--cache-slots" && i + 1 < argc) cache_slots = std::stoi(argv[++i]);
         else if (a == "--cache-slots-dir" && i + 1 < argc) cache_slots_dir = argv[++i];
+        else if (a == "--time-slice" && i + 1 < argc) time_slice = std::stoi(argv[++i]);
         else if (a == "--cpu")              force_cpu = true;
     }
     if (!cache_slots_dir.empty() && cache_slots <= 0) cache_slots = 4;   // dir implies slots
@@ -374,6 +403,7 @@ int main(int argc, char ** argv) {
             "  --no-mmproj         disable image input even if an mmproj file is present\n"
             "  --cache-slots <N>   extra prompt-cache slots for interleaved conversations (default 0)\n"
             "  --cache-slots-dir <dir>  store the slots on disk instead of RAM (persists across restarts)\n"
+            "  --time-slice <N>    interleave concurrent streaming requests every N tokens (default 0 = serialize)\n"
             "  --cpu               force CPU backend\n", argv[0]);
         return 1;
     }
@@ -494,7 +524,12 @@ int main(int argc, char ** argv) {
     const int32_t im_end = tok->token_to_id("<|im_end|>");
     auto is_stop = [&](int32_t t){ return t == eos || (im_end >= 0 && t == im_end); };
 
-    std::mutex infer_mtx;   // runtime is single-threaded + stateful
+    TicketLock tlock;          // runtime is single-threaded + stateful (FIFO queue)
+    uint64_t live_owner = 0;   // request id owning the live state (0 = none); guarded by tlock
+    std::atomic<uint64_t> sid_gen{1};
+    if (time_slice > 0 && cache_slots <= 0)
+        fprintf(stderr, "warning: --time-slice without --cache-slots: a preempted request"
+                        " re-prefills its whole context on resume\n");
 
     // ---- single-slot prompt prefix cache (guarded by infer_mtx) ----
     // The runtime keeps the KV cache / GDN state of the previous request. If
@@ -681,7 +716,7 @@ int main(int argc, char ** argv) {
 
     auto prepare_prompt = [&](std::vector<int32_t> & prompt,
                               std::vector<Runtime::EmbdOverride> & ovr,
-                              std::vector<ImgSpan> spans) -> int {
+                              std::vector<ImgSpan> spans, uint64_t owner) -> int {
         int n = match_cov(rt->kv_tokens(), *kv_imgs, prompt, spans, "live");
         const char * src = "live";
         if (n < 0 && !slots.empty()) {
@@ -704,7 +739,39 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "prefix cache: reusing %d tokens (%s), prefilling %zu\n", n, src, prompt.size());
         }
         *kv_imgs = std::move(spans);
+        live_owner = owner;
         return n;
+    };
+
+    // re-attach a time-sliced request to the runtime after a pause: continue
+    // if the live state is still ours, else restore our parked slot, else
+    // (slot got evicted) rebuild the exact state by re-prefilling our token
+    // snapshot. Returns false only when the state is unrecoverable (images:
+    // the embedding overrides are gone, a re-prefill would be wrong).
+    auto ensure_state = [&](uint64_t owner, const std::vector<int32_t> & my_toks,
+                            const std::vector<ImgSpan> & my_imgs,
+                            bool had_images, bool & need_reprefill) -> bool {
+        need_reprefill = false;
+        if (live_owner == owner) return true;
+        int s = -1;
+        for (int i = 0; i < (int) slots.size(); ++i)
+            if (!slots[i].toks.empty() && slots[i].toks == my_toks) { s = i; break; }
+        if (s >= 0) {
+            save_live(s);
+            if (load_slot(s)) {
+                live_origin = s;
+                live_owner  = owner;
+                return true;
+            }
+        }
+        if (had_images) return false;          // overrides gone: cannot rebuild
+        save_live(-1);
+        rt->reset();
+        live_origin = -1;
+        live_owner  = owner;
+        *kv_imgs    = my_imgs;
+        need_reprefill = true;                 // caller re-decodes my_toks
+        return true;
     };
 
     // Parse OpenAI-style messages: plain string content, multimodal content
@@ -870,21 +937,36 @@ int main(int argc, char ** argv) {
 
             using clk = std::chrono::steady_clock;
             struct State {
-                std::unique_lock<std::mutex> lock;
                 Sampler smp;
+                TicketLock * tl = nullptr;
+                bool holding = false;             // we own the runtime lock
                 std::vector<int32_t> prompt;
                 std::vector<float> logits;
                 std::string text;   // accumulated output (for tool-call parsing)
                 std::shared_ptr<std::vector<std::vector<float>>> vembs;   // keep image embds alive
                 std::vector<Runtime::EmbdOverride> ovr;
                 std::vector<ImgSpan> spans;       // image spans for the prefix cache
+                uint64_t sid = 0;                 // request id (live-state ownership)
+                bool had_images = false;
+                int slice_used = 0;               // tokens emitted in the current slice
+                std::vector<int32_t> my_toks;     // kv snapshot at pause (resume key)
+                std::vector<ImgSpan> my_imgs;
+                size_t resp_base = 0;             // kv index where the response starts (MTP)
+                size_t n_sent = 0;                // response tokens delivered (MTP)
+                int32_t pending = -1;             // next undecoded token after a pause (MTP)
+                bool pending_valid = false;
+                bool resume_full = false;         // slot lost: re-prefill my_toks (MTP)
+                bool paused = false, done = false;
                 int n_cached = 0;                 // prompt tokens reused from the cache
                 int generated = 0, max_tokens = 0, prompt_tokens = 0;
                 bool started = false, finished = false;
                 clk::time_point t0, t_prefill, t_first;
-                State(std::mutex & m, const SamplerConfig & sc) : lock(m), smp(sc) {}
+                State(const SamplerConfig & sc) : smp(sc) {}
+                ~State() { if (holding && tl) tl->unlock(); }   // client disconnect mid-slice
             };
-            auto st = std::make_shared<State>(infer_mtx, sc);
+            auto st = std::make_shared<State>(sc);
+            st->tl = &tlock;
+            st->sid = sid_gen.fetch_add(1);
             st->prompt = prompt;
             st->max_tokens = max_tokens;
             st->prompt_tokens = (int) prompt.size();
@@ -896,6 +978,7 @@ int main(int argc, char ** argv) {
                 [&, st, id, req_mtp, n_draft](size_t, httplib::DataSink & sink) -> bool {
                     if (st->finished) return false;
                     auto finish = [&]() -> bool {
+                        if (st->holding) { tlock.unlock(); st->holding = false; }
                         const auto t_end = clk::now();
                         auto ms = [](clk::time_point a, clk::time_point b) {
                             return std::chrono::duration<double, std::milli>(b - a).count();
@@ -939,59 +1022,138 @@ int main(int argc, char ** argv) {
                         sink.done();
                         return false;
                     };
-                    try {
-                        // ---- MTP self-speculative decode: stream the whole run in one
-                        // blocking provider call, emitting an SSE chunk per token ----
-                        if (req_mtp) {
-                            if (st->started) return false;
-                            st->started = true;
-                            st->t0 = clk::now();
-                            st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans));
-                            if (!st->ovr.empty()) rt->set_embd_overrides(st->ovr);   // vision
-                            st->t_prefill = st->t_first = st->t0;   // defaults if 0 tokens
-                            bool first = true;
-                            rt->generate_mtp(st->prompt, st->max_tokens, n_draft, [&](int32_t t) -> bool {
-                                if (is_stop(t) || rt->n_past() + 1 >= n_ctx) return false;
-                                if (first) { st->t_prefill = st->t_first = clk::now(); first = false; }
-                                std::string piece = tok->decode(t);
-                                st->text += piece;
-                                json chunk = {{"id", id}, {"object", "chat.completion.chunk"},
-                                    {"model", model_id}, {"choices", json::array({
-                                        {{"index", 0}, {"delta", {{"content", piece}}}, {"finish_reason", nullptr}}})}};
-                                std::string ev = "data: " + chunk.dump() + "\n\n";
-                                if (!sink.write(ev.data(), ev.size())) return false;  // client gone
-                                st->generated++;
-                                return st->generated < st->max_tokens;
-                            });
-                            return finish();
-                        }
-                        if (!st->started) {
-                            st->started = true;
-                            st->t0 = clk::now();
-                            st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans));
-                            if (!st->ovr.empty()) rt->set_embd_overrides(st->ovr);   // vision
-                            st->logits = rt->decode(st->prompt);
-                            st->t_prefill = clk::now();
-                            st->t_first   = st->t_prefill;   // overwritten on the first emitted token
-                        }
-                        int next = st->smp.sample(st->logits);
-                        // stop on EOS, token budget, or context limit (avoids overflow crash)
-                        if (is_stop(next) || st->generated >= st->max_tokens || rt->n_past() + 1 >= n_ctx)
-                            return finish();
+                    auto emit_piece = [&](int32_t t) -> bool {   // SSE chunk for one token
                         if (st->generated == 0) st->t_first = clk::now();
-                        std::string piece = tok->decode(next);
+                        std::string piece = tok->decode(t);
                         st->text += piece;
                         json chunk = {{"id", id}, {"object", "chat.completion.chunk"},
                             {"model", model_id}, {"choices", json::array({
                                 {{"index", 0}, {"delta", {{"content", piece}}}, {"finish_reason", nullptr}}})}};
                         std::string ev = "data: " + chunk.dump() + "\n\n";
-                        if (!sink.write(ev.data(), ev.size())) { st->finished = true; return false; }  // client gone
+                        return sink.write(ev.data(), ev.size());
+                    };
+                    try {
+                        const bool was_holding = st->holding;
+                        if (!st->holding) { tlock.lock(); st->holding = true; }
+                        if (!was_holding) st->slice_used = 0;   // fresh slice on (re)acquisition
+
+                        // ---- MTP self-speculative decode: one time slice per provider
+                        // call (the whole run when --time-slice is off / uncontended) ----
+                        if (req_mtp) {
+                            std::vector<int32_t> rp;             // tokens to feed generate_mtp
+                            if (!st->started) {
+                                st->started = true;
+                                st->t0 = clk::now();
+                                st->had_images = !st->ovr.empty();
+                                st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid);
+                                st->my_imgs = *kv_imgs;
+                                if (!st->ovr.empty()) rt->set_embd_overrides(st->ovr);   // vision
+                                st->resp_base = rt->kv_tokens().size() + st->prompt.size();
+                                st->t_prefill = st->t_first = st->t0;   // defaults if 0 tokens
+                                rp = st->prompt;
+                            } else {
+                                bool reprefill = false;
+                                if (!ensure_state(st->sid, st->my_toks, st->my_imgs, st->had_images, reprefill)) {
+                                    fprintf(stderr, "time-slice: state lost (image request), truncating stream\n");
+                                    return finish();
+                                }
+                                st->resume_full = reprefill;
+                                if (st->resume_full) rp = st->my_toks;   // rebuild the whole context
+                            }
+
+                            // deliver confirmed tokens a mid-cycle pause left unsent, then
+                            // the pending (undecoded) one; they precede anything new
+                            const std::vector<int32_t> & src =
+                                st->resume_full ? st->my_toks : rt->kv_tokens();
+                            for (size_t i = st->resp_base + st->n_sent; i < src.size(); ++i) {
+                                const int32_t t = src[i];
+                                if (is_stop(t)) return finish();
+                                if (!emit_piece(t)) return finish();    // client gone
+                                ++st->n_sent; ++st->slice_used;
+                                if (++st->generated >= st->max_tokens) return finish();
+                            }
+                            if (st->pending_valid) {
+                                const int32_t t = st->pending;
+                                st->pending_valid = false;
+                                if (is_stop(t) || rt->n_past() + 1 >= n_ctx) return finish();
+                                if (!emit_piece(t)) return finish();
+                                ++st->n_sent; ++st->slice_used;
+                                if (++st->generated >= st->max_tokens) return finish();
+                                rp.push_back(t);                        // decode it as the tail
+                            } else if (st->started && rp.empty()) {
+                                return finish();                        // nothing to resume from
+                            }
+
+                            bool first = !was_holding && st->generated == 0;
+                            int32_t pending = -1;
+                            st->paused = st->done = false;
+                            rt->generate_mtp(rp, st->max_tokens - st->generated, n_draft,
+                                             [&](int32_t t) -> bool {
+                                if (is_stop(t) || rt->n_past() + 1 >= n_ctx) { st->done = true; return false; }
+                                if (time_slice > 0 && st->slice_used >= time_slice) {
+                                    if (tlock.contended()) { st->paused = true; return false; }
+                                    st->slice_used = 0;     // nobody waiting: fresh slice
+                                }
+                                if (first) { st->t_prefill = st->t_first = clk::now(); first = false; }
+                                if (!emit_piece(t)) { st->done = true; return false; }   // client gone
+                                ++st->slice_used; ++st->n_sent;
+                                st->generated++;
+                                return st->generated < st->max_tokens;
+                            }, &pending);
+
+                            if (st->paused && !st->done) {              // yield the runtime
+                                st->pending = pending;
+                                st->pending_valid = true;
+                                st->my_toks = rt->kv_tokens();
+                                st->my_imgs = *kv_imgs;
+                                if (getenv("QWEN_CACHE_DEBUG"))
+                                    fprintf(stderr, "time-slice: yield at %d tokens (sid=%llu)\n",
+                                            st->generated, (unsigned long long) st->sid);
+                                tlock.unlock(); st->holding = false;
+                                return true;                            // resumed on the next call
+                            }
+                            return finish();
+                        }
+
+                        // ---- plain decode: one token per provider call ----
+                        if (!st->started) {
+                            st->started = true;
+                            st->t0 = clk::now();
+                            st->had_images = !st->ovr.empty();
+                            st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid);
+                            st->my_imgs = *kv_imgs;
+                            if (!st->ovr.empty()) rt->set_embd_overrides(st->ovr);   // vision
+                            st->logits = rt->decode(st->prompt);
+                            st->t_prefill = clk::now();
+                            st->t_first   = st->t_prefill;   // overwritten on the first emitted token
+                        } else if (!was_holding) {
+                            // resumed after yielding the runtime at a slice boundary
+                            bool reprefill = false;
+                            if (!ensure_state(st->sid, st->my_toks, st->my_imgs, st->had_images, reprefill)) {
+                                fprintf(stderr, "time-slice: state lost (image request), truncating stream\n");
+                                return finish();
+                            }
+                            if (reprefill) st->logits = rt->decode(st->my_toks);
+                        }
+                        int next = st->smp.sample(st->logits);
+                        // stop on EOS, token budget, or context limit (avoids overflow crash)
+                        if (is_stop(next) || st->generated >= st->max_tokens || rt->n_past() + 1 >= n_ctx)
+                            return finish();
+                        if (!emit_piece(next)) { st->finished = true; tlock.unlock(); st->holding = false; return false; }
                         st->generated++;
                         st->logits = rt->decode({ next });
+                        if (time_slice > 0 && ++st->slice_used >= time_slice && tlock.contended()) {
+                            st->my_toks = rt->kv_tokens();   // yield the runtime
+                            st->my_imgs = *kv_imgs;
+                            if (getenv("QWEN_CACHE_DEBUG"))
+                                fprintf(stderr, "time-slice: yield at %d tokens (sid=%llu)\n",
+                                        st->generated, (unsigned long long) st->sid);
+                            tlock.unlock(); st->holding = false;
+                        }
                         return true;
                     } catch (const std::exception & e) {
                         fprintf(stderr, "stream error: %s\n", e.what());
-                        rt->reset();   // state unknown: invalidate the prefix cache
+                        if (st->holding) { rt->reset(); live_owner = 0; }   // state unknown
                         return finish();
                     }
                 });
@@ -1004,8 +1166,12 @@ int main(int argc, char ** argv) {
         using clk = std::chrono::steady_clock;
         clk::time_point t0, t_prefill = {}, t_end = {};
         try {
-            std::lock_guard<std::mutex> lk(infer_mtx);
-            n_cached = prepare_prompt(prompt, ovr, std::move(spans));
+            struct Guard {
+                TicketLock & t;
+                Guard(TicketLock & t_) : t(t_) { t.lock(); }
+                ~Guard() { t.unlock(); }
+            } lk(tlock);
+            n_cached = prepare_prompt(prompt, ovr, std::move(spans), 0);
             t0 = clk::now();
             if (req_mtp) {
                 t_prefill = t0;

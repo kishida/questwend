@@ -50,9 +50,17 @@ public:
     bool has_mtp() const;
 
     // MTP self-speculative greedy decode. Calls on_token for each accepted token
-    // (return false to stop, e.g. on EOS). Reset KV first. has_mtp() must be true.
+    // (return false to stop, e.g. on EOS). has_mtp() must be true. Continues
+    // from the current state when n_past > 0 (prompt = the new tail tokens).
+    // When generation stops because on_token returned false, *out_pending (if
+    // given) receives the next confirmed token that was NOT decoded yet; pass
+    // it as the prompt of a follow-up call to resume seamlessly. Confirmed
+    // tokens that were never offered to on_token can additionally sit at the
+    // tail of kv_tokens() (a mid-cycle stop); the caller is responsible for
+    // delivering those before resuming.
     void generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
-                      const std::function<bool(int32_t)> & on_token);
+                      const std::function<bool(int32_t)> & on_token,
+                      int32_t * out_pending = nullptr);
 
     void reset();                 // clear KV cache / position
     int  n_past() const;
