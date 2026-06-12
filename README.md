@@ -157,6 +157,7 @@ infer-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15000
 | `--cpu` | CPU バックエンドを強制 |
 
 > 画像は OpenAI 形式（`content` 配列の `image_url` に base64 data URI）で受け付け。ブラウザ UI にも 📎 ボタンあり。MTP 有効時もそのまま画像入力可。
+> mmproj をロードすると vision tower の GPU 使用分（重み + 計算バッファ; 起動時にログ表示）が `--vram-budget` から自動で差し引かれる。Metal の作業セット上限いっぱいに budget を張っていても OOM しない。テキストのみで使うときは `--no-mmproj` でその分を expert キャッシュに戻せる。
 > tool calling は `tools` を渡すと `<tool_call>` 出力を OpenAI の `tool_calls` に変換して返す（`finish_reason: "tool_calls"`）。`role:"tool"` の応答メッセージにも対応。
 
 > MTP はモデルロード時に nextn ブロックを VRAM 常駐させるため、リクエスト単位ではなく**サーバー起動フラグ**で指定します。ストリーミング/非ストリーミングの両方に対応。

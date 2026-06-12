@@ -371,9 +371,62 @@ int main(int argc, char ** argv) {
     std::unique_ptr<Model> model;
     std::unique_ptr<Tokenizer> tok;
     std::unique_ptr<Runtime> rt;
+    ggml_backend_t vis_backend = nullptr;
+    std::unique_ptr<VisionEncoder> venc;
+    std::mutex vis_mtx;   // the encoder graph is single-threaded
     try {
         model = Model::load(model_path);
         tok   = std::make_unique<Tokenizer>(model->vocab());
+
+        // ---- vision tower (image input): explicit --mmproj or auto-discovery ----
+        // Loaded BEFORE the runtime so its GPU footprint can be subtracted from
+        // the expert-cache budget: a maxed-out --vram-budget sized for text-only
+        // would otherwise exceed the backend memory limit once the tower is
+        // added on top (Metal: kIOGPUCommandBufferCallbackErrorOutOfMemory).
+        if (!no_mmproj) {
+            if (mmproj_path.empty()) {
+                std::string dir = model_path;
+                const size_t sl = dir.find_last_of("/\\");
+                dir = sl == std::string::npos ? "." : dir.substr(0, sl);
+                try {
+                    for (const auto & e : std::filesystem::directory_iterator(dir)) {
+                        const std::string fn = e.path().filename().string();
+                        if (fn.rfind("mmproj", 0) == 0 && fn.size() > 5 &&
+                            fn.substr(fn.size() - 5) == ".gguf") {
+                            mmproj_path = e.path().string();
+                            break;
+                        }
+                    }
+                } catch (...) {}
+            }
+            if (!mmproj_path.empty()) {
+                try {
+                    if (!force_cpu)
+                        if (ggml_backend_dev_t d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))
+                            vis_backend = ggml_backend_dev_init(d, nullptr);
+                    if (!vis_backend) vis_backend = ggml_backend_cpu_init();
+                    venc = VisionEncoder::load(mmproj_path, vis_backend);
+                    if (venc->n_embd() != (int) model->hparams().n_embd) {
+                        fprintf(stderr, "mmproj: projection dim mismatch, disabling image input\n");
+                        venc.reset();
+                    } else {
+                        fprintf(stderr, "image input: ON (%s)\n", mmproj_path.c_str());
+                    }
+                } catch (const std::exception & e) {
+                    fprintf(stderr, "mmproj load failed (%s), image input disabled\n", e.what());
+                    venc.reset();
+                }
+            }
+            if (venc && vram_budget_mb > 0) {
+                const size_t vmb = (venc->gpu_bytes() + 1024 * 1024 - 1) / (1024 * 1024);
+                const size_t cut = std::min(vram_budget_mb, vmb);
+                fprintf(stderr, "vision tower: %zu MB GPU; expert cache budget %zu -> %zu MB"
+                                " (--no-mmproj reclaims it for text-only runs)\n",
+                        vmb, vram_budget_mb, vram_budget_mb - cut);
+                vram_budget_mb -= cut;
+            }
+        }
+
         RuntimeConfig cfg;
         cfg.n_ctx              = n_ctx;
         cfg.use_cuda           = !force_cpu;
@@ -387,46 +440,6 @@ int main(int argc, char ** argv) {
     } catch (const std::exception & e) {
         fprintf(stderr, "load error: %s\n", e.what());
         return 1;
-    }
-
-    // ---- vision tower (image input): explicit --mmproj or auto-discovery ----
-    ggml_backend_t vis_backend = nullptr;
-    std::unique_ptr<VisionEncoder> venc;
-    std::mutex vis_mtx;   // the encoder graph is single-threaded
-    if (!no_mmproj) {
-        if (mmproj_path.empty()) {
-            std::string dir = model_path;
-            const size_t sl = dir.find_last_of("/\\");
-            dir = sl == std::string::npos ? "." : dir.substr(0, sl);
-            try {
-                for (const auto & e : std::filesystem::directory_iterator(dir)) {
-                    const std::string fn = e.path().filename().string();
-                    if (fn.rfind("mmproj", 0) == 0 && fn.size() > 5 &&
-                        fn.substr(fn.size() - 5) == ".gguf") {
-                        mmproj_path = e.path().string();
-                        break;
-                    }
-                }
-            } catch (...) {}
-        }
-        if (!mmproj_path.empty()) {
-            try {
-                if (!force_cpu)
-                    if (ggml_backend_dev_t d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))
-                        vis_backend = ggml_backend_dev_init(d, nullptr);
-                if (!vis_backend) vis_backend = ggml_backend_cpu_init();
-                venc = VisionEncoder::load(mmproj_path, vis_backend);
-                if (venc->n_embd() != (int) model->hparams().n_embd) {
-                    fprintf(stderr, "mmproj: projection dim mismatch, disabling image input\n");
-                    venc.reset();
-                } else {
-                    fprintf(stderr, "image input: ON (%s)\n", mmproj_path.c_str());
-                }
-            } catch (const std::exception & e) {
-                fprintf(stderr, "mmproj load failed (%s), image input disabled\n", e.what());
-                venc.reset();
-            }
-        }
     }
 
     // MTP self-speculative decode is active only if requested AND the model has a

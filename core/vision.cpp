@@ -350,6 +350,12 @@ VisionEncoder::VisionEncoder() : impl_(new Impl()) {}
 VisionEncoder::~VisionEncoder() = default;
 int VisionEncoder::n_image_tokens() const { return impl_->n_tokens; }
 int VisionEncoder::n_embd() const         { return impl_->proj_dim; }
+size_t VisionEncoder::gpu_bytes() const {
+    size_t n = 0;
+    if (impl_->wbuf)   n += ggml_backend_buffer_get_size(impl_->wbuf);
+    if (impl_->galloc) n += ggml_gallocr_get_buffer_size(impl_->galloc, 0);
+    return n;
+}
 
 std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string & path,
                                                    ggml_backend_t backend) {

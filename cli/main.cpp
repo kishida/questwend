@@ -135,19 +135,11 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s", model->summary().c_str());
 
         Tokenizer tok(model->vocab());
-        RuntimeConfig cfg;
-        cfg.n_ctx          = n_ctx;
-        cfg.use_cuda       = !force_cpu;
-        cfg.vram_budget_mb = vram_budget_mb;
-        cfg.cache_profile  = cache_profile;
-        cfg.experts_ssd    = experts_ssd;
-        // MTP needs the nextn block kept VRAM-resident (also the dev MTP test mode).
-        cfg.use_mtp        = use_mtp || getenv("QWEN_MTP_TEST");
-        cfg.embd_q8        = embd_q8;
-        Runtime rt(*model, cfg);
-        Sampler smp(sc);
 
         // ---- vision: load the mmproj tower and encode the images up front ----
+        // Done BEFORE the runtime so the tower's GPU footprint can be subtracted
+        // from the expert-cache budget (a maxed-out --vram-budget sized for
+        // text-only would otherwise exceed the backend memory limit).
         ggml_backend_t vis_backend = nullptr;
         std::unique_ptr<VisionEncoder> venc;
         std::vector<std::vector<float>> vembs;
@@ -185,7 +177,26 @@ int main(int argc, char ** argv) {
                             std::chrono::steady_clock::now() - t0).count());
             }
             chat = true;   // images imply chat formatting
+            if (vram_budget_mb > 0) {
+                const size_t vmb = (venc->gpu_bytes() + 1024 * 1024 - 1) / (1024 * 1024);
+                const size_t cut = std::min(vram_budget_mb, vmb);
+                fprintf(stderr, "vision tower: %zu MB GPU; expert cache budget %zu -> %zu MB\n",
+                        vmb, vram_budget_mb, vram_budget_mb - cut);
+                vram_budget_mb -= cut;
+            }
         }
+
+        RuntimeConfig cfg;
+        cfg.n_ctx          = n_ctx;
+        cfg.use_cuda       = !force_cpu;
+        cfg.vram_budget_mb = vram_budget_mb;
+        cfg.cache_profile  = cache_profile;
+        cfg.experts_ssd    = experts_ssd;
+        // MTP needs the nextn block kept VRAM-resident (also the dev MTP test mode).
+        cfg.use_mtp        = use_mtp || getenv("QWEN_MTP_TEST");
+        cfg.embd_q8        = embd_q8;
+        Runtime rt(*model, cfg);
+        Sampler smp(sc);
 
         // GDN equivalence check: multi-token prefill vs token-by-token must give
         // the same final-token logits (build_graph multi-token GDN == single step).

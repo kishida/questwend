@@ -28,6 +28,11 @@ public:
     int n_image_tokens() const;   // tokens per image after spatial merge (e.g. 576)
     int n_embd() const;           // output embedding dim (= LLM n_embd)
 
+    // Total backend memory held by the tower (weights + persistent compute
+    // buffer). Callers running a maxed-out --vram-budget should subtract this
+    // from the budget before sizing the expert cache.
+    size_t gpu_bytes() const;
+
     // Decode (JPEG/PNG/...), resize to the trained resolution, normalize, and
     // run the vision tower. Returns [n_image_tokens * n_embd] floats.
     std::vector<float> encode_image(const std::string & image_path);
