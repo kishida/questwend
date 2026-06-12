@@ -281,6 +281,7 @@ struct Runtime::Impl {
     void generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                       const std::function<bool(int32_t)> & on_token,
                       int32_t * out_pending = nullptr);
+    void prefill(const std::vector<int32_t> & toks, bool mtp_kv);
 
     // ---- Phase B v2 dynamic-cache decode (single token) ----
     void init_cache();
@@ -1398,6 +1399,66 @@ void Runtime::Impl::decode_verify(const std::vector<int32_t> & toks) {
 // single nextn block (each draft feeds the block's own hidden into the next),
 // verifies them with one (n_draft+1)-token main forward, and accepts the longest
 // matching prefix. n_draft=1 reduces exactly to the 2-token verify.
+// Advance the main KV (and, when mtp_kv, the nextn KV + mtp_hidden) over
+// `toks` without sampling: one chunk of a (possibly preemptible) prefill.
+// Consumes embd_ovr (indices relative to `toks`). Leaves the last token's
+// logits in `logits`; with mtp_kv the invariants mtp_past == n_past - 1 and
+// mtp_hidden == h(last) hold afterwards, so generation or another chunk can
+// follow seamlessly.
+void Runtime::Impl::prefill(const std::vector<int32_t> & toks, bool mtp_kv) {
+    const int P = (int) toks.size();
+    if (P == 0) return;
+    if (!mtp_kv) { decode(toks); return; }
+
+    const int n_embd = model.hparams().n_embd;
+    static const bool no_batch_prefill = getenv("QWEN_MTP_NO_BATCH_PREFILL") != nullptr;
+
+    // continuation from earlier tokens (cached prefix or a previous chunk):
+    // mtp_hidden holds the last token's hidden; pair it with the first new
+    // token so the nextn KV chain stays gapless.
+    if (n_past > 0) {
+        std::vector<Runtime::EmbdOverride> bovr;
+        for (const auto & o : embd_ovr)
+            if (o.first == 0) bovr.push_back({ 0, 1, o.data });
+        if (!bovr.empty()) mtp_prefill_batch(&toks[0], mtp_hidden.data(), 1, bovr);
+        else               mtp_resync(toks[0]);
+    }
+
+    if (P > 1 && (!no_batch_prefill || !embd_ovr.empty())) {
+        const std::vector<Runtime::EmbdOverride> povr = embd_ovr;   // decode() consumes the member
+        bh_all.clear();
+        want_bh_all = true;
+        decode(toks);                      // chunking + embd overrides handled inside
+        want_bh_all = false;
+        // MTP KV for positions 0..P-2: token i+1 paired with hidden h_i
+        const int MCHUNK = 512;            // bounds the [n_kv, T] mask allocation
+        int i = 0;
+        while (i < P - 1) {
+            const int t = std::min(MCHUNK, P - 1 - i);
+            // image spans clipped to this chunk, shifted to the nextn token
+            // array (its token j is toks[i+1+j])
+            std::vector<Runtime::EmbdOverride> ovr;
+            for (const auto & o : povr) {
+                const int lo = std::max(o.first, i + 1);
+                const int hi = std::min(o.first + o.count, i + 1 + t);
+                if (lo < hi) ovr.push_back({ lo - (i + 1), hi - lo,
+                                             o.data + (size_t) (lo - o.first) * n_embd });
+            }
+            mtp_prefill_batch(&toks[i + 1], bh_all.data() + (size_t) i * n_embd, t, ovr);
+            i += t;
+        }
+        mtp_hidden.assign(bh_all.begin() + (size_t) (P - 1) * n_embd,
+                          bh_all.begin() + (size_t) P * n_embd);
+        bh_all.clear();
+        bh_all.shrink_to_fit();
+    } else {
+        for (int i = 0; i < P; ++i) {
+            decode({ toks[i] });
+            if (i + 1 < P) mtp_resync(toks[i + 1]);   // KV only, no head
+        }
+    }
+}
+
 void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                                  const std::function<bool(int32_t)> & on_token,
                                  int32_t * out_pending) {
@@ -1421,58 +1482,11 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
 
     // prefill: one batched main forward captures every token's hidden (bh_all),
     // then batched headless nextn forwards build the MTP KV (so drafts have
-    // history). Token-by-token fallback via QWEN_MTP_NO_BATCH_PREFILL (image
-    // embedding overrides require the batched path).
-    std::vector<float> mlog;
+    // history). See Impl::prefill. The runtime may already hold a cached
+    // prefix (n_past > 0); prefill bridges the nextn KV across the boundary.
     const int P = (int) prompt.size();
-    const int n_embd = hp.n_embd;
-    static const bool no_batch_prefill = getenv("QWEN_MTP_NO_BATCH_PREFILL") != nullptr;
-
-    // continuation from a cached prefix (n_past > 0): the main KV / GDN state
-    // and the MTP KV already cover the previous tokens, and mtp_hidden holds
-    // the last cached token's hidden. Pair it with the first new token so the
-    // nextn KV chain stays gapless across requests.
-    if (n_past > 0 && P > 0) {
-        std::vector<Runtime::EmbdOverride> bovr;
-        for (const auto & o : embd_ovr)
-            if (o.first == 0) bovr.push_back({ 0, 1, o.data });
-        if (!bovr.empty()) mtp_prefill_batch(&prompt[0], mtp_hidden.data(), 1, bovr);
-        else               mtp_resync(prompt[0]);
-    }
-
-    if (P > 1 && (!no_batch_prefill || !embd_ovr.empty())) {
-        const std::vector<Runtime::EmbdOverride> povr = embd_ovr;   // decode() consumes the member
-        bh_all.clear();
-        want_bh_all = true;
-        mlog = decode(prompt);             // chunking + embd overrides handled inside
-        want_bh_all = false;
-        // MTP KV for prompt positions 0..P-2: token i+1 paired with hidden h_i
-        const int MCHUNK = 512;            // bounds the [n_kv, T] mask allocation
-        int i = 0;
-        while (i < P - 1) {
-            const int t = std::min(MCHUNK, P - 1 - i);
-            // image spans clipped to this chunk, shifted to the nextn token
-            // array (its token j is prompt[i+1+j])
-            std::vector<Runtime::EmbdOverride> ovr;
-            for (const auto & o : povr) {
-                const int lo = std::max(o.first, i + 1);
-                const int hi = std::min(o.first + o.count, i + 1 + t);
-                if (lo < hi) ovr.push_back({ lo - (i + 1), hi - lo,
-                                             o.data + (size_t) (lo - o.first) * n_embd });
-            }
-            mtp_prefill_batch(&prompt[i + 1], bh_all.data() + (size_t) i * n_embd, t, ovr);
-            i += t;
-        }
-        mtp_hidden.assign(bh_all.begin() + (size_t) (P - 1) * n_embd,
-                          bh_all.begin() + (size_t) P * n_embd);
-        bh_all.clear();
-        bh_all.shrink_to_fit();
-    } else {
-        for (int i = 0; i < P; ++i) {
-            mlog = decode({ prompt[i] });
-            if (i + 1 < P) mtp_resync(prompt[i + 1]);   // KV only, no head
-        }
-    }
+    if (P > 0) prefill(prompt, /*mtp_kv=*/true);
+    std::vector<float> mlog = logits;    // logits of the last prefilled token
     kv_toks.insert(kv_toks.end(), prompt.begin(), prompt.end());
     int32_t x = argmax(mlog);            // first generated token
     // invariant at loop top: n_past = pos(x), mtp_past = pos(x)-1, mtp_hidden = h_{pos(x)-1}
@@ -2549,6 +2563,10 @@ void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int
                            const std::function<bool(int32_t)> & on_token,
                            int32_t * out_pending) {
     impl_->generate_mtp(prompt, max_new, n_draft, on_token, out_pending);
+}
+void Runtime::prefill(const std::vector<int32_t> & tokens, bool mtp_kv) {
+    impl_->prefill(tokens, mtp_kv);
+    impl_->kv_toks.insert(impl_->kv_toks.end(), tokens.begin(), tokens.end());
 }
 void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->kv_toks.clear(); impl_->zero_states(); }
 int  Runtime::n_past() const { return impl_->n_past; }

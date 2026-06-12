@@ -955,7 +955,8 @@ int main(int argc, char ** argv) {
                 size_t n_sent = 0;                // response tokens delivered (MTP)
                 int32_t pending = -1;             // next undecoded token after a pause (MTP)
                 bool pending_valid = false;
-                bool resume_full = false;         // slot lost: re-prefill my_toks (MTP)
+                size_t pf_pos = 0;                // prompt tokens prefilled so far
+                bool pf_done = false;
                 bool paused = false, done = false;
                 int n_cached = 0;                 // prompt tokens reused from the cache
                 int generated = 0, max_tokens = 0, prompt_tokens = 0;
@@ -1037,34 +1038,71 @@ int main(int argc, char ** argv) {
                         if (!st->holding) { tlock.lock(); st->holding = true; }
                         if (!was_holding) st->slice_used = 0;   // fresh slice on (re)acquisition
 
+                        // clip the image-embedding overrides to a prompt chunk
+                        // [pos, pos+n), shifting indices to be chunk-relative
+                        const int ne = (int) model->hparams().n_embd;
+                        auto chunk_ovr = [&](size_t pos, size_t n) {
+                            std::vector<Runtime::EmbdOverride> covr;
+                            for (const auto & o : st->ovr) {
+                                const int lo = std::max(o.first, (int) pos);
+                                const int hi = std::min(o.first + o.count, (int) (pos + n));
+                                if (lo < hi) covr.push_back({ lo - (int) pos, hi - lo,
+                                                              o.data + (size_t) (lo - o.first) * ne });
+                            }
+                            return covr;
+                        };
+                        // prefill slice unit: token slices would be too fine (batch
+                        // efficiency), so prefill yields at a coarser granularity
+                        const size_t pf_chunk = time_slice > 0
+                            ? (size_t) std::max(time_slice, 256) : (size_t) 1 << 30;
+
                         // ---- MTP self-speculative decode: one time slice per provider
                         // call (the whole run when --time-slice is off / uncontended) ----
                         if (req_mtp) {
-                            std::vector<int32_t> rp;             // tokens to feed generate_mtp
                             if (!st->started) {
                                 st->started = true;
                                 st->t0 = clk::now();
                                 st->had_images = !st->ovr.empty();
                                 st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid);
                                 st->my_imgs = *kv_imgs;
-                                if (!st->ovr.empty()) rt->set_embd_overrides(st->ovr);   // vision
                                 st->resp_base = rt->kv_tokens().size() + st->prompt.size();
                                 st->t_prefill = st->t_first = st->t0;   // defaults if 0 tokens
-                                rp = st->prompt;
-                            } else {
+                            } else if (!was_holding) {
                                 bool reprefill = false;
                                 if (!ensure_state(st->sid, st->my_toks, st->my_imgs, st->had_images, reprefill)) {
                                     fprintf(stderr, "time-slice: state lost (image request), truncating stream\n");
                                     return finish();
                                 }
-                                st->resume_full = reprefill;
-                                if (st->resume_full) rp = st->my_toks;   // rebuild the whole context
+                                if (reprefill) rt->prefill(st->my_toks, true);   // exact rebuild incl nextn KV
+                            }
+
+                            // ---- preemptible prefill: all but the last chunk; the
+                            // final chunk goes through generate_mtp below ----
+                            while (st->prompt.size() - st->pf_pos > pf_chunk) {
+                                rt->set_embd_overrides(chunk_ovr(st->pf_pos, pf_chunk));
+                                rt->prefill(std::vector<int32_t>(st->prompt.begin() + st->pf_pos,
+                                                                 st->prompt.begin() + st->pf_pos + pf_chunk), true);
+                                st->pf_pos += pf_chunk;
+                                if (tlock.contended()) {                 // yield mid-prefill
+                                    st->my_toks = rt->kv_tokens();
+                                    st->my_imgs = *kv_imgs;
+                                    if (getenv("QWEN_CACHE_DEBUG"))
+                                        fprintf(stderr, "time-slice: prefill yield at %zu/%zu (sid=%llu)\n",
+                                                st->pf_pos, st->prompt.size(), (unsigned long long) st->sid);
+                                    tlock.unlock(); st->holding = false;
+                                    return true;
+                                }
+                            }
+                            std::vector<int32_t> rp;             // tokens to feed generate_mtp
+                            if (st->pf_pos < st->prompt.size()) {
+                                rp.assign(st->prompt.begin() + st->pf_pos, st->prompt.end());
+                                rt->set_embd_overrides(chunk_ovr(st->pf_pos, rp.size()));
+                                st->pf_pos = st->prompt.size();
                             }
 
                             // deliver confirmed tokens a mid-cycle pause left unsent, then
                             // the pending (undecoded) one; they precede anything new
-                            const std::vector<int32_t> & src =
-                                st->resume_full ? st->my_toks : rt->kv_tokens();
+                            const std::vector<int32_t> & src = rt->kv_tokens();
                             for (size_t i = st->resp_base + st->n_sent; i < src.size(); ++i) {
                                 const int32_t t = src[i];
                                 if (is_stop(t)) return finish();
@@ -1122,10 +1160,6 @@ int main(int argc, char ** argv) {
                             st->had_images = !st->ovr.empty();
                             st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid);
                             st->my_imgs = *kv_imgs;
-                            if (!st->ovr.empty()) rt->set_embd_overrides(st->ovr);   // vision
-                            st->logits = rt->decode(st->prompt);
-                            st->t_prefill = clk::now();
-                            st->t_first   = st->t_prefill;   // overwritten on the first emitted token
                         } else if (!was_holding) {
                             // resumed after yielding the runtime at a slice boundary
                             bool reprefill = false;
@@ -1134,6 +1168,28 @@ int main(int argc, char ** argv) {
                                 return finish();
                             }
                             if (reprefill) st->logits = rt->decode(st->my_toks);
+                        }
+                        // preemptible prefill: the last chunk's logits feed sampling
+                        while (st->pf_pos < st->prompt.size()) {
+                            const size_t n = std::min(pf_chunk, st->prompt.size() - st->pf_pos);
+                            rt->set_embd_overrides(chunk_ovr(st->pf_pos, n));
+                            st->logits = rt->decode(std::vector<int32_t>(st->prompt.begin() + st->pf_pos,
+                                                                         st->prompt.begin() + st->pf_pos + n));
+                            st->pf_pos += n;
+                            if (st->pf_pos < st->prompt.size() && tlock.contended()) {
+                                st->my_toks = rt->kv_tokens();           // yield mid-prefill
+                                st->my_imgs = *kv_imgs;
+                                if (getenv("QWEN_CACHE_DEBUG"))
+                                    fprintf(stderr, "time-slice: prefill yield at %zu/%zu (sid=%llu)\n",
+                                            st->pf_pos, st->prompt.size(), (unsigned long long) st->sid);
+                                tlock.unlock(); st->holding = false;
+                                return true;
+                            }
+                        }
+                        if (!st->pf_done) {
+                            st->pf_done = true;
+                            st->t_prefill = clk::now();
+                            st->t_first   = st->t_prefill;   // overwritten on the first emitted token
                         }
                         int next = st->smp.sample(st->logits);
                         // stop on EOS, token budget, or context limit (avoids overflow crash)

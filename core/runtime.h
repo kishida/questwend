@@ -49,6 +49,12 @@ public:
     const std::vector<float> & mtp_draft(int32_t token);
     bool has_mtp() const;
 
+    // Advance the KV cache (and, when mtp_kv, the nextn KV + draft context)
+    // over `tokens` without sampling: one chunk of a preemptible prefill.
+    // Embedding overrides apply with indices relative to `tokens`. Finish
+    // with decode() / generate_mtp() on the remaining tail.
+    void prefill(const std::vector<int32_t> & tokens, bool mtp_kv = false);
+
     // MTP self-speculative greedy decode. Calls on_token for each accepted token
     // (return false to stop, e.g. on EOS). has_mtp() must be true. Continues
     // from the current state when n_past > 0 (prompt = the new tail tokens).
