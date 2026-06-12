@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -333,6 +334,8 @@ int main(int argc, char ** argv) {
     int  n_draft = 1;
     std::string mmproj_path;
     bool no_mmproj = false;
+    int  cache_slots = 0;
+    std::string cache_slots_dir;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -349,8 +352,11 @@ int main(int argc, char ** argv) {
         else if (a == "--embd-q8")          embd_q8 = true;
         else if (a == "--mmproj" && i + 1 < argc) mmproj_path = argv[++i];
         else if (a == "--no-mmproj")        no_mmproj = true;
+        else if (a == "--cache-slots" && i + 1 < argc) cache_slots = std::stoi(argv[++i]);
+        else if (a == "--cache-slots-dir" && i + 1 < argc) cache_slots_dir = argv[++i];
         else if (a == "--cpu")              force_cpu = true;
     }
+    if (!cache_slots_dir.empty() && cache_slots <= 0) cache_slots = 4;   // dir implies slots
     if (model_path.empty()) {
         fprintf(stderr,
             "usage: %s -m <model.gguf> [options]\n"
@@ -366,6 +372,8 @@ int main(int argc, char ** argv) {
             "  --embd-q8           use Q8_0 (not F16) for embedding fallback (saves ~45%% VRAM)\n"
             "  --mmproj <gguf>     vision tower for image input (default: mmproj-*.gguf next to the model)\n"
             "  --no-mmproj         disable image input even if an mmproj file is present\n"
+            "  --cache-slots <N>   extra prompt-cache slots for interleaved conversations (default 0)\n"
+            "  --cache-slots-dir <dir>  store the slots on disk instead of RAM (persists across restarts)\n"
             "  --cpu               force CPU backend\n", argv[0]);
         return 1;
     }
@@ -495,22 +503,22 @@ int main(int argc, char ** argv) {
     // reused prefix must hold the same image as last time (byte hash); a span
     // straddling the reuse boundary forces a full reset.
     struct ImgSpan { int first; int count; uint64_t hash; };
-    auto kv_imgs = std::make_shared<std::vector<ImgSpan>>();
-    auto prepare_prompt = [&rt, &tok, kv_imgs](std::vector<int32_t> & prompt,
-                                               std::vector<Runtime::EmbdOverride> & ovr,
-                                               std::vector<ImgSpan> spans) -> int {
-        const auto & kv = rt->kv_tokens();
+    auto kv_imgs = std::make_shared<std::vector<ImgSpan>>();   // image spans behind the live state
+
+    // Longest-coverage match of `prompt` against a cached token list. Returns
+    // the prompt index n (> 0) whose prefix [0, n) covers ALL cached tokens,
+    // or -1. Token ids can diverge while the text is identical (the model may
+    // emit a non-canonical BPE split, e.g. " "+" " where re-tokenization gives
+    // "  "), so a token-id mismatch falls back to text-level alignment with
+    // the seam on a prompt-token boundary.
+    auto match_cov = [&tok](const std::vector<int32_t> & kv, const std::vector<ImgSpan> & kimgs,
+                            const std::vector<int32_t> & prompt, const std::vector<ImgSpan> & spans,
+                            const char * dbg_tag) -> int {
+        if (kv.empty() || prompt.empty()) return -1;
         size_t n = 0;
-        if (!prompt.empty()) {
-            const size_t lim = std::min(kv.size(), prompt.size() - 1);   // keep >= 1 tail token
-            while (n < lim && kv[n] == prompt[n]) ++n;
-        }
-        // Token ids can diverge while the text is identical (the model may emit
-        // a non-canonical BPE split, e.g. " "+" " where re-tokenization gives
-        // "  "). Fall back to text-level alignment: if the rest of the cached
-        // tokens decodes to exactly the text of the next prompt tokens, reuse
-        // the whole cache and place the seam on a prompt-token boundary.
-        bool covered = !kv.empty() && n == kv.size();   // prompt[0..n) holds ALL cached tokens
+        const size_t lim = std::min(kv.size(), prompt.size() - 1);   // keep >= 1 tail token
+        while (n < lim && kv[n] == prompt[n]) ++n;
+        bool covered = n == kv.size();
         if (n > 0 && !covered) {
             std::string skv, sp;
             for (size_t i = n; i < kv.size(); ++i) skv += tok->decode(kv[i]);
@@ -518,37 +526,185 @@ int main(int argc, char ** argv) {
             while (j < prompt.size() - 1 && sp.size() < skv.size()) sp += tok->decode(prompt[j++]);
             if (sp == skv) { n = j; covered = true; }   // prompt[0..j) covers all of kv
         }
-        bool ok = covered;                      // GDN state cannot rewind: full reuse only
-        if (!ok && !kv.empty() && getenv("QWEN_CACHE_DEBUG")) {
-            const std::string a = n < kv.size()     ? tok->decode(kv[n])     : "<end>";
-            const std::string b = n < prompt.size() ? tok->decode(prompt[n]) : "<end>";
-            fprintf(stderr, "prefix cache miss: matched %zu of kv=%zu prompt=%zu (kv[%zu]=%d '%s' prompt[%zu]=%d '%s')\n",
-                    n, kv.size(), prompt.size(),
-                    n, n < kv.size() ? kv[n] : -1, a.c_str(),
-                    n, n < prompt.size() ? prompt[n] : -1, b.c_str());
+        if (!covered || n == 0) {
+            if (dbg_tag && getenv("QWEN_CACHE_DEBUG"))
+                fprintf(stderr, "prefix cache [%s]: matched %zu of kv=%zu prompt=%zu (kv=%d '%s' prompt=%d '%s')\n",
+                        dbg_tag, n, kv.size(), prompt.size(),
+                        n < kv.size() ? kv[n] : -1,
+                        (n < kv.size() ? tok->decode(kv[n]) : "<end>").c_str(),
+                        n < prompt.size() ? prompt[n] : -1,
+                        (n < prompt.size() ? tok->decode(prompt[n]) : "<end>").c_str());
+            return -1;
         }
-        if (ok) for (const auto & s : spans)    // image span straddling the boundary
-            if (s.first < (int) n && s.first + s.count > (int) n) { ok = false; break; }
-        if (ok) {                               // images inside the prefix must be unchanged
-            std::vector<const ImgSpan *> in;
-            for (const auto & s : spans) if (s.first + s.count <= (int) n) in.push_back(&s);
-            ok = in.size() == kv_imgs->size();
-            for (size_t i = 0; ok && i < in.size(); ++i) {
-                const auto & p = (*kv_imgs)[i];
-                ok = in[i]->first == p.first && in[i]->count == p.count && in[i]->hash == p.hash;
+        for (const auto & s : spans)            // image span straddling the boundary
+            if (s.first < (int) n && s.first + s.count > (int) n) return -1;
+        std::vector<const ImgSpan *> in;        // images inside the prefix must be unchanged
+        for (const auto & s : spans) if (s.first + s.count <= (int) n) in.push_back(&s);
+        if (in.size() != kimgs.size()) return -1;
+        for (size_t i = 0; i < in.size(); ++i)
+            if (in[i]->first != kimgs[i].first || in[i]->count != kimgs[i].count ||
+                in[i]->hash != kimgs[i].hash) return -1;
+        return (int) n;
+    };
+
+    // ---- snapshot slots (RAM or SSD): park evicted states for later reuse ----
+    struct Slot {
+        std::vector<int32_t> toks;     // tokens of the saved state (match key)
+        std::vector<ImgSpan> imgs;
+        uint64_t stamp = 0;            // LRU
+        std::vector<uint8_t> blob;     // RAM mode
+        std::string path;              // SSD mode (file with meta header + state)
+    };
+    std::vector<Slot> slots((size_t) std::max(0, cache_slots));
+    uint64_t slot_clock = 0;
+    int live_origin = -1;              // slot the live state was loaded from / saved to
+    const bool slots_ssd = !cache_slots_dir.empty();
+    static const uint32_t SLOT_MAGIC = 0x314C5351;   // "QSL1"
+
+    if (slots_ssd && !slots.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(cache_slots_dir, ec);
+        // restore slot metadata from a previous run (state blobs stay on disk
+        // and are validated by the runtime header when actually loaded)
+        for (size_t i = 0; i < slots.size(); ++i) {
+            slots[i].path = cache_slots_dir + "/slot-" + std::to_string(i) + ".bin";
+            FILE * f = fopen(slots[i].path.c_str(), "rb");
+            if (!f) continue;
+            uint32_t magic = 0, n_toks = 0, n_imgs = 0;
+            bool ok = fread(&magic, 4, 1, f) == 1 && magic == SLOT_MAGIC &&
+                      fread(&n_toks, 4, 1, f) == 1 && fread(&n_imgs, 4, 1, f) == 1 &&
+                      n_toks < 10u * 1024 * 1024 && n_imgs < 4096;
+            if (ok) {
+                slots[i].toks.resize(n_toks);
+                slots[i].imgs.resize(n_imgs);
+                ok = (n_toks == 0 || fread(slots[i].toks.data(), sizeof(int32_t), n_toks, f) == n_toks) &&
+                     (n_imgs == 0 || fread(slots[i].imgs.data(), sizeof(ImgSpan), n_imgs, f) == n_imgs);
             }
+            fclose(f);
+            if (!ok) { slots[i].toks.clear(); slots[i].imgs.clear(); continue; }
+            slots[i].stamp = ++slot_clock;
         }
-        if (!ok) { rt->reset(); n = 0; }
+        size_t restored = 0;
+        for (const auto & s : slots) restored += !s.toks.empty();
+        if (restored) fprintf(stderr, "prefix cache: restored %zu slot(s) from %s\n",
+                              restored, cache_slots_dir.c_str());
+    }
+
+    // park the live state into a slot (its origin slot, or the LRU one, never
+    // `avoid`). No-op if the live state is empty or unchanged since loading.
+    auto save_live = [&](int avoid) {
+        const auto & lt = rt->kv_tokens();
+        if (lt.empty() || slots.empty()) return;
+        int s = live_origin;
+        if (s < 0 || s == avoid) {
+            s = -1;
+            uint64_t oldest = UINT64_MAX;
+            for (int i = 0; i < (int) slots.size(); ++i) {
+                if (i == avoid) continue;
+                if (slots[i].toks.empty()) { s = i; break; }
+                if (slots[i].stamp < oldest) { oldest = slots[i].stamp; s = i; }
+            }
+            if (s < 0) return;
+        }
+        if (live_origin == s && slots[s].toks.size() == lt.size()) {
+            slots[s].stamp = ++slot_clock;     // unchanged since load
+            return;
+        }
+        Slot & sl = slots[s];
+        sl.toks = lt;
+        sl.imgs = *kv_imgs;
+        sl.stamp = ++slot_clock;
+        if (slots_ssd) {
+            FILE * f = fopen(sl.path.c_str(), "wb");
+            bool ok = f != nullptr;
+            if (ok) {
+                const uint32_t n_toks = (uint32_t) sl.toks.size(), n_imgs = (uint32_t) sl.imgs.size();
+                ok = fwrite(&SLOT_MAGIC, 4, 1, f) == 1 && fwrite(&n_toks, 4, 1, f) == 1 &&
+                     fwrite(&n_imgs, 4, 1, f) == 1 &&
+                     (n_toks == 0 || fwrite(sl.toks.data(), sizeof(int32_t), n_toks, f) == n_toks) &&
+                     (n_imgs == 0 || fwrite(sl.imgs.data(), sizeof(ImgSpan), n_imgs, f) == n_imgs);
+                if (ok) {
+                    try { rt->save_state([&](const void * p, size_t n) {
+                              if (fwrite(p, 1, n, f) != n) throw std::runtime_error("short write"); });
+                    } catch (const std::exception & e) {
+                        fprintf(stderr, "prefix cache: slot %d save failed (%s)\n", s, e.what());
+                        ok = false;
+                    }
+                }
+                fclose(f);
+            }
+            if (!ok) { remove(sl.path.c_str()); sl.toks.clear(); sl.imgs.clear(); }
+        } else {
+            sl.blob.clear();
+            sl.blob.reserve(rt->state_bytes());
+            rt->save_state([&](const void * p, size_t n) {
+                const uint8_t * b = (const uint8_t *) p;
+                sl.blob.insert(sl.blob.end(), b, b + n);
+            });
+        }
+    };
+
+    // restore a slot into the runtime; on failure the slot is dropped and the
+    // runtime is reset. Returns success.
+    auto load_slot = [&](int s) -> bool {
+        Slot & sl = slots[s];
+        try {
+            if (slots_ssd) {
+                FILE * f = fopen(sl.path.c_str(), "rb");
+                if (!f) throw std::runtime_error("slot file missing");
+                const long skip = 12 + (long) (sl.toks.size() * sizeof(int32_t))
+                                     + (long) (sl.imgs.size() * sizeof(ImgSpan));
+                if (fseek(f, skip, SEEK_SET) != 0) { fclose(f); throw std::runtime_error("seek failed"); }
+                try { rt->load_state([&](void * p, size_t n) {
+                          if (fread(p, 1, n, f) != n) throw std::runtime_error("short read"); });
+                } catch (...) { fclose(f); throw; }
+                fclose(f);
+            } else {
+                size_t off = 0;
+                rt->load_state([&](void * p, size_t n) {
+                    if (off + n > sl.blob.size()) throw std::runtime_error("short blob");
+                    memcpy(p, sl.blob.data() + off, n);
+                    off += n;
+                });
+            }
+        } catch (const std::exception & e) {
+            fprintf(stderr, "prefix cache: slot %d load failed (%s), dropping it\n", s, e.what());
+            if (slots_ssd) remove(sl.path.c_str());
+            sl.toks.clear(); sl.imgs.clear(); sl.blob.clear(); sl.blob.shrink_to_fit();
+            rt->reset();
+            return false;
+        }
+        *kv_imgs = sl.imgs;
+        sl.stamp = ++slot_clock;
+        return true;
+    };
+
+    auto prepare_prompt = [&](std::vector<int32_t> & prompt,
+                              std::vector<Runtime::EmbdOverride> & ovr,
+                              std::vector<ImgSpan> spans) -> int {
+        int n = match_cov(rt->kv_tokens(), *kv_imgs, prompt, spans, "live");
+        const char * src = "live";
+        if (n < 0 && !slots.empty()) {
+            int best = -1, bcov = -1;
+            for (int i = 0; i < (int) slots.size(); ++i) {
+                if (slots[i].toks.empty()) continue;
+                const int c = match_cov(slots[i].toks, slots[i].imgs, prompt, spans, nullptr);
+                if (c > bcov) { bcov = c; best = i; }
+            }
+            save_live(best);                   // park the live state before overwriting it
+            if (best >= 0 && load_slot(best)) { n = bcov; live_origin = best; src = "slot"; }
+        }
+        if (n < 0) { rt->reset(); live_origin = -1; n = 0; }
         if (n > 0) {
             prompt.erase(prompt.begin(), prompt.begin() + n);
             std::vector<Runtime::EmbdOverride> tail;
             for (const auto & o : ovr)
                 if (o.first >= (int) n) tail.push_back({ o.first - (int) n, o.count, o.data });
             ovr = std::move(tail);
-            fprintf(stderr, "prefix cache: reusing %zu tokens, prefilling %zu\n", n, prompt.size());
+            fprintf(stderr, "prefix cache: reusing %d tokens (%s), prefilling %zu\n", n, src, prompt.size());
         }
         *kv_imgs = std::move(spans);
-        return (int) n;
+        return n;
     };
 
     // Parse OpenAI-style messages: plain string content, multimodal content

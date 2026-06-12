@@ -2546,4 +2546,106 @@ void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->kv
 int  Runtime::n_past() const { return impl_->n_past; }
 const std::vector<int32_t> & Runtime::kv_tokens() const { return impl_->kv_toks; }
 
+// ---- prompt-cache slot state save/load ----
+// Sequential stream: header, kv_toks, mtp_hidden, then per layer either the
+// KV prefix rows (attention layers; the trailing nextn layers use mtp_past)
+// or the full conv/ssm states (GDN layers).
+namespace {
+struct StateHeader {
+    uint32_t magic;      // 'QSS1'
+    int32_t  n_layer, n_ctx, n_embd_gqa;
+    int32_t  n_past, mtp_past, n_toks, n_hidden;
+};
+constexpr uint32_t STATE_MAGIC = 0x31535351;   // "QSS1" little-endian
+}
+
+size_t Runtime::state_bytes() const {
+    const auto & hp = impl_->model.hparams();
+    size_t n = sizeof(StateHeader);
+    n += impl_->kv_toks.size() * sizeof(int32_t);
+    n += impl_->mtp_hidden.size() * sizeof(float);
+    for (int il = 0; il < (int) hp.n_layer; ++il) {
+        if (impl_->k_cache[il]) {
+            const int rows = il >= (int) hp.n_main() ? impl_->mtp_past : impl_->n_past;
+            n += 2 * (size_t) rows * impl_->k_cache[il]->nb[1];
+        } else {
+            n += ggml_nbytes(impl_->conv_state[il]) + ggml_nbytes(impl_->ssm_state[il]);
+        }
+    }
+    return n;
+}
+
+void Runtime::save_state(const std::function<void(const void *, size_t)> & sink) const {
+    const auto & hp = impl_->model.hparams();
+    StateHeader h{};
+    h.magic      = STATE_MAGIC;
+    h.n_layer    = (int32_t) hp.n_layer;
+    h.n_ctx      = impl_->n_ctx;
+    h.n_embd_gqa = (int32_t) (hp.n_head_kv * hp.n_embd_head);
+    h.n_past     = impl_->n_past;
+    h.mtp_past   = impl_->mtp_past;
+    h.n_toks     = (int32_t) impl_->kv_toks.size();
+    h.n_hidden   = (int32_t) impl_->mtp_hidden.size();
+    sink(&h, sizeof(h));
+    if (h.n_toks)   sink(impl_->kv_toks.data(),    h.n_toks   * sizeof(int32_t));
+    if (h.n_hidden) sink(impl_->mtp_hidden.data(), h.n_hidden * sizeof(float));
+
+    std::vector<uint8_t> buf;
+    auto dump = [&](ggml_tensor * t, size_t nbytes) {
+        if (nbytes == 0) return;
+        buf.resize(nbytes);
+        ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+        sink(buf.data(), nbytes);
+    };
+    for (int il = 0; il < h.n_layer; ++il) {
+        if (impl_->k_cache[il]) {
+            const int rows = il >= (int) hp.n_main() ? h.mtp_past : h.n_past;
+            dump(impl_->k_cache[il], (size_t) rows * impl_->k_cache[il]->nb[1]);
+            dump(impl_->v_cache[il], (size_t) rows * impl_->v_cache[il]->nb[1]);
+        } else {
+            dump(impl_->conv_state[il], ggml_nbytes(impl_->conv_state[il]));
+            dump(impl_->ssm_state[il],  ggml_nbytes(impl_->ssm_state[il]));
+        }
+    }
+}
+
+void Runtime::load_state(const std::function<void(void *, size_t)> & src) {
+    const auto & hp = impl_->model.hparams();
+    StateHeader h{};
+    src(&h, sizeof(h));
+    if (h.magic != STATE_MAGIC ||
+        h.n_layer != (int32_t) hp.n_layer || h.n_ctx != impl_->n_ctx ||
+        h.n_embd_gqa != (int32_t) (hp.n_head_kv * hp.n_embd_head) ||
+        h.n_past < 0 || h.n_past > impl_->n_ctx || h.mtp_past < 0 ||
+        h.n_toks < 0 || h.n_hidden < 0)
+        throw std::runtime_error("load_state: header mismatch (different model/n_ctx or corrupt slot)");
+
+    std::vector<int32_t> toks(h.n_toks);
+    if (h.n_toks) src(toks.data(), h.n_toks * sizeof(int32_t));
+    std::vector<float> hidden(h.n_hidden);
+    if (h.n_hidden) src(hidden.data(), h.n_hidden * sizeof(float));
+
+    std::vector<uint8_t> buf;
+    auto fill = [&](ggml_tensor * t, size_t nbytes) {
+        if (nbytes == 0) return;
+        buf.resize(nbytes);
+        src(buf.data(), nbytes);
+        ggml_backend_tensor_set(t, buf.data(), 0, nbytes);
+    };
+    for (int il = 0; il < h.n_layer; ++il) {
+        if (impl_->k_cache[il]) {
+            const int rows = il >= (int) hp.n_main() ? h.mtp_past : h.n_past;
+            fill(impl_->k_cache[il], (size_t) rows * impl_->k_cache[il]->nb[1]);
+            fill(impl_->v_cache[il], (size_t) rows * impl_->v_cache[il]->nb[1]);
+        } else {
+            fill(impl_->conv_state[il], ggml_nbytes(impl_->conv_state[il]));
+            fill(impl_->ssm_state[il],  ggml_nbytes(impl_->ssm_state[il]));
+        }
+    }
+    impl_->n_past     = h.n_past;
+    impl_->mtp_past   = h.mtp_past;
+    impl_->kv_toks    = std::move(toks);
+    impl_->mtp_hidden = std::move(hidden);
+}
+
 } // namespace qwencpp

@@ -64,6 +64,16 @@ public:
     // rewound, so reuse requires the full token list to be a prompt prefix).
     const std::vector<int32_t> & kv_tokens() const;
 
+    // ---- prompt-cache slots: save / restore the full inference state ----
+    // The stream covers the KV prefix for the current n_past (and the MTP KV
+    // for mtp_past), the GDN recurrent states, mtp_hidden and the kv_tokens
+    // bookkeeping. Opaque format: feed load_state exactly the bytes produced
+    // by save_state on the same model + n_ctx (validated by a header; throws
+    // std::runtime_error on mismatch or truncation).
+    size_t state_bytes() const;   // size save_state() will produce right now
+    void save_state(const std::function<void(const void *, size_t)> & sink) const;
+    void load_state(const std::function<void(void *, size_t)> & src);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
