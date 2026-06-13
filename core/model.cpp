@@ -520,6 +520,20 @@ void Model::load_hparams() {
                                hp_.n_head ? hp_.n_embd / hp_.n_head : 0);
     hp_.n_rot = gguf_u32(gguf_, k("rope.dimension_count"), hp_.n_embd_head);
 
+    // M-RoPE sections (Qwen-VL): [t, h, w, 0]. Present only on VL text models;
+    // when their sum*2 == n_rot, decode applies multi-axis RoPE so image tokens
+    // get 2D grid positions (text tokens use t=h=w=pos -> identical to 1D RoPE).
+    {
+        auto secs = gguf_i32_array(gguf_, k("rope.dimension_sections"));
+        int sum = 0;
+        for (size_t i = 0; i < secs.size() && i < 4; ++i) {
+            hp_.rope_sections[i] = secs[i];
+            sum += secs[i];
+        }
+        hp_.use_mrope = secs.size() >= 3 && sum > 0 && (uint32_t) (sum * 2) == hp_.n_rot
+                        && getenv("QWEN_NO_MROPE") == nullptr;   // A/B escape hatch
+    }
+
     // MoE
     hp_.n_expert      = gguf_u32(gguf_, k("expert_count"), 0);
     hp_.n_expert_used = gguf_u32(gguf_, k("expert_used_count"), 0);

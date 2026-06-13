@@ -45,6 +45,11 @@ struct HParams {
     float    rope_freq_base = 1000000.0f;
     float    rms_eps        = 1e-6f;
 
+    // M-RoPE (Qwen-VL): multi-axis RoPE sections [t, h, w, 0]. use_mrope set
+    // when present and consistent with n_rot; otherwise plain 1D NEOX RoPE.
+    int      rope_sections[4] = {0, 0, 0, 0};
+    bool     use_mrope        = false;
+
     // MoE (qwen3moe / qwen35moe / qwen3next)
     uint32_t n_expert       = 0;     // total experts (0 = dense)
     uint32_t n_expert_used  = 0;     // top-k

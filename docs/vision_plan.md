@@ -61,8 +61,13 @@ QuestWend に画像入力を実装する。Java 版と違い ViT forward は **g
 - ブラウザ UI に画像添付
 
 ### V5（後続・任意）
-- LLM 側 M-RoPE（`rope.dimension_sections` を読み `ggml_rope_multi` に切替。
-  テキストのみの場合は従来 rope と数値一致するため回帰なしで入れられる）
+- ✅ LLM 側 M-RoPE（実装済み）: `rope.dimension_sections` が存在し sum*2==n_rot の
+  モデルで `ggml_rope_multi`（GGML_ROPE_TYPE_MROPE）に切替。テキストトークンは t=h=w=pos
+  で従来 1D rope と**数値完全一致**（A/B 検証済み）、画像トークンは 2D グリッド位置
+  （t=base, h=base+row, w=base+col）を持ち、画像後は max(grid) だけ進む。位置カウンタ
+  mrope_next は n_past と別に追跡し state（キャッシュスロット）にも永続化。MTP の nextn
+  ドラフトは 1D のまま（verify は main stack の M-RoPE 経路なので出力は正しく、受理率に
+  影響するだけ）。`QWEN_NO_MROPE=1` で従来 1D に戻せる。
 - 動的解像度（`image_grid_thw`、position embedding の bicubic 補間）
 - tool calling（V0 のテンプレート基盤の上に、`<tool_call>` パース + OpenAI 形式変換）
 

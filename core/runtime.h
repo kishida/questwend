@@ -40,7 +40,10 @@ public:
     // decode() call (e.g. the <|image_pad|> run) with precomputed embeddings.
     // `data` must stay valid until that decode() returns; n_embd floats per
     // token, `count` tokens starting at prompt index `first`. Cleared after use.
-    struct EmbdOverride { int first = 0; int count = 0; const float * data = nullptr; };
+    // grid_h/grid_w: the image's post-merge patch grid (e.g. 24x24 -> 576).
+    // Used for M-RoPE 2D positions; 0 means "square, derived from count".
+    struct EmbdOverride { int first = 0; int count = 0; const float * data = nullptr;
+                          int grid_h = 0; int grid_w = 0; };
     void set_embd_overrides(std::vector<EmbdOverride> ovr);
 
     // MTP (multi-token prediction): draft the token *after* `token`, using the

@@ -144,6 +144,11 @@ struct Runtime::Impl {
     int n_ctx  = 0;
     int n_past = 0;
 
+    // M-RoPE: next text rope position. Equals n_past for text-only, but an
+    // image span advances it by max(grid_h, grid_w) instead of its token count,
+    // so it diverges from n_past after images. Persisted with the cache state.
+    int mrope_next = 0;
+
     // prompt prefix cache bookkeeping: the tokens behind n_past / the recurrent
     // state. Appended by the public decode() wrapper and by generate_mtp's
     // confirmed tokens; cleared by reset().
@@ -251,6 +256,28 @@ struct Runtime::Impl {
     void init();
     void zero_states();
     ggml_cgraph * build_graph(ggml_context * ctx, int n_tokens, int n_kv);
+    // M-RoPE helpers (no-op when !hp.use_mrope): rope_dim returns the inp_pos
+    // length for a graph, apply_rope picks ggml_rope_multi vs ggml_rope_ext,
+    // fill_rope_pos computes the per-token (sequential or 2D-grid) positions
+    // for the main stack and returns the next text rope position.
+    int rope_dim(int n_tokens) const {
+        return model.hparams().use_mrope ? 4 * n_tokens : n_tokens;
+    }
+    ggml_tensor * apply_rope(ggml_context * ctx, ggml_tensor * x, ggml_tensor * pos) {
+        const auto & hp = model.hparams();
+        if (hp.use_mrope) {
+            int sec[4] = { hp.rope_sections[0], hp.rope_sections[1],
+                           hp.rope_sections[2], hp.rope_sections[3] };
+            return ggml_rope_multi(ctx, x, pos, nullptr, hp.n_rot, sec,
+                                   GGML_ROPE_TYPE_MROPE, 0, hp.rope_freq_base,
+                                   1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        }
+        return ggml_rope_ext(ctx, x, pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX,
+                             0, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    }
+    int fill_rope_pos(std::vector<int32_t> & dst, int n_tokens, int rope_start);
+    int fill_rope_pos_spans(std::vector<int32_t> & dst, int n_tokens, int rope_start,
+                            const Runtime::EmbdOverride * spans, int n_spans);
     ggml_tensor * build_attn(ggml_context * ctx, ggml_cgraph * gf, int il,
                              ggml_tensor * Q, ggml_tensor * K, ggml_tensor * V,
                              ggml_tensor * mask, int n_tokens, int n_kv);
@@ -524,6 +551,54 @@ void Runtime::Impl::zero_states() {
     for (auto * t : ssm_state)  zero(t);
     for (auto * t : k_cache)    zero(t);
     for (auto * t : v_cache)    zero(t);
+}
+
+// Fill the main-stack rope positions for `n_tokens` tokens starting at rope
+// position `rope_start`. Without M-RoPE, dst[i] = n_past + i (unchanged 1D
+// behavior; rope_start ignored). With M-RoPE, dst is section-major
+// [t.. , h.. , w.. , e..] of size 4*n_tokens: text tokens get t=h=w=running,
+// image spans (embd_ovr, indices batch-local) get t=base, h=base+row,
+// w=base+col over their post-merge patch grid, advancing the counter by
+// max(grid) instead of the token count. Returns the rope position after the
+// batch (the caller commits it to mrope_next for real decodes).
+int Runtime::Impl::fill_rope_pos(std::vector<int32_t> & dst, int n_tokens, int rope_start) {
+    return fill_rope_pos_spans(dst, n_tokens, rope_start,
+                               embd_ovr.data(), (int) embd_ovr.size());
+}
+
+int Runtime::Impl::fill_rope_pos_spans(std::vector<int32_t> & dst, int n_tokens, int rope_start,
+                                       const Runtime::EmbdOverride * spans, int n_spans) {
+    const auto & hp = model.hparams();
+    if (!hp.use_mrope) {
+        dst.resize(n_tokens);
+        for (int i = 0; i < n_tokens; ++i) dst[i] = n_past + i;
+        return rope_start;
+    }
+    dst.assign((size_t) 4 * n_tokens, 0);
+    int32_t * pt = dst.data();
+    int32_t * ph = pt + n_tokens;
+    int32_t * pw = ph + n_tokens;          // pe (4th section) stays 0
+    int cur = rope_start;
+    int i = 0;
+    while (i < n_tokens) {
+        const Runtime::EmbdOverride * span = nullptr;
+        for (int s = 0; s < n_spans; ++s) if (spans[s].first == i) { span = &spans[s]; break; }
+        if (span) {
+            const int cnt = span->count;
+            int gw = span->grid_w > 0 ? span->grid_w
+                                      : (int) std::lround(std::sqrt((double) cnt));
+            if (gw < 1) gw = 1;
+            const int gh = span->grid_h > 0 ? span->grid_h : (cnt + gw - 1) / gw;
+            const int base = cur;
+            for (int k = 0; k < cnt && i < n_tokens; ++k, ++i) {
+                pt[i] = base; ph[i] = base + k / gw; pw[i] = base + k % gw;
+            }
+            cur = base + std::max(gh, gw);
+        } else {
+            pt[i] = ph[i] = pw[i] = cur; ++cur; ++i;
+        }
+    }
+    return cur;
 }
 
 // ---- gated attention (shared by qwen3 plain and qwen35 gated paths) ----
@@ -820,7 +895,7 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
 
     ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp_tokens); ggml_set_name(inp_tokens, "inp_tokens");
-    ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rope_dim(n_tokens));
     ggml_set_input(inp_pos); ggml_set_name(inp_pos, "inp_pos");
     ggml_tensor * inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_tokens);
     ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
@@ -880,10 +955,8 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
             Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il));
             K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il));
 
-            Q = ggml_rope_ext(ctx, Q, inp_pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX,
-                              0, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-            K = ggml_rope_ext(ctx, K, inp_pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX,
-                              0, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            Q = apply_rope(ctx, Q, inp_pos);
+            K = apply_rope(ctx, K, inp_pos);
 
             ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, n_tokens, n_kv);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate));
@@ -1367,10 +1440,11 @@ void Runtime::Impl::decode_verify(const std::vector<int32_t> & toks) {
     ggml_tensor * inp_mask   = ggml_graph_get_tensor(v_gf, "inp_mask");
     ggml_tensor * inp_kvidx  = ggml_graph_get_tensor(v_gf, "inp_kvidx");
     ggml_backend_tensor_set(inp_tokens, toks.data(), 0, n_tokens * sizeof(int32_t));
-    std::vector<int32_t> pos(n_tokens);
+    std::vector<int32_t> pos;
+    fill_rope_pos(pos, n_tokens, mrope_next);   // verify tokens are text: sequential
     std::vector<int64_t> kvi(n_tokens);
-    for (int i = 0; i < n_tokens; ++i) { pos[i] = n_past + i; kvi[i] = n_past + i; }
-    ggml_backend_tensor_set(inp_pos, pos.data(), 0, n_tokens * sizeof(int32_t));
+    for (int i = 0; i < n_tokens; ++i) kvi[i] = n_past + i;
+    ggml_backend_tensor_set(inp_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
     ggml_backend_tensor_set(inp_kvidx, kvi.data(), 0, n_tokens * sizeof(int64_t));
     std::vector<ggml_fp16_t> mask((size_t) v_nkv * n_tokens);
     const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
@@ -1499,6 +1573,7 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
 
         const int p   = n_past;            // x lands at main position p
         const int mp0 = mtp_past;          // = p-1
+        const int m0  = mrope_next;        // rope position of x (all gen tokens are text)
 
         // ---- draft K tokens by chaining the MTP block ----
         auto td0 = pclk::now();
@@ -1562,6 +1637,8 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
 
         kv_toks.push_back(x);                  // the a+1 confirmed tokens now in KV
         for (int j = 0; j < a; ++j) kv_toks.push_back(drafts[j]);
+        mrope_next = m0 + a + 1;               // a+1 confirmed text tokens (overrides any
+                                               // advance the GDN re-decode settle made)
 
         // emit accepted drafts AFTER settle/resync, so an early exit (stop
         // token, budget) leaves the state consistent with kv_toks for reuse
@@ -1624,8 +1701,9 @@ const std::vector<float> & Runtime::Impl::decode_reuse(int32_t token) {
     ggml_tensor * inp_kvidx  = ggml_graph_get_tensor(dgf, "inp_kvidx");
 
     ggml_backend_tensor_set(inp_tokens, &token, 0, sizeof(int32_t));
-    int32_t pos = n_past;
-    ggml_backend_tensor_set(inp_pos, &pos, 0, sizeof(int32_t));
+    std::vector<int32_t> posv;
+    fill_rope_pos(posv, 1, mrope_next);   // generation token: text, sequential
+    ggml_backend_tensor_set(inp_pos, posv.data(), 0, posv.size() * sizeof(int32_t));
     int64_t kvidx = n_past;
     ggml_backend_tensor_set(inp_kvidx, &kvidx, 0, sizeof(int64_t));
 
@@ -1651,6 +1729,7 @@ const std::vector<float> & Runtime::Impl::decode_reuse(int32_t token) {
                 ms(pt0, pt_build), ms(pt_build, pt_input), ms(pt_input, pt_compute));
     }
     n_past += 1;
+    mrope_next += 1;   // generation token is text: t=h=w advance by 1
     return logits;
 }
 
@@ -1797,7 +1876,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         const bool recurrent = hp.is_recurrent(il);
         ggml_tensor * inp_pos = nullptr, * inp_mask = nullptr;
         if (!recurrent) {
-            inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+            inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rope_dim(T));
             ggml_set_input(inp_pos);  ggml_set_name(inp_pos, "inp_pos");
             inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, T);
             ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
@@ -1832,10 +1911,8 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             }
             Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il));
             K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il));
-            Q = ggml_rope_ext(ctx, Q, inp_pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX,
-                              0, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-            K = ggml_rope_ext(ctx, K, inp_pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX,
-                              0, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            Q = apply_rope(ctx, Q, inp_pos);
+            K = apply_rope(ctx, K, inp_pos);
             ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, T, n_kv);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
@@ -1901,11 +1978,12 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     };
 
     // Set the attention pos/mask inputs of a graph (no-op for GDN-only graphs).
+    // M-RoPE positions use the chunk-relative image spans passed in ovr/n_ovr.
     auto set_attn_inputs = [&](ggml_cgraph * gf) {
         if (ggml_tensor * ip = ggml_graph_get_tensor(gf, "inp_pos")) {
-            std::vector<int32_t> pos(T);
-            for (int i = 0; i < T; ++i) pos[i] = n_past + i;
-            ggml_backend_tensor_set(ip, pos.data(), 0, T * sizeof(int32_t));
+            std::vector<int32_t> pos;
+            fill_rope_pos_spans(pos, T, mrope_next, ovr, n_ovr);
+            ggml_backend_tensor_set(ip, pos.data(), 0, pos.size() * sizeof(int32_t));
         }
         if (ggml_tensor * im = ggml_graph_get_tensor(gf, "inp_mask")) {
             std::vector<ggml_fp16_t> mask((size_t) n_kv * T);
@@ -2015,6 +2093,10 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     ggml_backend_buffer_free(tbuf);
     ggml_free(tctx);
     n_past += T;
+    if (!verify) {                       // prefill chunk: advance the rope counter
+        std::vector<int32_t> tmp;        // (verify is speculative; caller manages it)
+        mrope_next = fill_rope_pos_spans(tmp, T, mrope_next, ovr, n_ovr);
+    }
 }
 
 // Single-token decode using the dynamic VRAM expert cache.
@@ -2087,7 +2169,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         const bool recurrent = hp.is_recurrent(il);
         ggml_tensor * inp_pos = nullptr, * inp_mask = nullptr;
         if (!recurrent) {
-            inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+            inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rope_dim(1));
             ggml_set_input(inp_pos);  ggml_set_name(inp_pos, "inp_pos");
             inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, 1);
             ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
@@ -2120,10 +2202,8 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             }
             Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il));
             K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il));
-            Q = ggml_rope_ext(ctx, Q, inp_pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX,
-                              0, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-            K = ggml_rope_ext(ctx, K, inp_pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX,
-                              0, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            Q = apply_rope(ctx, Q, inp_pos);
+            K = apply_rope(ctx, K, inp_pos);
             ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, 1, n_kv);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
@@ -2150,7 +2230,9 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     // segB-only graph or a GDN-only seg A).
     auto set_attn_inputs = [&](ggml_cgraph * gf) {
         if (ggml_tensor * ip = ggml_graph_get_tensor(gf, "inp_pos")) {
-            int32_t pos = n_past; ggml_backend_tensor_set(ip, &pos, 0, sizeof(int32_t));
+            std::vector<int32_t> posv;
+            fill_rope_pos(posv, 1, mrope_next);
+            ggml_backend_tensor_set(ip, posv.data(), 0, posv.size() * sizeof(int32_t));
         }
         if (ggml_tensor * im = ggml_graph_get_tensor(gf, "inp_mask")) {
             std::vector<ggml_fp16_t> mask(n_kv);
@@ -2226,6 +2308,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         dc_tokens++;
     }
     n_past += 1;
+    mrope_next += 1;   // single-token decode is a text generation step
     return logits;
 }
 
@@ -2337,7 +2420,9 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     ggml_tensor * inp_mask   = ggml_graph_get_tensor(f_gf, "inp_mask");
     ggml_tensor * inp_kvidx  = ggml_graph_get_tensor(f_gf, "inp_kvidx");
     ggml_backend_tensor_set(inp_tokens, &token, 0, sizeof(int32_t));
-    int32_t pos = n_past;   ggml_backend_tensor_set(inp_pos, &pos, 0, sizeof(int32_t));
+    std::vector<int32_t> posv;
+    fill_rope_pos(posv, 1, mrope_next);   // generation token: text, sequential
+    ggml_backend_tensor_set(inp_pos, posv.data(), 0, posv.size() * sizeof(int32_t));
     int64_t kvidx = n_past; ggml_backend_tensor_set(inp_kvidx, &kvidx, 0, sizeof(int64_t));
     std::vector<ggml_fp16_t> mask(f_nkv);
     const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
@@ -2394,6 +2479,7 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     logits.resize(n_vocab);
     ggml_backend_tensor_get(logits_t, logits.data(), 0, n_vocab * sizeof(float));
     n_past += 1;
+    mrope_next += 1;   // generation token is text: t=h=w advance by 1
     return logits;
 }
 
@@ -2486,9 +2572,9 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
 
     ggml_backend_tensor_set(inp_tokens_t, tokens.data(), 0, n_tokens * sizeof(int32_t));
 
-    std::vector<int32_t> pos(n_tokens);
-    for (int i = 0; i < n_tokens; ++i) pos[i] = n_past + i;
-    ggml_backend_tensor_set(inp_pos_t, pos.data(), 0, n_tokens * sizeof(int32_t));
+    std::vector<int32_t> pos;
+    const int new_mrope = fill_rope_pos(pos, n_tokens, mrope_next);
+    ggml_backend_tensor_set(inp_pos_t, pos.data(), 0, pos.size() * sizeof(int32_t));
 
     std::vector<ggml_fp16_t> mask((size_t) n_kv * n_tokens);
     const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
@@ -2538,6 +2624,7 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     }
 
     n_past += n_tokens;
+    mrope_next = new_mrope;
     ggml_free(ctx);
     return logits;
 }
@@ -2568,7 +2655,7 @@ void Runtime::prefill(const std::vector<int32_t> & tokens, bool mtp_kv) {
     impl_->prefill(tokens, mtp_kv);
     impl_->kv_toks.insert(impl_->kv_toks.end(), tokens.begin(), tokens.end());
 }
-void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->kv_toks.clear(); impl_->zero_states(); }
+void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->mrope_next = 0; impl_->kv_toks.clear(); impl_->zero_states(); }
 int  Runtime::n_past() const { return impl_->n_past; }
 const std::vector<int32_t> & Runtime::kv_tokens() const { return impl_->kv_toks; }
 
@@ -2578,11 +2665,11 @@ const std::vector<int32_t> & Runtime::kv_tokens() const { return impl_->kv_toks;
 // or the full conv/ssm states (GDN layers).
 namespace {
 struct StateHeader {
-    uint32_t magic;      // 'QSS1'
+    uint32_t magic;      // 'QSS2'
     int32_t  n_layer, n_ctx, n_embd_gqa;
-    int32_t  n_past, mtp_past, n_toks, n_hidden;
+    int32_t  n_past, mtp_past, n_toks, n_hidden, mrope_next;
 };
-constexpr uint32_t STATE_MAGIC = 0x31535351;   // "QSS1" little-endian
+constexpr uint32_t STATE_MAGIC = 0x32535351;   // "QSS2" little-endian
 }
 
 size_t Runtime::state_bytes() const {
@@ -2612,6 +2699,7 @@ void Runtime::save_state(const std::function<void(const void *, size_t)> & sink)
     h.mtp_past   = impl_->mtp_past;
     h.n_toks     = (int32_t) impl_->kv_toks.size();
     h.n_hidden   = (int32_t) impl_->mtp_hidden.size();
+    h.mrope_next = impl_->mrope_next;
     sink(&h, sizeof(h));
     if (h.n_toks)   sink(impl_->kv_toks.data(),    h.n_toks   * sizeof(int32_t));
     if (h.n_hidden) sink(impl_->mtp_hidden.data(), h.n_hidden * sizeof(float));
@@ -2670,6 +2758,7 @@ void Runtime::load_state(const std::function<void(void *, size_t)> & src) {
     }
     impl_->n_past     = h.n_past;
     impl_->mtp_past   = h.mtp_past;
+    impl_->mrope_next = h.mrope_next;
     impl_->kv_toks    = std::move(toks);
     impl_->mtp_hidden = std::move(hidden);
 }
