@@ -2495,9 +2495,13 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     if (n_tokens == 1 && ecache)
         return cache_fast_enabled ? decode_cached_fast(tokens[0]) : decode_cached(tokens[0]);
 
-    // SSD tier has no CPU-expert sched path: run prefill as batched chunks via
-    // the cache (chunk bounded so a layer's distinct experts fit the pools).
-    if (ecache && !sched) {
+    // Prefill as batched chunks through the VRAM expert cache (chunk bounded so
+    // a layer's distinct experts fit the pools). Used for both offload tiers:
+    // the experts run on the GPU (fetched from pinned RAM or SSD) instead of on
+    // CPU via the scheduler, which otherwise leaves the GPU idle during prefill.
+    // QWEN_CPU_PREFILL forces the old RAM-tier behavior (experts on CPU/sched).
+    static const bool cpu_prefill = getenv("QWEN_CPU_PREFILL") != nullptr;
+    if (ecache && !(sched && cpu_prefill)) {
         // Batched prefill: each chunk runs one segmented forward (seg A
         // attention/GDN/router for all tokens -> one expert-residency sync per
         // layer -> batched seg B expert matmuls). Argmax-equivalent to the

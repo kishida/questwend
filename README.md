@@ -215,7 +215,9 @@ qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40000 --e
 | 変数 | 効果 |
 |---|---|
 | `QWEN_NO_BATCH_PREFILL=1` | SSD 階層の prefill を旧来の token-by-token に戻す（既定はバッチチャンク実行） |
-| `QWEN_BATCH_CHUNK=N` | SSD バッチ prefill のチャンク長を固定（既定はプールサイズから自動、最大 256） |
+| `QWEN_BATCH_CHUNK=N` | バッチ prefill のチャンク長を固定（既定はプールサイズから自動、最大 256） |
+| `QWEN_PREFILL_CHUNK=N` | 常駐／RAM階層 build_graph prefill のチャンク長（既定 512） |
+| `QWEN_CPU_PREFILL=1` | RAM 階層の prefill をエキスパート CPU 実行（sched）に戻す（既定は GPU キャッシュ経路。GPU が遊ぶ代わりに H2D 転送を省く旧挙動） |
 | `QWEN_MTP_NO_BATCH_PREFILL=1` | MTP の prefill を旧来の token-by-token に戻す（既定はバッチ。画像入力時はバッチ強制） |
 | `QWEN_FASTCACHE=1` | 楽観単一グラフデコード（全 expert 常駐前提 + ミス時フォールバック; 実験的） |
 | `QWEN_GDN_TEST=1` | GDN の multi-token / token-by-token 等価性チェックを実行して終了 |
