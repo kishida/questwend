@@ -578,15 +578,25 @@ int main(int argc, char ** argv) {
     auto pf_last  = std::make_shared<lclk::time_point>(lclk::now());
     auto pf_base  = std::make_shared<int>(0);
     auto pf_total = std::make_shared<int>(0);
-    rt->set_progress_cb([pf_start, pf_last, pf_base, pf_total](int done, int total) {
+    auto pf_shown = std::make_shared<bool>(false);   // any progress line shown this request
+    rt->set_progress_cb([pf_start, pf_last, pf_base, pf_total, pf_shown](int done, int total) {
         const int gtot  = *pf_total > 0 ? *pf_total : total;
         const int gdone = *pf_base + done;
         const auto now = lclk::now();
-        if (gdone < gtot && now - *pf_last >= std::chrono::seconds(10)) {
+        auto emit = [&] {
             const double el = std::chrono::duration<double>(now - *pf_start).count();
             fprintf(stderr, "  prefill %d/%d (%.0f%%) %.0f tok/s\n",
                     gdone, gtot, 100.0 * gdone / gtot, el > 0 ? gdone / el : 0.0);
             *pf_last = now;
+        };
+        if (gdone >= gtot) {
+            // a long prefill finishing between ticks would otherwise stall the
+            // log at e.g. 93%; emit a closing 100% line (only if we ever showed
+            // progress, so short prefills stay quiet)
+            if (*pf_shown) { emit(); *pf_shown = false; }
+        } else if (now - *pf_last >= std::chrono::seconds(10)) {
+            emit();
+            *pf_shown = true;
         }
     });
 
@@ -809,6 +819,7 @@ int main(int argc, char ** argv) {
         *pf_last  = lclk::now();
         *pf_total = (int) prompt.size();   // full tail to prefill (overall progress)
         *pf_base  = 0;
+        *pf_shown = false;
         return n;
     };
 
