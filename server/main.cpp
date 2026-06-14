@@ -569,15 +569,23 @@ int main(int argc, char ** argv) {
     // prefill progress: the offload (SSD/RAM-tier) prefill runs in chunks and
     // reports (done,total); throttle the log line to one per ~10s. The clock is
     // reset at each request's prefill start (requests are serialized).
+    // The runtime callback's (done,total) is per decode() call, which is too
+    // local when the server itself chunks prefill (time-slicing): report
+    // progress against the whole prefill instead. pf_total = full tail tokens,
+    // pf_base = tokens prefilled by earlier server chunks; both set per request.
     using lclk = std::chrono::steady_clock;
     auto pf_start = std::make_shared<lclk::time_point>(lclk::now());
     auto pf_last  = std::make_shared<lclk::time_point>(lclk::now());
-    rt->set_progress_cb([pf_start, pf_last](int done, int total) {
+    auto pf_base  = std::make_shared<int>(0);
+    auto pf_total = std::make_shared<int>(0);
+    rt->set_progress_cb([pf_start, pf_last, pf_base, pf_total](int done, int total) {
+        const int gtot  = *pf_total > 0 ? *pf_total : total;
+        const int gdone = *pf_base + done;
         const auto now = lclk::now();
-        if (done < total && now - *pf_last >= std::chrono::seconds(10)) {
+        if (gdone < gtot && now - *pf_last >= std::chrono::seconds(10)) {
             const double el = std::chrono::duration<double>(now - *pf_start).count();
             fprintf(stderr, "  prefill %d/%d (%.0f%%) %.0f tok/s\n",
-                    done, total, 100.0 * done / total, el > 0 ? done / el : 0.0);
+                    gdone, gtot, 100.0 * gdone / gtot, el > 0 ? gdone / el : 0.0);
             *pf_last = now;
         }
     });
@@ -799,6 +807,8 @@ int main(int argc, char ** argv) {
                 rt->has_expert_cache() ? "" : " (resident)");
         *pf_start = lclk::now();
         *pf_last  = lclk::now();
+        *pf_total = (int) prompt.size();   // full tail to prefill (overall progress)
+        *pf_base  = 0;
         return n;
     };
 
@@ -1190,6 +1200,7 @@ int main(int argc, char ** argv) {
                             // ---- preemptible prefill: all but the last chunk; the
                             // final chunk goes through generate_mtp below ----
                             while (st->prompt.size() - st->pf_pos > pf_chunk) {
+                                *pf_base = (int) st->pf_pos;   // overall-progress offset
                                 rt->set_embd_overrides(chunk_ovr(st->pf_pos, pf_chunk));
                                 rt->prefill(std::vector<int32_t>(st->prompt.begin() + st->pf_pos,
                                                                  st->prompt.begin() + st->pf_pos + pf_chunk), true);
@@ -1206,6 +1217,7 @@ int main(int argc, char ** argv) {
                             }
                             std::vector<int32_t> rp;             // tokens to feed generate_mtp
                             if (st->pf_pos < st->prompt.size()) {
+                                *pf_base = (int) st->pf_pos;     // overall-progress offset
                                 rp.assign(st->prompt.begin() + st->pf_pos, st->prompt.end());
                                 rt->set_embd_overrides(chunk_ovr(st->pf_pos, rp.size()));
                                 st->pf_pos = st->prompt.size();
@@ -1284,6 +1296,7 @@ int main(int argc, char ** argv) {
                         // preemptible prefill: the last chunk's logits feed sampling
                         while (st->pf_pos < st->prompt.size()) {
                             const size_t n = std::min(pf_chunk, st->prompt.size() - st->pf_pos);
+                            *pf_base = (int) st->pf_pos;   // overall-progress offset
                             rt->set_embd_overrides(chunk_ovr(st->pf_pos, n));
                             st->logits = rt->decode(std::vector<int32_t>(st->prompt.begin() + st->pf_pos,
                                                                          st->prompt.begin() + st->pf_pos + n));
