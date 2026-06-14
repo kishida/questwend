@@ -83,6 +83,11 @@ int main(int argc, char ** argv) {
         else if (a == "--cpu")              force_cpu = true;
         else if (a == "--info")             info_only = true;
         else if (a == "-h" || a == "--help"){ usage(argv[0]); return 0; }
+        else {
+            fprintf(stderr, "error: unknown or malformed argument: %s\n\n", a.c_str());
+            usage(argv[0]);
+            return 1;
+        }
     }
     // standalone vision-tower test: encode images and print embedding stats
     // (for numeric comparison against the Java reference implementation)

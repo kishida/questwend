@@ -407,6 +407,13 @@ int main(int argc, char ** argv) {
         else if (a == "--cache-slots-dir" && i + 1 < argc) cache_slots_dir = argv[++i];
         else if (a == "--time-slice" && i + 1 < argc) time_slice = std::stoi(argv[++i]);
         else if (a == "--cpu")              force_cpu = true;
+        else {
+            // unknown flag, or a known flag missing its value (e.g. a typo like
+            // --time-clice): fail loudly instead of silently ignoring it
+            fprintf(stderr, "error: unknown or malformed argument: %s\n"
+                            "run with -m <model.gguf> and no other args to see usage\n", a.c_str());
+            return 1;
+        }
     }
     if (!cache_slots_dir.empty() && cache_slots <= 0) cache_slots = 4;   // dir implies slots
     if (model_path.empty()) {
