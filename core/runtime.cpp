@@ -2543,13 +2543,16 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
         return logits;
     }
 
-    // Resident prefill of a long prompt: a single graph would be a big O(n^2)
-    // attention (mask alone is n_kv*n_tokens) and one uninterruptible compute
-    // that blocks time-slicing. Split it into chunks (bounded mask, progress
-    // reporting, and time-slice can preempt at the server's chunk boundary).
+    // Long-prompt prefill through the build_graph path (resident, or RAM-tier
+    // offload which uses the backend scheduler): a single graph would be a big
+    // O(n^2) attention (the scores/mask scale with n_kv*n_tokens -> multi-GB
+    // and OOM at ~8k tokens) and one uninterruptible compute that blocks
+    // time-slicing. Split it into chunks (bounded buffers, progress reporting,
+    // preemptible). The SSD-tier path (ecache && !sched) already chunks via the
+    // decode_cached_batch loop above, so it is excluded here.
     static const int PF_CHUNK = []{ const char * c = getenv("QWEN_PREFILL_CHUNK");
                                     int v = c ? atoi(c) : 512; return v < 1 ? 512 : v; }();
-    if (n_tokens > PF_CHUNK && !ecache && !sched) {
+    if (n_tokens > PF_CHUNK && (sched || !ecache)) {
         const int n_embd = model.hparams().n_embd;
         const std::vector<Runtime::EmbdOverride> all = embd_ovr;   // member is consumed per call
         int i = 0;
