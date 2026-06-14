@@ -2543,6 +2543,33 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
         return logits;
     }
 
+    // Resident prefill of a long prompt: a single graph would be a big O(n^2)
+    // attention (mask alone is n_kv*n_tokens) and one uninterruptible compute
+    // that blocks time-slicing. Split it into chunks (bounded mask, progress
+    // reporting, and time-slice can preempt at the server's chunk boundary).
+    static const int PF_CHUNK = []{ const char * c = getenv("QWEN_PREFILL_CHUNK");
+                                    int v = c ? atoi(c) : 512; return v < 1 ? 512 : v; }();
+    if (n_tokens > PF_CHUNK && !ecache && !sched) {
+        const int n_embd = model.hparams().n_embd;
+        const std::vector<Runtime::EmbdOverride> all = embd_ovr;   // member is consumed per call
+        int i = 0;
+        while (i < n_tokens) {
+            const int t = std::min(PF_CHUNK, n_tokens - i);
+            std::vector<Runtime::EmbdOverride> ovr;                // image spans clipped to chunk
+            for (const auto & o : all) {
+                const int lo = std::max(o.first, i), hi = std::min(o.first + o.count, i + t);
+                if (lo < hi) ovr.push_back({ lo - i, hi - lo,
+                                             o.data + (size_t) (lo - o.first) * n_embd });
+            }
+            embd_ovr = std::move(ovr);
+            decode(std::vector<int32_t>(tokens.begin() + i, tokens.begin() + i + t));
+            i += t;
+            if (progress_cb) progress_cb(i, n_tokens);
+        }
+        embd_ovr.clear();
+        return logits;
+    }
+
     // fast path: single-token decode with a reusable (CUDA-graph friendly) graph
     // (only when not using the backend scheduler for expert offload)
     if (n_tokens == 1 && reuse_graph && !sched) return decode_reuse(tokens[0]);
