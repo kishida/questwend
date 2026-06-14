@@ -158,6 +158,9 @@ struct Runtime::Impl {
     // by build_graph; the input tensors are filled in decode() after alloc)
     std::vector<Runtime::EmbdOverride> embd_ovr;
 
+    // optional prefill progress callback (tokens_done, tokens_total) per chunk
+    std::function<void(int, int)> progress_cb;
+
     // MTP batched prefill: while set, batched decodes append every token's final
     // hidden (pre-output-norm) to bh_all so the nextn KV can be built in batches.
     bool               want_bh_all = false;
@@ -2534,6 +2537,7 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
             decode_cached_batch(&tokens[i], t, /*want_logits=*/ i + t >= n_tokens, /*verify=*/false,
                                 ovr.empty() ? nullptr : ovr.data(), (int) ovr.size());
             i += t;
+            if (progress_cb) progress_cb(i, n_tokens);
         }
         embd_ovr.clear();
         return logits;
@@ -2658,6 +2662,16 @@ void Runtime::prefill(const std::vector<int32_t> & tokens, bool mtp_kv) {
 void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->mrope_next = 0; impl_->kv_toks.clear(); impl_->zero_states(); }
 int  Runtime::n_past() const { return impl_->n_past; }
 const std::vector<int32_t> & Runtime::kv_tokens() const { return impl_->kv_toks; }
+bool Runtime::has_expert_cache() const { return impl_->ecache != nullptr; }
+Runtime::CacheStats Runtime::cache_stats() const {
+    CacheStats c;
+    if (impl_->ecache) {
+        const auto & s = impl_->ecache->stats();
+        c.hits = s.hits; c.misses = s.misses; c.fetch_ms = s.fetch_ms; c.fetch_bytes = s.fetch_bytes;
+    }
+    return c;
+}
+void Runtime::set_progress_cb(std::function<void(int, int)> cb) { impl_->progress_cb = std::move(cb); }
 
 // ---- prompt-cache slot state save/load ----
 // Sequential stream: header, kv_toks, mtp_hidden, then per layer either the

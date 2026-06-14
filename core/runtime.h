@@ -74,6 +74,16 @@ public:
     void reset();                 // clear KV cache / position
     int  n_past() const;
 
+    // Expert-cache stats (cumulative since load; all zero when there is no
+    // offload cache). The server snapshots before/after a request for hit rate.
+    struct CacheStats { uint64_t hits = 0, misses = 0; double fetch_ms = 0; uint64_t fetch_bytes = 0; };
+    CacheStats cache_stats() const;
+    bool has_expert_cache() const;
+
+    // Progress callback invoked once per prefill chunk (offload path only;
+    // resident prefill is a single fast pass): (tokens_done, tokens_total).
+    void set_progress_cb(std::function<void(int, int)> cb);
+
     // Tokens currently represented in the KV cache / recurrent state, in order.
     // Maintained across decode() / generate_mtp(); cleared by reset(). Enables
     // prompt prefix reuse: if a new prompt extends exactly these tokens, the

@@ -19,7 +19,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -64,6 +66,20 @@ static std::string dumpj(const nlohmann::json & j) {
 static std::string now_id(const char * prefix) {
     auto t = std::chrono::system_clock::now().time_since_epoch().count();
     return std::string(prefix) + std::to_string(t);
+}
+
+// local wall-clock "HH:MM:SS" for request log lines
+static std::string clock_hms() {
+    const std::time_t t = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+    return buf;
 }
 
 static std::vector<uint8_t> base64_decode(const std::string & in) {
@@ -543,6 +559,22 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "warning: --time-slice without --cache-slots: a preempted request"
                         " re-prefills its whole context on resume\n");
 
+    // prefill progress: the offload (SSD/RAM-tier) prefill runs in chunks and
+    // reports (done,total); throttle the log line to one per ~10s. The clock is
+    // reset at each request's prefill start (requests are serialized).
+    using lclk = std::chrono::steady_clock;
+    auto pf_start = std::make_shared<lclk::time_point>(lclk::now());
+    auto pf_last  = std::make_shared<lclk::time_point>(lclk::now());
+    rt->set_progress_cb([pf_start, pf_last](int done, int total) {
+        const auto now = lclk::now();
+        if (done < total && now - *pf_last >= std::chrono::seconds(10)) {
+            const double el = std::chrono::duration<double>(now - *pf_start).count();
+            fprintf(stderr, "  prefill %d/%d (%.0f%%) %.0f tok/s\n",
+                    done, total, 100.0 * done / total, el > 0 ? done / el : 0.0);
+            *pf_last = now;
+        }
+    });
+
     // ---- single-slot prompt prefix cache (guarded by infer_mtx) ----
     // The runtime keeps the KV cache / GDN state of the previous request. If
     // the new prompt's tokens start with exactly rt->kv_tokens(), skip
@@ -729,6 +761,8 @@ int main(int argc, char ** argv) {
     auto prepare_prompt = [&](std::vector<int32_t> & prompt,
                               std::vector<Runtime::EmbdOverride> & ovr,
                               std::vector<ImgSpan> spans, uint64_t owner) -> int {
+        const int n_full = (int) prompt.size();
+        const bool has_img = !spans.empty();
         int n = match_cov(rt->kv_tokens(), *kv_imgs, prompt, spans, "live");
         const char * src = "live";
         if (n < 0 && !slots.empty()) {
@@ -748,11 +782,38 @@ int main(int argc, char ** argv) {
             for (const auto & o : ovr)
                 if (o.first >= (int) n) tail.push_back({ o.first - (int) n, o.count, o.data });
             ovr = std::move(tail);
-            fprintf(stderr, "prefix cache: reusing %d tokens (%s), prefilling %zu\n", n, src, prompt.size());
         }
         *kv_imgs = std::move(spans);
         live_owner = owner;
+        // request start: time, prompt size, KV reuse, image flag, prefill size
+        fprintf(stderr, "[%s] req: %d tok%s, KV reuse %d (%s), prefill %d%s\n",
+                clock_hms().c_str(), n_full, has_img ? " +img" : "",
+                n, n > 0 ? src : "none", (int) prompt.size(),
+                rt->has_expert_cache() ? "" : " (resident)");
+        *pf_start = lclk::now();
+        *pf_last  = lclk::now();
         return n;
+    };
+
+    // completion log: prefill/decode tok/s, output tokens, expert hit-rate
+    // delta since this request's prefill (c0 snapshot taken at prefill start).
+    auto log_done = [&rt](int n_prompt, int n_cached, int gen,
+                          double prefill_ms, double gen_ms, Runtime::CacheStats c0) {
+        std::string hit;
+        if (rt->has_expert_cache()) {
+            const auto c = rt->cache_stats();
+            const uint64_t h = c.hits - c0.hits, m = c.misses - c0.misses, tot = h + m;
+            char b[64];
+            std::snprintf(b, sizeof(b), ", expert hit %.1f%% (%llu/%llu)",
+                          tot ? 100.0 * h / tot : 0.0,
+                          (unsigned long long) h, (unsigned long long) tot);
+            hit = b;
+        }
+        const int pf = n_prompt - n_cached;
+        fprintf(stderr, "[%s] done: prefill %.0f tok/s (%d tok), gen %.1f tok/s (%d tok)%s\n",
+                clock_hms().c_str(),
+                prefill_ms > 0 ? pf * 1000.0 / prefill_ms : 0.0, pf,
+                gen_ms > 0 ? gen * 1000.0 / gen_ms : 0.0, gen, hit.c_str());
     };
 
     // re-attach a time-sliced request to the runtime after a pause: continue
@@ -969,6 +1030,7 @@ int main(int argc, char ** argv) {
                 std::vector<Runtime::EmbdOverride> ovr;
                 std::vector<ImgSpan> spans;       // image spans for the prefix cache
                 uint64_t sid = 0;                 // request id (live-state ownership)
+                Runtime::CacheStats cstat0;       // expert-cache snapshot at prefill start
                 bool had_images = false;
                 int slice_used = 0;               // tokens emitted in the current slice
                 std::vector<int32_t> my_toks;     // kv snapshot at pause (resume key)
@@ -1017,6 +1079,8 @@ int main(int argc, char ** argv) {
                             {"prefill_tps", prefill_ms > 0 ? n_prefilled  * 1000.0 / prefill_ms : 0.0},
                             {"gen_tps",     gen_ms     > 0 ? st->generated * 1000.0 / gen_ms    : 0.0},
                         };
+                        log_done(st->prompt_tokens, st->n_cached, st->generated,
+                                 prefill_ms, gen_ms, st->cstat0);
                         // tool calls: parse the accumulated text; if any, emit them as a
                         // final delta and finish with "tool_calls"
                         std::vector<ParsedToolCall> calls;
@@ -1103,6 +1167,7 @@ int main(int argc, char ** argv) {
                                 st->t0 = clk::now();
                                 st->had_images = !st->ovr.empty();
                                 st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid);
+                                st->cstat0 = rt->cache_stats();
                                 st->my_imgs = *kv_imgs;
                                 st->resp_base = rt->kv_tokens().size() + st->prompt.size();
                                 st->t_prefill = st->t_first = st->t0;   // defaults if 0 tokens
@@ -1198,6 +1263,7 @@ int main(int argc, char ** argv) {
                             st->t0 = clk::now();
                             st->had_images = !st->ovr.empty();
                             st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid);
+                            st->cstat0 = rt->cache_stats();
                             st->my_imgs = *kv_imgs;
                         } else if (!was_holding) {
                             // resumed after yielding the runtime at a slice boundary
@@ -1258,6 +1324,7 @@ int main(int argc, char ** argv) {
         // non-streaming
         std::string text;
         int generated = 0, n_cached = 0;
+        Runtime::CacheStats cstat0;
         using clk = std::chrono::steady_clock;
         clk::time_point t0, t_prefill = {}, t_end = {};
         try {
@@ -1267,6 +1334,7 @@ int main(int argc, char ** argv) {
                 ~Guard() { t.unlock(); }
             } lk(tlock);
             n_cached = prepare_prompt(prompt, ovr, std::move(spans), 0);
+            cstat0 = rt->cache_stats();
             t0 = clk::now();
             if (req_mtp) {
                 t_prefill = t0;
@@ -1303,6 +1371,7 @@ int main(int argc, char ** argv) {
         };
         const double prefill_ms = ms(t0, t_prefill);
         const double gen_ms     = ms(t_prefill, t_end);
+        log_done(n_prompt_full, n_cached, generated, prefill_ms, gen_ms, cstat0);
         // tool calls: parse the output; strip the blocks from content if any
         std::vector<ParsedToolCall> calls;
         const std::string content = parse_tool_calls(text, calls);
