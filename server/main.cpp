@@ -497,7 +497,11 @@ int main(int argc, char ** argv) {
     if (mtp) fprintf(stderr, "MTP self-speculative decode ON (draft=%d; greedy only -"
                              " request sampling parameters are ignored)\n", n_draft);
 
-    const std::string model_id = "questwend:" + std::string(arch_name(model->hparams().arch));
+    // /v1/models id: the model name (general.name) so clients identify the
+    // actual model, not the architecture; fall back to "questwend:<arch>".
+    const std::string model_id = !model->hparams().general_name.empty()
+        ? model->hparams().general_name
+        : "questwend:" + std::string(arch_name(model->hparams().arch));
 
     // Build a human-readable display name: "Qwen3-30B-A3B Q8_0(qwen3)"
     auto ftype_label = [](uint32_t ft) -> const char * {
