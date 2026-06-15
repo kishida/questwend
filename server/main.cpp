@@ -1183,9 +1183,12 @@ int main(int argc, char ** argv) {
                             return covr;
                         };
                         // prefill slice unit: token slices would be too fine (batch
-                        // efficiency), so prefill yields at a coarser granularity
+                        // efficiency), so prefill works in coarser chunks. Even
+                        // without time-slicing we chunk (default 512) so a client
+                        // disconnect is noticed between chunks instead of after
+                        // the whole (possibly minutes-long) prefill.
                         const size_t pf_chunk = time_slice > 0
-                            ? (size_t) std::max(time_slice, 256) : (size_t) 1 << 30;
+                            ? (size_t) std::max(time_slice, 256) : (size_t) 512;
 
                         // ---- MTP self-speculative decode: one time slice per provider
                         // call (the whole run when --time-slice is off / uncontended) ----
@@ -1211,6 +1214,12 @@ int main(int argc, char ** argv) {
                             // ---- preemptible prefill: all but the last chunk; the
                             // final chunk goes through generate_mtp below ----
                             while (st->prompt.size() - st->pf_pos > pf_chunk) {
+                                if (!sink.is_writable()) {   // client disconnected mid-prefill
+                                    fprintf(stderr, "client gone during prefill (%zu/%zu), aborting\n",
+                                            st->pf_pos, st->prompt.size());
+                                    st->finished = true; tlock.unlock(); st->holding = false;
+                                    return false;
+                                }
                                 *pf_base = (int) st->pf_pos;   // overall-progress offset
                                 rt->set_embd_overrides(chunk_ovr(st->pf_pos, pf_chunk));
                                 rt->prefill(std::vector<int32_t>(st->prompt.begin() + st->pf_pos,
@@ -1306,6 +1315,12 @@ int main(int argc, char ** argv) {
                         }
                         // preemptible prefill: the last chunk's logits feed sampling
                         while (st->pf_pos < st->prompt.size()) {
+                            if (!sink.is_writable()) {   // client gone mid-prefill
+                                fprintf(stderr, "client gone during prefill (%zu/%zu), aborting\n",
+                                        st->pf_pos, st->prompt.size());
+                                st->finished = true; tlock.unlock(); st->holding = false;
+                                return false;
+                            }
                             const size_t n = std::min(pf_chunk, st->prompt.size() - st->pf_pos);
                             *pf_base = (int) st->pf_pos;   // overall-progress offset
                             rt->set_embd_overrides(chunk_ovr(st->pf_pos, n));
