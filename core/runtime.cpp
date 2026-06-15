@@ -411,7 +411,8 @@ void Runtime::Impl::init() {
         // Disable persistent reuse graph — sched alloc is incompatible with it.
         reuse_graph = false;
 
-        fprintf(stderr, "expert offload: ON (prefill on CPU experts, decode via VRAM cache)\n");
+        fprintf(stderr, "expert offload: ON (experts stream into the VRAM cache;"
+                        " QWEN_CPU_PREFILL=1 runs prefill experts on CPU instead)\n");
     } else {
         weights_buf = model.load_weights(backend);
     }
