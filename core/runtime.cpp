@@ -477,11 +477,21 @@ void Runtime::Impl::init_cache() {
     const int n_embd = hp.n_embd;
     const int n_used = hp.n_expert_used;
 
-    // VRAM left for the expert slot pools after non-expert weights + headroom.
+    // VRAM left for the expert slot pools after non-expert weights, the KV
+    // cache, and a compute-buffer headroom. The KV cache (st_buf, already
+    // allocated) scales with n_ctx -- ~6 GB at n_ctx=36000 for a 40-layer
+    // model -- so a fixed headroom would oversize the pool and overcommit VRAM.
+    // On Windows the driver then silently spills allocations to shared system
+    // memory (paged over PCIe), uniformly slowing prefill and decode; sizing
+    // the pool against the real KV bytes keeps everything VRAM-resident.
     const size_t budget   = cfg.vram_budget_mb * 1024ull * 1024ull;
     const size_t gpu_w    = ggml_backend_buffer_get_size(weights_buf);
-    const size_t headroom = 1024ull * 1024ull * 1024ull;   // KV cache + compute buffers
-    size_t avail = (budget > gpu_w + headroom) ? budget - gpu_w - headroom : 0;
+    const size_t kv_bytes = st_buf ? ggml_backend_buffer_get_size(st_buf) : 0;
+    const size_t compute  = 1024ull * 1024ull * 1024ull;   // gallocr graph buffers
+    const size_t reserve  = gpu_w + kv_bytes + compute;
+    size_t avail = budget > reserve ? budget - reserve : 0;
+    fprintf(stderr, "VRAM budget %zu MB = weights %zu + KV %zu + compute %zu + expert pool %zu MB\n",
+            cfg.vram_budget_mb, gpu_w >> 20, kv_bytes >> 20, compute >> 20, avail >> 20);
 
     // Only the main stack's experts are offloaded; the trailing MTP (nextn) block
     // stays fully VRAM-resident, so the cache covers n_main() layers (not n_layer).
