@@ -971,6 +971,8 @@ int main(int argc, char ** argv) {
         json body;
         try { body = json::parse(req.body); }
         catch (...) { res.status = 400; res.set_content(R"({"error":"invalid json"})", "application/json"); return; }
+        if (getenv("QWEN_LOG_RESPONSE"))
+            fprintf(stderr, "=== request body ===\n%s\n", req.body.c_str());
 
         const int  max_tokens = body.value("max_tokens", 512);
         const bool stream      = body.value("stream", false);
@@ -1003,6 +1005,9 @@ int main(int argc, char ** argv) {
                 copts.add_vision_id  = images.size() > 1;
             }
             cp = build_qwen_prompt(*tok, messages, copts);
+            if (getenv("QWEN_LOG_RESPONSE"))
+                fprintf(stderr, "=== rendered prompt (%zu tok) ===\n%s\n",
+                        cp.ids.size(), tok->decode(cp.ids).c_str());
             if (!images.empty()) {
                 std::lock_guard<std::mutex> vl(vis_mtx);
                 for (const auto & ib : images)
@@ -1113,6 +1118,12 @@ int main(int argc, char ** argv) {
                         // final delta and finish with "tool_calls"
                         std::vector<ParsedToolCall> calls;
                         parse_tool_calls(st->text, calls);
+                        if (getenv("QWEN_LOG_RESPONSE")) {
+                            fprintf(stderr, "=== raw response ===\n%s\n=== parsed %zu tool call(s) ===\n",
+                                    st->text.c_str(), calls.size());
+                            for (auto & c : calls)
+                                fprintf(stderr, "  %s args=%s\n", c.name.c_str(), c.arguments.c_str());
+                        }
                         std::string ev;
                         // "length" when generation was cut by the token budget or
                         // the context limit (e.g. a tool call's big content arg got
@@ -1428,6 +1439,12 @@ int main(int argc, char ** argv) {
         // tool calls: parse the output; strip the blocks from content if any
         std::vector<ParsedToolCall> calls;
         const std::string content = parse_tool_calls(text, calls);
+        if (getenv("QWEN_LOG_RESPONSE")) {
+            fprintf(stderr, "=== raw response ===\n%s\n=== parsed %zu tool call(s) ===\n",
+                    text.c_str(), calls.size());
+            for (auto & c : calls)
+                fprintf(stderr, "  %s args=%s\n", c.name.c_str(), c.arguments.c_str());
+        }
         json msg = {{"role", "assistant"}};
         msg["content"] = calls.empty() ? text : content;
         if (!calls.empty()) {
