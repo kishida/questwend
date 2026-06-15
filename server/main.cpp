@@ -1114,7 +1114,14 @@ int main(int argc, char ** argv) {
                         std::vector<ParsedToolCall> calls;
                         parse_tool_calls(st->text, calls);
                         std::string ev;
-                        const char * fr = "stop";
+                        // "length" when generation was cut by the token budget or
+                        // the context limit (e.g. a tool call's big content arg got
+                        // truncated before its closing tags, so it could not be
+                        // parsed) -> clients retry/extend instead of treating a
+                        // partial reply as complete.
+                        const bool truncated = calls.empty() &&
+                            (st->generated >= st->max_tokens || rt->n_past() + 1 >= n_ctx);
+                        const char * fr = truncated ? "length" : "stop";
                         if (!calls.empty()) {
                             json tcs = json::array();
                             for (size_t k = 0; k < calls.size(); ++k)
@@ -1431,11 +1438,14 @@ int main(int argc, char ** argv) {
                                              {"arguments", calls[k].arguments}}}});
             msg["tool_calls"] = tcs;
         }
+        const bool truncated = calls.empty() &&
+            (generated >= max_tokens || rt->n_past() + 1 >= n_ctx);
+        const char * fr = !calls.empty() ? "tool_calls" : (truncated ? "length" : "stop");
         json resp = {
             {"id", id}, {"object", "chat.completion"}, {"model", model_id},
             {"choices", json::array({
                 {{"index", 0}, {"message", msg},
-                 {"finish_reason", calls.empty() ? "stop" : "tool_calls"}}})},
+                 {"finish_reason", fr}}})},
             {"usage", {{"prompt_tokens", n_prompt_full},
                        {"completion_tokens", generated},
                        {"total_tokens", n_prompt_full + generated}}},
