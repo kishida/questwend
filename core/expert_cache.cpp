@@ -20,6 +20,12 @@
 #include <unistd.h>
 #endif
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace questwend {
 
 #ifdef __APPLE__
@@ -33,6 +39,36 @@ static bool ptr_is_mapped(const void * p) {
     char vec = 0;
     void * al = (void *) ((uintptr_t) p & ~(uintptr_t) (pg - 1));
     return mincore(al, pg, &vec) == 0;
+}
+#endif
+
+#ifdef _WIN32
+// Positioned read with FILE_FLAG_NO_BUFFERING semantics: offset, length and
+// buffer must be sector-aligned, so read the covering aligned range into an
+// (over-allocated) aligned staging vector and copy the slab out. Bypasses the
+// OS page cache — true SSD reads even when the GGUF fits in RAM.
+static bool win_direct_read(void * h, void * dst, size_t nbytes, uint64_t off,
+                            std::vector<uint8_t> & abuf) {
+    const uint64_t SEC = 4096;
+    const uint64_t a0   = off & ~(SEC - 1);
+    const uint64_t a1   = (off + nbytes + SEC - 1) & ~(SEC - 1);
+    const size_t   alen = (size_t) (a1 - a0);
+    if (abuf.size() < alen + SEC) abuf.resize(alen + SEC);
+    uint8_t * ap = (uint8_t *) (((uintptr_t) abuf.data() + SEC - 1) & ~(uintptr_t) (SEC - 1));
+    OVERLAPPED ov{};
+    ov.Offset     = (DWORD) (a0 & 0xffffffffull);
+    ov.OffsetHigh = (DWORD) (a0 >> 32);
+    DWORD got = 0;
+    if (!ReadFile((HANDLE) h, ap, (DWORD) alen, &got, &ov)) return false;
+    if ((uint64_t) got + a0 < off + nbytes) return false;   // short read (EOF)
+    memcpy(dst, ap + (off - a0), nbytes);
+    return true;
+}
+
+static void * win_direct_open(const std::string & path) {
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
+    return h == INVALID_HANDLE_VALUE ? nullptr : (void *) h;
 }
 #endif
 
@@ -70,6 +106,12 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
             int v = atoi(e);
             if (v >= 1 && v <= 64) prefetch_threads_ = v;
         }
+#ifdef _WIN32
+        if (getenv("QWEN_SSD_DIRECT")) {
+            direct_ = true;
+            fprintf(stderr, "expert cache: direct (unbuffered) SSD reads — OS page cache bypassed\n");
+        }
+#endif
         for (int r = 0; r < N_ROLE; ++r) {
             foff_[r].assign(n_layer, 0);
             fpath_[r].assign(n_layer, std::string());
@@ -175,6 +217,9 @@ ExpertCache::~ExpertCache() {
 #ifdef __APPLE__
     for (auto & kv : fds_) if (kv.second >= 0) close(kv.second);
 #endif
+#ifdef _WIN32
+    for (auto & kv : hfiles_) if (kv.second) CloseHandle((HANDLE) kv.second);
+#endif
     if (stage_buf_) ggml_backend_buffer_free(stage_buf_);
     if (buf_) ggml_backend_buffer_free(buf_);
     if (ctx_) ggml_free(ctx_);
@@ -218,6 +263,13 @@ int ExpertCache::min_slots() const {
     return m;
 }
 
+int ExpertCache::capacity(int layer) const {
+    int m = pools_[layer_pool_[0][layer]].n_slots;
+    for (int r = 1; r < N_ROLE; ++r)
+        m = std::min(m, pools_[layer_pool_[r][layer]].n_slots);
+    return m;
+}
+
 // Copy one expert's slab from the slower tier into a VRAM slot.
 // This is the tiering seam: RAM (tensor_get) vs SSD (pread from the GGUF file).
 void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst, int slot) {
@@ -251,6 +303,15 @@ void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst
 #endif
         // SSD tier: read the slab into a pinned staging buffer, then H2D from it.
         void * stage = stage_host(nb2);
+#ifdef _WIN32
+        if (direct_) {
+            void *& hv = hfiles_[fpath_[role][layer]];
+            if (!hv) hv = win_direct_open(fpath_[role][layer]);
+            if (!hv || !win_direct_read(hv, stage, nb2, off, abuf_))
+                throw std::runtime_error("ExpertCache: direct SSD read failed");
+            hsrc = stage;
+        } else {
+#endif
         void *& fp = files_[fpath_[role][layer]];
         if (!fp) {
             fp = (void *) fopen(fpath_[role][layer].c_str(), "rb");
@@ -265,6 +326,9 @@ void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst
             fread(stage, 1, nb2, f) != nb2)
             throw std::runtime_error("ExpertCache: SSD pread failed");
         hsrc = stage;
+#ifdef _WIN32
+        }
+#endif
     } else {
         // RAM tier: the expert weights live in a (pinned) CPU buffer -> H2D straight
         // from the source, no intermediate staging copy.
@@ -329,6 +393,7 @@ int ExpertCache::reserve_victim(Pool & pool, int key) {
 void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
     const int n = (int) jobs.size();
     if (n == 0) return;
+    const auto t0 = std::chrono::steady_clock::now();
 
     std::vector<std::vector<uint8_t>> stage(n);
     std::atomic<bool> ok{true};
@@ -339,11 +404,24 @@ void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
 #ifdef __APPLE__
         std::unordered_map<std::string, int> tfd;     // per-thread fd cache (direct path)
 #endif
+#ifdef _WIN32
+        std::unordered_map<std::string, void *> th;   // per-thread HANDLE cache (direct path)
+        std::vector<uint8_t> tabuf;                   // per-thread aligned staging
+#endif
         for (int j = tid; j < n; j += nthreads) {
             const FetchJob & job = jobs[j];
             const size_t nb2 = job.pool->t->nb[2];
             const std::string & path = fpath_[job.role][layer];
             const size_t off = foff_[job.role][layer] + (size_t) job.expert * nb2;
+#ifdef _WIN32
+            if (direct_) {
+                void *& hv = th[path];
+                if (!hv) hv = win_direct_open(path);
+                stage[j].resize(nb2);
+                if (!hv || !win_direct_read(hv, stage[j].data(), nb2, off, tabuf)) ok = false;
+                continue;
+            }
+#endif
 #ifdef __APPLE__
             if (job.pool->host) {
                 auto it = tfd.find(path);
@@ -370,6 +448,9 @@ void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
 #ifdef __APPLE__
         for (auto & kv : tfd) if (kv.second >= 0) close(kv.second);
 #endif
+#ifdef _WIN32
+        for (auto & kv : th) if (kv.second) CloseHandle((HANDLE) kv.second);
+#endif
     };
 
     std::vector<std::thread> ts;
@@ -380,10 +461,13 @@ void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
     if (!ok) throw std::runtime_error("ExpertCache: parallel SSD read failed");
 
     for (int j = 0; j < n; ++j) {
+        stats_.fetch_bytes += jobs[j].pool->t->nb[2];
         if (jobs[j].pool->host) continue;   // already written in place
         ggml_tensor * dst = jobs[j].pool->t;
         ggml_backend_tensor_set(dst, stage[j].data(), (size_t) jobs[j].slot * dst->nb[2], stage[j].size());
     }
+    stats_.fetch_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
 }
 
 bool ExpertCache::resident(Role role, int layer, int expert) const {

@@ -369,6 +369,16 @@ function showStats(el, t){
 </html>
 )HTML";
 
+// CLI aliases for the offload tuning knobs (the runtime reads them as QWEN_*
+// env vars; the flag and the env var are equivalent, the flag wins if both).
+static void set_knob(const char * env, const char * val) {
+#ifdef _WIN32
+    _putenv_s(env, val);
+#else
+    setenv(env, val, /*overwrite=*/1);
+#endif
+}
+
 int main(int argc, char ** argv) {
     std::string model_path;
     int  port  = 8080;
@@ -407,6 +417,13 @@ int main(int argc, char ** argv) {
         else if (a == "--cache-slots-dir" && i + 1 < argc) cache_slots_dir = argv[++i];
         else if (a == "--time-slice" && i + 1 < argc) time_slice = std::stoi(argv[++i]);
         else if (a == "--cpu")              force_cpu = true;
+        else if (a == "--resident-decode")  set_knob("QWEN_RESIDENT_DECODE", "1");
+        else if (a == "--resident-refill" && i + 1 < argc) set_knob("QWEN_RESIDENT_REFILL", argv[++i]);
+        else if (a == "--resident-warmup" && i + 1 < argc) set_knob("QWEN_RESIDENT_WARMUP", argv[++i]);
+        else if (a == "--prefill-prune" && i + 1 < argc)   set_knob("QWEN_PREFILL_PRUNE", argv[++i]);
+        else if (a == "--batch-chunk" && i + 1 < argc)     set_knob("QWEN_BATCH_CHUNK", argv[++i]);
+        else if (a == "--pf-chunk" && i + 1 < argc)        set_knob("QWEN_PF_CHUNK", argv[++i]);
+        else if (a == "--ssd-direct")       set_knob("QWEN_SSD_DIRECT", "1");
         else {
             // unknown flag, or a known flag missing its value (e.g. a typo like
             // --time-clice): fail loudly instead of silently ignoring it
@@ -434,7 +451,16 @@ int main(int argc, char ** argv) {
             "  --cache-slots <N>   extra prompt-cache slots for interleaved conversations (default 0)\n"
             "  --cache-slots-dir <dir>  store the slots on disk instead of RAM (persists across restarts)\n"
             "  --time-slice <N>    interleave concurrent streaming requests every N tokens (default 0 = serialize)\n"
-            "  --cpu               force CPU backend\n", argv[0]);
+            "  --cpu               force CPU backend\n"
+            "offload tuning (equivalent to the QWEN_* env vars; flag wins):\n"
+            "  --resident-decode   resident-only routing decode: fused graph, no per-token miss\n"
+            "                      (lossy; auto-warmup + background refill keep quality)\n"
+            "  --resident-refill <N>  refilled experts per token while masked (default: RAM 8, SSD 2; 0 = frozen)\n"
+            "  --resident-warmup <N>  decode tokens before the mask locks in (default 16)\n"
+            "  --prefill-prune <eps>  skip fetching low-router-mass experts in prefill (lossy; e.g. 0.05)\n"
+            "  --batch-chunk <N>   prefill chunk length in tokens (default 4096)\n"
+            "  --pf-chunk <N>      server prefill slice (disconnect-abort granularity, default 4096)\n"
+            "  --ssd-direct        unbuffered SSD reads (bypass the OS page cache; with --experts-ssd)\n", argv[0]);
         return 1;
     }
 
@@ -1201,12 +1227,19 @@ int main(int argc, char ** argv) {
                             return covr;
                         };
                         // prefill slice unit: token slices would be too fine (batch
-                        // efficiency), so prefill works in coarser chunks. Even
-                        // without time-slicing we chunk (default 512) so a client
-                        // disconnect is noticed between chunks instead of after
-                        // the whole (possibly minutes-long) prefill.
+                        // efficiency), so prefill works in coarser chunks; a client
+                        // disconnect is noticed between chunks instead of after the
+                        // whole prefill. With expert offload, per-chunk expert fetch
+                        // is amortized over the chunk (layer-major prefill), so
+                        // bigger chunks = less streaming: 4096 by default (~10s of
+                        // disconnect-abort latency), QWEN_PF_CHUNK to tune.
+                        static const size_t pf_chunk_plain = []{
+                            const char * c = getenv("QWEN_PF_CHUNK");
+                            const int v = c ? atoi(c) : 0;
+                            return (size_t) (v >= 1 ? v : 4096);
+                        }();
                         const size_t pf_chunk = time_slice > 0
-                            ? (size_t) std::max(time_slice, 256) : (size_t) 512;
+                            ? (size_t) std::max(time_slice, 256) : pf_chunk_plain;
 
                         // ---- MTP self-speculative decode: one time slice per provider
                         // call (the whole run when --time-slice is off / uncontended) ----

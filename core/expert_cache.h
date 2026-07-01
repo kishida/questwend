@@ -63,6 +63,9 @@ public:
 
     int n_expert() const { return n_expert_; }
     int min_slots() const;   // smallest pool capacity (bounds a safe prefill batch)
+    // Slot capacity serving `layer` (min over roles): one ensure() call must not
+    // reference more distinct experts than this, or it evicts its own slots.
+    int capacity(int layer) const;
 
     // Is (layer,expert) currently resident in the role's pool?
     bool resident(Role role, int layer, int expert) const;
@@ -120,6 +123,10 @@ private:
     ggml_backend_buffer_t buf_ = nullptr;
 
     bool  ssd_  = false;
+    bool  direct_ = false;                    // Windows: FILE_FLAG_NO_BUFFERING reads
+                                              // (bypass the OS page cache; QWEN_SSD_DIRECT)
+    std::unordered_map<std::string, void *> hfiles_;  // path -> HANDLE (direct, main thread)
+    std::vector<uint8_t> abuf_;               // aligned staging for direct reads (main thread)
     int   prefetch_threads_ = 1;              // parallel SSD read workers
     std::vector<size_t>      foff_[N_ROLE];   // file offset of expert tensor (role,layer)
     std::vector<std::string> fpath_[N_ROLE];  // shard file of expert tensor (role,layer)

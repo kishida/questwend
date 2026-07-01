@@ -116,6 +116,22 @@ qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15000 --cache-profile hot.prof
 - `--experts-ssd`: エキスパートをディスクからストリーミング（RAM に載らない巨大モデル向け）。
 - `--cache-profile <file>`: ホットエキスパートの頻度プロファイルを永続化。**同一/類似ワークロードで hit 率が ~100% になり、ストリーミングがほぼ消えて大幅高速化**。
 
+prefill は **layer-major 実行**（層ごとにエキスパートを一度だけ fetch して全トークンを処理）が既定で、
+旧方式比 RAM 階層 ~4倍 / SSD 階層 ~8倍。さらに速度を求めるときの調整ノブ（いずれも lossy または挙動変更、
+計測は [`prefill_layer_major.md`](prefill_layer_major.md)）:
+
+- `--resident-decode`: **decode を常駐エキスパート限定ルーティングの融合単一グラフで実行**。
+  数トークンのウォームアップ後にルーターを常駐集合へマスクし、以後ミスなし
+  （検証・状態バックアップ・フォールバックも消える）。「本来選びたかった」エキスパートは
+  毎トークン裏で補充されマスクに合流するので、話題の変化にも数トークン遅れで追従する。
+  実測: RAM 階層 20.8 → 36〜45 tok/s、SSD 階層 3.1 → 25 tok/s（真のSSD読み時）。lossy。
+- `--resident-refill <N>`: 補充するエキスパート数/トークン（既定 RAM 8 / SSD 2、`0` で完全凍結=非推奨）。
+- `--resident-warmup <N>`: マスク固定までの decode トークン数（既定 16）。
+- `--prefill-prune <eps>`: prefill で router 重み合計が層の eps 未満の非常駐エキスパートの fetch を
+  スキップ（例 `0.05`。SSD 階層で特に有効）。lossy。
+- `--ssd-direct`: SSD 読みで OS のページキャッシュをバイパス（Windows, unbuffered I/O）。
+  モデルが RAM に収まらない場合の実性能を測るとき・二重キャッシュを避けたいときに。
+
 ### MTP 自己推測デコード（nextn ブロックを持つモデル）
 
 ```bash
@@ -158,6 +174,8 @@ qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15000
 | `--cache-slots-dir <dir>` | スロットの退避先を RAM ではなくディスクにする（再起動後もキャッシュが残る） |
 | `--time-slice <N>` | 同時ストリーミングを N トークンごとに交互実行（既定 0 = 完全直列） |
 | `--cpu` | CPU バックエンドを強制 |
+| `--resident-decode` ほか | オフロード調整ノブ（`--resident-refill/-warmup`, `--prefill-prune`, `--batch-chunk`, `--ssd-direct`; CLI と共通、上のオフロード節を参照） |
+| `--pf-chunk <N>` | サーバー prefill のスライス長（切断検出の粒度; 既定 4096） |
 
 > 画像は OpenAI 形式（`content` 配列の `image_url` に base64 data URI）で受け付け。ブラウザ UI にも 📎 ボタンあり。MTP 有効時もそのまま画像入力可。
 > mmproj をロードすると vision tower の GPU 使用分（重み + 計算バッファ; 起動時にログ表示）が `--vram-budget` から自動で差し引かれる。Metal の作業セット上限いっぱいに budget を張っていても OOM しない。テキストのみで使うときは `--no-mmproj` でその分を expert キャッシュに戻せる。
@@ -215,11 +233,21 @@ qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40000 --e
 | 変数 | 効果 |
 |---|---|
 | `QWEN_NO_BATCH_PREFILL=1` | SSD 階層の prefill を旧来の token-by-token に戻す（既定はバッチチャンク実行） |
-| `QWEN_BATCH_CHUNK=N` | バッチ prefill のチャンク長を固定（既定はプールサイズから自動、最大 256） |
+| `QWEN_BATCH_CHUNK=N` | オフロード prefill のチャンク長（既定 4096; layer-major で expert 転送はチャンク数に比例） |
+| `QWEN_SEGA_CHUNK=N` | layer-major prefill の attention サブチャンク長（既定 256; これ以下の T は旧・融合経路） |
+| `QWEN_SEGB_SLICE=N` | layer-major prefill の FFN スライス上限トークン数（既定 1024; MoE 活性メモリの上限） |
+| `QWEN_PREFILL_STATS=1` | prefill のチャンク×層ごとの expert 和集合 / fetch 量 / スライス数を stderr に表示 |
+| `QWEN_PREFILL_PRUNE=eps` | = `--prefill-prune`（prefill の質量ベース expert pruning; lossy） |
+| `QWEN_RESIDENT_DECODE=1` | = `--resident-decode`（常駐限定ルーティング decode; lossy） |
+| `QWEN_RESIDENT_MIN=N` | マスク発動に必要な層あたり常駐数（既定 32; 揃わない層はウォームアップ継続） |
+| `QWEN_RESIDENT_WARMUP=N` | = `--resident-warmup`（この decode トークン数の後は常駐数を問わず固定; 既定 16） |
+| `QWEN_RESIDENT_REFILL=N` | = `--resident-refill`（マスク中の補充 expert 数/トークン; 既定 RAM 8 / SSD 2, 0=凍結） |
+| `QWEN_SSD_DIRECT=1` | = `--ssd-direct`（Windows: unbuffered read でページキャッシュをバイパス） |
+| `QWEN_PF_CHUNK=N` | = `--pf-chunk`（サーバー prefill のスライス長; 既定 4096） |
 | `QWEN_PREFILL_CHUNK=N` | 常駐／RAM階層 build_graph prefill のチャンク長（既定 512） |
 | `QWEN_CPU_PREFILL=1` | RAM 階層の prefill をエキスパート CPU 実行（sched）に戻す（既定は GPU キャッシュ経路。GPU が遊ぶ代わりに H2D 転送を省く旧挙動） |
 | `QWEN_MTP_NO_BATCH_PREFILL=1` | MTP の prefill を旧来の token-by-token に戻す（既定はバッチ。画像入力時はバッチ強制） |
-| `QWEN_FASTCACHE=1` | 楽観単一グラフデコード（全 expert 常駐前提 + ミス時フォールバック; 実験的） |
+| `QWEN_FASTCACHE=1` | 楽観単一グラフデコード（全 expert 常駐前提 + ミス時フォールバック; `--resident-decode` のマスク無し版） |
 | `QWEN_GDN_TEST=1` | GDN の multi-token / token-by-token 等価性チェックを実行して終了 |
 | `QWEN_MTP_TEST=1` | MTP の draft 受理率計測モード（`--mtp` なしでも nextn を常駐させる） |
 | `QWEN_MTP_NOACCEPT=1` | MTP の draft 受理を強制無効化（= 出力は plain と一致するはず。ロスレス確認用） |
@@ -231,6 +259,7 @@ qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40000 --e
 - [`docs/mtp.md`](docs/mtp.md) — MTP（自己推測デコード）の実装・評価・ベンチ
 - [`docs/metal_unified_memory.md`](docs/metal_unified_memory.md) — 48GB Mac で 122B-A10B を動かすチューニング記録（Metal / ユニファイドメモリ / ゼロコピー SSD 読み）
 - [`offload_optimize.md`](offload_optimize.md) — エキスパート・オフロードの高速化（pinned/async/グラフ融合）実測ログ
+- [`prefill_layer_major.md`](prefill_layer_major.md) — layer-major prefill / expert pruning / 常駐限定 decode の設計・実測・落とし穴（2026-07）
 - [`docs/gpu_performance_guide.md`](docs/gpu_performance_guide.md) — GPU パフォーマンス指針
 
 ---

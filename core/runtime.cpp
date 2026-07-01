@@ -10,6 +10,7 @@
 #include <memory>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -73,6 +74,25 @@ struct Runtime::Impl {
     // miss, restore recurrent state and fall back to the slow decode_cached.
     bool                  cache_fast_build   = false;   // set while building the fast graph
     bool                  cache_fast_enabled = false;    // experimental; opt-in via QWEN_FASTCACHE
+    // Resident-only routing (QWEN_RESIDENT_DECODE): a per-layer bias added to
+    // the router logits (-inf for non-resident experts) makes every selection a
+    // cache hit by construction, so the single fused graph never misses — no
+    // verify readback, no state backup, no fallback. Lossy: the router is
+    // restricted to the experts the prefill/profile left resident.
+    bool                  resident_decode = false;
+    ggml_tensor *         resmask_all = nullptr;  // [n_expert, n_layer] f32 (0 / -inf)
+    std::vector<float>    resmask_host;
+    // Background refill: the fused graph also records what the *unmasked*
+    // router would have picked (want_all); wanted-but-absent experts are
+    // fetched off the critical path (budget per token) and join the mask on
+    // the next token, so the frozen palette tracks topic drift.
+    ggml_tensor *         want_all = nullptr;     // [n_used, n_layer] i32 (unmasked top-k)
+    std::vector<int32_t>  want_host;
+    int                   refill_cursor = 0;      // round-robin layer scan position
+    uint64_t              fast_remap_stamp = ~0ull; // residency version the mask/g2s uploads reflect
+    bool                  fast_mask_complete = false;
+    int                   fast_warm_tokens = 0;     // fast-path decode calls so far (warmup deadline)
+    int                   fast_last_floor = -1;     // palette floor the current mask was built with
     ggml_tensor *         g2s_all = nullptr;  // [1, n_expert, 3*n_layer] i32  (host-filled remap)
     ggml_tensor *         sel_all = nullptr;  // [n_used, n_layer]        i32  (selected readback)
     ggml_context *        f_ctx    = nullptr;
@@ -281,9 +301,11 @@ struct Runtime::Impl {
     int fill_rope_pos(std::vector<int32_t> & dst, int n_tokens, int rope_start);
     int fill_rope_pos_spans(std::vector<int32_t> & dst, int n_tokens, int rope_start,
                             const Runtime::EmbdOverride * spans, int n_spans);
+    // kv_pos: KV-cache write position for this batch (-1 = n_past). Sub-chunked
+    // prefill passes n_past+offset so a layer's chunks land consecutively.
     ggml_tensor * build_attn(ggml_context * ctx, ggml_cgraph * gf, int il,
                              ggml_tensor * Q, ggml_tensor * K, ggml_tensor * V,
-                             ggml_tensor * mask, int n_tokens, int n_kv);
+                             ggml_tensor * mask, int n_tokens, int n_kv, int kv_pos = -1);
     ggml_tensor * build_gdn(ggml_context * ctx, ggml_cgraph * gf, int il,
                             ggml_tensor * x, int n_tokens);
     ggml_tensor * build_moe(ggml_context * ctx, ggml_cgraph * gf, int il,
@@ -516,6 +538,10 @@ void Runtime::Impl::init_cache() {
     p_slot_d  = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, 1);
     g2s_all   = ggml_new_tensor_3d(cctx, GGML_TYPE_I32, 1, hp.n_expert, 3 * hp.n_layer);
     sel_all   = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, hp.n_layer);
+    resmask_all = ggml_new_tensor_2d(cctx, GGML_TYPE_F32, hp.n_expert, hp.n_layer);
+    ggml_set_name(resmask_all, "carry.resmask");
+    want_all = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, hp.n_layer);
+    ggml_set_name(want_all, "carry.want");
     ggml_set_name(p_h, "carry.h");
     ggml_set_name(p_ffn_in, "carry.ffn_in");
     ggml_set_name(p_resid, "carry.resid");
@@ -536,8 +562,11 @@ void Runtime::Impl::init_cache() {
 
     g2s_host.assign((size_t) 3 * hp.n_layer * hp.n_expert, 0);
     sel_host.assign((size_t) n_used * hp.n_layer, 0);
+    resmask_host.assign((size_t) hp.n_layer * hp.n_expert, 0.0f);
+    want_host.assign((size_t) n_used * hp.n_layer, 0);
 
     if (getenv("QWEN_FASTCACHE")) cache_fast_enabled = true;   // experimental single-graph path
+    if (getenv("QWEN_RESIDENT_DECODE")) { cache_fast_enabled = true; resident_decode = true; }
 
     init_state_backup();   // GDN rollback buffers (speculative miss / MTP reject)
 
@@ -618,7 +647,8 @@ int Runtime::Impl::fill_rope_pos_spans(std::vector<int32_t> & dst, int n_tokens,
 // ---- gated attention (shared by qwen3 plain and qwen35 gated paths) ----
 ggml_tensor * Runtime::Impl::build_attn(ggml_context * ctx, ggml_cgraph * gf, int il,
         ggml_tensor * Q, ggml_tensor * K, ggml_tensor * V,
-        ggml_tensor * mask, int n_tokens, int n_kv) {
+        ggml_tensor * mask, int n_tokens, int n_kv, int kv_pos) {
+    if (kv_pos < 0) kv_pos = n_past;
     const auto & hp = model.hparams();
     const int n_head      = hp.n_head;
     const int n_head_kv   = hp.n_head_kv;
@@ -635,10 +665,10 @@ ggml_tensor * Runtime::Impl::build_attn(ggml_context * ctx, ggml_cgraph * gf, in
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_cache[il], Vflat, d_kvidx));
     } else {
         ggml_tensor * k_dst = ggml_view_2d(ctx, k_cache[il], n_embd_gqa, n_tokens,
-                                           k_cache[il]->nb[1], (size_t) n_past * k_cache[il]->nb[1]);
+                                           k_cache[il]->nb[1], (size_t) kv_pos * k_cache[il]->nb[1]);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, Kflat, k_dst));
         ggml_tensor * v_dst = ggml_view_2d(ctx, v_cache[il], n_embd_gqa, n_tokens,
-                                           v_cache[il]->nb[1], (size_t) n_past * v_cache[il]->nb[1]);
+                                           v_cache[il]->nb[1], (size_t) kv_pos * v_cache[il]->nb[1]);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, Vflat, v_dst));
     }
 
@@ -802,6 +832,19 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
     const int n_used  = hp.n_expert_used;
 
     ggml_tensor * logits = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp.weight", il), x); // [n_exp, n_tokens]
+    if (cache_fast_build && resident_decode) {
+        // record the unmasked router preference (top-k of the raw logits) so
+        // the host can refill wanted-but-absent experts in the background
+        ggml_tensor * want = ggml_argsort_top_k(ctx, logits, n_used);      // [n_used, 1]
+        ggml_tensor * want_col = ggml_view_2d(ctx, want_all, n_used, 1,
+                                              want_all->nb[1], (size_t) il * want_all->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, want, want_col));
+        // resident-only routing: bias non-resident experts to -inf before the
+        // softmax/top-k so the fused graph can never select a cache miss
+        ggml_tensor * rm = ggml_view_2d(ctx, resmask_all, n_exp, 1,
+                                        resmask_all->nb[1], (size_t) il * resmask_all->nb[1]);
+        logits = ggml_add(ctx, logits, rm);
+    }
     ggml_tensor * probs  = ggml_soft_max(ctx, logits);
 
     ggml_tensor * selected = ggml_argsort_top_k(ctx, probs, n_used);   // [n_used, n_tokens] i32
@@ -1808,8 +1851,9 @@ ggml_tensor * Runtime::Impl::build_moe_cached(ggml_context * ctx, ggml_cgraph * 
 // Batched prefill over the cache: run n_tokens through one segmented forward
 // (seg A attention/router for all tokens -> ensure the union of selected experts
 //  -> seg B expert matmuls for all tokens). Far fewer graph dispatches than the
-// token-by-token path. n_tokens is bounded so a layer's distinct experts fit the
-// pool. Only the last token's logits are produced (when want_logits).
+// token-by-token path. n_tokens is bounded by activation memory only: a layer
+// whose selection union exceeds its pool capacity runs seg B in token slices.
+// Only the last token's logits are produced (when want_logits).
 void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool want_logits,
                                         bool verify,
                                         const Runtime::EmbdOverride * ovr, int n_ovr) {
@@ -1884,69 +1928,78 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     ggml_tensor * carry_res[2] = { resid_b,   resid_b2   };
     ggml_tensor * carry_wgt[2] = { weights_b, weights_b2 };
 
-    // Append seg A (attention/GDN + router, all T tokens) for layer `il`; writes
-    // the layer's parity carry and exposes `selected` for host readback.
-    auto build_segA = [&](ggml_context * ctx, ggml_cgraph * gf, int il) -> ggml_tensor * {
+    // Append seg A (attention/GDN + router) for layer `il` over the token slice
+    // [tc0, tc0+tlen) of the chunk; writes that slice of the layer's parity carry
+    // and exposes `selected` ([n_used, tlen]) for host readback. Attention KV
+    // lands at n_past+tc0 and the causal mask covers n_kv_c columns, so a layer's
+    // sub-chunks processed in order are equivalent to one full-chunk pass (GDN
+    // states likewise chain across sub-chunks).
+    auto build_segA = [&](ggml_context * ctx, ggml_cgraph * gf, int il, int tc0, int tlen) -> ggml_tensor * {
+        auto tslice = [&](ggml_tensor * t) {   // token-dim slice view [ne0, tlen]
+            return ggml_view_2d(ctx, t, t->ne[0], tlen, t->nb[1], (size_t) tc0 * t->nb[1]);
+        };
+        const int n_kv_c = n_past + tc0 + tlen;
         const bool recurrent = hp.is_recurrent(il);
         ggml_tensor * inp_pos = nullptr, * inp_mask = nullptr;
         if (!recurrent) {
-            inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rope_dim(T));
+            inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rope_dim(tlen));
             ggml_set_input(inp_pos);  ggml_set_name(inp_pos, "inp_pos");
-            inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, T);
+            inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv_c, tlen);
             ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
         }
 
-        ggml_tensor * cur = ggml_rms_norm(ctx, h_b, eps);
+        ggml_tensor * h_c = tslice(h_b);
+        ggml_tensor * cur = ggml_rms_norm(ctx, h_c, eps);
         cur = ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il));
 
         if (recurrent) {
-            cur = build_gdn(ctx, gf, il, cur, T);
+            cur = build_gdn(ctx, gf, il, cur, tlen);
         } else {
             ggml_tensor * Q, * K, * V, * gate_t = nullptr;
             if (gated) {
                 ggml_tensor * Qf = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur);
                 const size_t es = ggml_element_size(Qf);
-                Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head, T,
+                Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head, tlen,
                         es * n_embd_head * 2, es * n_embd_head * 2 * n_head, 0);
-                gate_t = ggml_view_3d(ctx, Qf, n_embd_head, n_head, T,
+                gate_t = ggml_view_3d(ctx, Qf, n_embd_head, n_head, tlen,
                         es * n_embd_head * 2, es * n_embd_head * 2 * n_head, es * n_embd_head);
-                gate_t = ggml_cont_2d(ctx, gate_t, n_embd_head * n_head, T);
+                gate_t = ggml_cont_2d(ctx, gate_t, n_embd_head * n_head, tlen);
                 K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
                 V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
-                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, T);
-                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, T);
+                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, tlen);
+                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, tlen);
             } else {
                 Q = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur);
                 K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
                 V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
-                Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head,    T);
-                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, T);
-                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, T);
+                Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head,    tlen);
+                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, tlen);
+                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, tlen);
             }
             Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il));
             K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il));
             Q = apply_rope(ctx, Q, inp_pos);
             K = apply_rope(ctx, K, inp_pos);
-            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, T, n_kv);
+            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, tlen, n_kv_c, n_past + tc0);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
         }
 
-        ggml_tensor * attn_resid = ggml_add(ctx, cur, h_b);          // [n_embd, T]
+        ggml_tensor * attn_resid = ggml_add(ctx, cur, h_c);          // [n_embd, tlen]
         ggml_tensor * ffn_in;
         if (gated) ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", il));
         else       ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il));
 
         // multi-token router
-        ggml_tensor * logits = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp.weight", il), ffn_in);  // [n_exp, T]
+        ggml_tensor * logits = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp.weight", il), ffn_in);  // [n_exp, tlen]
         ggml_tensor * probs   = ggml_soft_max(ctx, logits);
         // argsort_top_k returns a STRIDED view (nb[1] = n_exp*4); make it contiguous
-        // so the [n_used, T] host readback (ggml_backend_tensor_get) is not corrupted
+        // so the [n_used, tlen] host readback (ggml_backend_tensor_get) is not corrupted
         // for columns >= 1 (it ignores strides). Single-token path is T=1 so unaffected.
-        ggml_tensor * selected = ggml_cont(ctx, ggml_argsort_top_k(ctx, probs, n_used));  // [n_used, T]
-        ggml_tensor * probs3  = ggml_reshape_3d(ctx, probs, 1, n_exp, T);
-        ggml_tensor * weights = ggml_get_rows(ctx, probs3, selected);             // [1, n_used, T]
-        weights = ggml_reshape_2d(ctx, weights, n_used, T);
+        ggml_tensor * selected = ggml_cont(ctx, ggml_argsort_top_k(ctx, probs, n_used));  // [n_used, tlen]
+        ggml_tensor * probs3  = ggml_reshape_3d(ctx, probs, 1, n_exp, tlen);
+        ggml_tensor * weights = ggml_get_rows(ctx, probs3, selected);             // [1, n_used, tlen]
+        weights = ggml_reshape_2d(ctx, weights, n_used, tlen);
         ggml_tensor * wsum = ggml_sum_rows(ctx, weights);
         wsum = ggml_clamp(ctx, wsum, 6.103515625e-5f, INFINITY);
         weights = ggml_div(ctx, weights, wsum);
@@ -1955,26 +2008,31 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_set_output(selected);
         ggml_build_forward_expand(gf, selected);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, carry_ffn[il & 1]));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, carry_res[il & 1]));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, weights, carry_wgt[il & 1]));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, tslice(carry_ffn[il & 1])));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, tslice(carry_res[il & 1])));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, weights, tslice(carry_wgt[il & 1])));
         return selected;
     };
 
-    // Append seg B (batched expert matmuls + residual) for layer `il`; writes h_b.
-    // mul_mat_id takes the whole batch at once (ids [n_used, T]); the weighted
-    // sum over n_used mirrors build_moe's batched path.
-    auto build_segB = [&](ggml_context * ctx, ggml_cgraph * gf, int il) {
-        ggml_tensor * ffn_l = carry_ffn[il & 1];
-        ggml_tensor * x3   = ggml_reshape_3d(ctx, ffn_l, n_embd, 1, T);
-        ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3, slot_u_b);
-        ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3, slot_g_b);
+    // Append seg B (batched expert matmuls + residual) for layer `il`, over the
+    // token slice [t0, t0+len) of the chunk; writes the matching rows of h_b.
+    // mul_mat_id takes the slice at once (ids [n_used, len]); the weighted sum
+    // over n_used mirrors build_moe's batched path. The FFN is pointwise over
+    // tokens, so a slice sees exactly the tensors it would in a full pass.
+    auto build_segB = [&](ggml_context * ctx, ggml_cgraph * gf, int il, int t0, int len) {
+        auto tslice = [&](ggml_tensor * t) {   // token-dim slice view [ne0, len]
+            return ggml_view_2d(ctx, t, t->ne[0], len, t->nb[1], (size_t) t0 * t->nb[1]);
+        };
+        ggml_tensor * ffn_l = tslice(carry_ffn[il & 1]);
+        ggml_tensor * x3   = ggml_reshape_3d(ctx, ffn_l, n_embd, 1, len);
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3, tslice(slot_u_b));
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3, tslice(slot_g_b));
         ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
-        ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, slot_d_b); // [n_embd, n_used, T]
-        experts = ggml_mul(ctx, experts, ggml_reshape_3d(ctx, carry_wgt[il & 1], 1, n_used, T));
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, tslice(slot_d_b)); // [n_embd, n_used, len]
+        experts = ggml_mul(ctx, experts, ggml_reshape_3d(ctx, tslice(carry_wgt[il & 1]), 1, n_used, len));
         ggml_tensor * moe_out = nullptr;
         for (int i = 0; i < n_used; ++i) {
-            ggml_tensor * v = ggml_view_2d(ctx, experts, n_embd, T, experts->nb[2], (size_t) i * experts->nb[1]);
+            ggml_tensor * v = ggml_view_2d(ctx, experts, n_embd, len, experts->nb[2], (size_t) i * experts->nb[1]);
             moe_out = i ? ggml_add(ctx, moe_out, v) : v;
         }
         if (n_used == 1) moe_out = ggml_cont(ctx, moe_out);
@@ -1987,66 +2045,291 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             ggml_tensor * sgt = ggml_sigmoid(ctx, ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp_shexp.weight", il), ffn_l));
             moe_out = ggml_add(ctx, moe_out, ggml_mul(ctx, sh, sgt));
         }
-        ggml_tensor * h_new = ggml_add(ctx, moe_out, carry_res[il & 1]);         // [n_embd, T]
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, h_b));
+        ggml_tensor * h_new = ggml_add(ctx, moe_out, tslice(carry_res[il & 1]));  // [n_embd, len]
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, tslice(h_b)));
     };
 
-    // Set the attention pos/mask inputs of a graph (no-op for GDN-only graphs).
-    // M-RoPE positions use the chunk-relative image spans passed in ovr/n_ovr.
-    auto set_attn_inputs = [&](ggml_cgraph * gf) {
+    // Set the attention pos/mask inputs of a graph (no-op for GDN-only graphs)
+    // for the token slice [tc0, tc0+tlen). M-RoPE positions come from one
+    // whole-chunk fill (section-major layout: slice each of the 4 planes).
+    std::vector<int32_t> pos_all;
+    fill_rope_pos_spans(pos_all, T, mrope_next, ovr, n_ovr);
+    auto set_attn_inputs = [&](ggml_cgraph * gf, int tc0, int tlen) {
         if (ggml_tensor * ip = ggml_graph_get_tensor(gf, "inp_pos")) {
-            std::vector<int32_t> pos;
-            fill_rope_pos_spans(pos, T, mrope_next, ovr, n_ovr);
-            ggml_backend_tensor_set(ip, pos.data(), 0, pos.size() * sizeof(int32_t));
+            if (hp.use_mrope) {
+                std::vector<int32_t> pos((size_t) 4 * tlen);
+                for (int p = 0; p < 4; ++p)
+                    memcpy(pos.data() + (size_t) p * tlen,
+                           pos_all.data() + (size_t) p * T + tc0, (size_t) tlen * sizeof(int32_t));
+                ggml_backend_tensor_set(ip, pos.data(), 0, pos.size() * sizeof(int32_t));
+            } else {
+                ggml_backend_tensor_set(ip, pos_all.data() + tc0, 0, (size_t) tlen * sizeof(int32_t));
+            }
         }
         if (ggml_tensor * im = ggml_graph_get_tensor(gf, "inp_mask")) {
-            std::vector<ggml_fp16_t> mask((size_t) n_kv * T);
+            const int n_kv_c = n_past + tc0 + tlen;
+            std::vector<ggml_fp16_t> mask((size_t) n_kv_c * tlen);
             const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
-            for (int i = 0; i < T; ++i) {
-                const int abs_i = n_past + i;
-                for (int j = 0; j < n_kv; ++j)
-                    mask[(size_t) i * n_kv + j] = (j <= abs_i) ? z : ninf;
+            for (int i = 0; i < tlen; ++i) {
+                const int abs_i = n_past + tc0 + i;
+                for (int j = 0; j < n_kv_c; ++j)
+                    mask[(size_t) i * n_kv_c + j] = (j <= abs_i) ? z : ninf;
             }
             ggml_backend_tensor_set(im, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
         }
     };
 
-    // Read back layer `il`'s router selection, make the union of selected
-    // experts resident, and upload the slot ids for seg B.
-    auto ensure_layer = [&](ggml_tensor * selected, int il) {
-        ggml_backend_tensor_get(selected, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
-        ecache->ensure(il, sel.data(), n_used * T, sg.data(), su.data(), sd.data());
-        ggml_backend_tensor_set(slot_g_b, sg.data(), 0, (size_t) n_used * T * sizeof(int32_t));
-        ggml_backend_tensor_set(slot_u_b, su.data(), 0, (size_t) n_used * T * sizeof(int32_t));
-        ggml_backend_tensor_set(slot_d_b, sd.data(), 0, (size_t) n_used * T * sizeof(int32_t));
+    // QWEN_PREFILL_STATS=1 logs, per (chunk,layer), the distinct-expert union and
+    // the fetch cost of ensure() — diagnoses "traffic = n_chunks x full sweep".
+    static const bool pf_stats = getenv("QWEN_PREFILL_STATS") != nullptr;
+    static int      pf_chunk_id = 0;
+    const int       pf_chunk    = pf_chunk_id++;
+    struct { uint64_t miss = 0, bytes = 0; double ms = 0; int union_min = 1 << 30, union_max = 0; long union_sum = 0; }
+        pf_tot;
+    const auto pf_t0 = std::chrono::steady_clock::now();
+
+    // The chunk size T is bounded by activation memory, not by the expert pools:
+    // one ensure() call must not reference more distinct experts than the layer's
+    // pool capacity (it would evict its own slots), so when a layer's selection
+    // union exceeds it, seg B runs in token slices with ensure()+slot upload
+    // between slices. The FFN is pointwise over tokens, so slicing is lossless.
+    std::vector<std::pair<int, int>> slices;   // (t0, len) per seg-B pass
+    std::vector<uint8_t> seen((size_t) n_exp, 0);
+    int plan_union = 0;                        // distinct experts over the whole chunk (stats)
+    // Length cap per seg-B pass: bounds the [n_ff, n_used, len] MoE activations
+    // (a length-capped follow-up slice re-hits the same resident experts, so it
+    // costs no extra fetch traffic).
+    static const int max_slice = []{ const char * c = getenv("QWEN_SEGB_SLICE");
+                                     int v = c ? atoi(c) : 1024; return v < 1 ? 1024 : v; }();
+    auto plan_slices = [&](int il) {
+        slices.clear();
+        const int cap = std::max(n_used, ecache->capacity(il) - 8);
+        std::fill(seen.begin(), seen.end(), 0);
+        int distinct = 0, t0 = 0;
+        plan_union = 0;
+        std::vector<uint8_t> useen((size_t) n_exp, 0);
+        for (int t = 0; t < T; ++t) {
+            int nnew = 0;
+            for (int j = 0; j < n_used; ++j) {
+                const int e = sel[(size_t) t * n_used + j];
+                if (!useen[e]) { useen[e] = 1; ++plan_union; }
+                if (!seen[e])  { seen[e] = 1; ++nnew; }
+            }
+            if ((distinct + nnew > cap || t - t0 >= max_slice) && t > t0) {
+                slices.push_back({ t0, t - t0 });
+                std::fill(seen.begin(), seen.end(), 0);
+                distinct = 0; nnew = 0;
+                for (int j = 0; j < n_used; ++j) {
+                    const int e = sel[(size_t) t * n_used + j];
+                    if (!seen[e]) { seen[e] = 1; ++nnew; }
+                }
+                t0 = t;
+            }
+            distinct += nnew;
+        }
+        slices.push_back({ t0, T - t0 });
+    };
+
+    // Make the slice's selected experts resident and upload its slot-id rows.
+    auto ensure_slice = [&](int il, int t0, int len) {
+        const size_t off = (size_t) t0 * n_used;
+        ecache->ensure(il, sel.data() + off, n_used * len,
+                       sg.data() + off, su.data() + off, sd.data() + off);
+        const size_t ob = off * sizeof(int32_t), nb = (size_t) n_used * len * sizeof(int32_t);
+        ggml_backend_tensor_set(slot_g_b, sg.data() + off, ob, nb);
+        ggml_backend_tensor_set(slot_u_b, su.data() + off, ob, nb);
+        ggml_backend_tensor_set(slot_d_b, sd.data() + off, ob, nb);
     };
 
     const int N = (int) hp.n_main();
 
+    auto log_layer = [&](int il, int nsl, const ExpertCache::Stats & s0) {
+        if (!pf_stats) return;
+        const auto s1 = ecache->stats();
+        fprintf(stderr, "prefill-stats: chunk=%d T=%d layer=%d union=%d/%d slices=%d miss=%llu fetch_mb=%.1f fetch_ms=%.1f\n",
+                pf_chunk, T, il, plan_union, n_exp, nsl,
+                (unsigned long long) (s1.misses - s0.misses),
+                (double) (s1.fetch_bytes - s0.fetch_bytes) / (1024.0 * 1024.0),
+                s1.fetch_ms - s0.fetch_ms);
+        pf_tot.miss  += s1.misses - s0.misses;
+        pf_tot.bytes += s1.fetch_bytes - s0.fetch_bytes;
+        pf_tot.ms    += s1.fetch_ms - s0.fetch_ms;
+        pf_tot.union_min = std::min(pf_tot.union_min, plan_union);
+        pf_tot.union_max = std::max(pf_tot.union_max, plan_union);
+        pf_tot.union_sum += plan_union;
+    };
+
+    // Seg-A sub-chunk length for the layer-major path (bounds attention scores).
+    static const int sega_chunk = []{ const char * c = getenv("QWEN_SEGA_CHUNK");
+                                      int v = c ? atoi(c) : 256; return v < 1 ? 256 : v; }();
+
+    // ---- optional prefill expert pruning (QWEN_PREFILL_PRUNE=<eps>) ----
+    // Skip fetching non-resident experts whose aggregate router mass over the
+    // whole chunk is negligible: cheapest-first, until the dropped mass reaches
+    // eps of the layer's total. A dropped entry keeps its token slot (id remapped
+    // to the token's heaviest kept expert) with weight 0, and the token's kept
+    // weights are renormalized, so seg B computes the same weighted sum minus the
+    // dropped contributions. Lossy — quality knob, prefill only.
+    static const float prune_eps = []{ const char * c = getenv("QWEN_PREFILL_PRUNE");
+                                       return c ? (float) atof(c) : 0.0f; }();
+    std::vector<float> wgt_host;
+    auto prune_layer = [&](int il) {
+        if (prune_eps <= 0.0f) return;
+        wgt_host.resize((size_t) n_used * T);
+        ggml_backend_tensor_get(carry_wgt[il & 1], wgt_host.data(), 0, wgt_host.size() * sizeof(float));
+
+        std::vector<double> mass((size_t) n_exp, 0.0);
+        for (size_t k = 0; k < wgt_host.size(); ++k) mass[sel[k]] += wgt_host[k];
+        struct Cand { int e; double m; };
+        std::vector<Cand> cands;
+        double total = 0.0;
+        for (int e = 0; e < n_exp; ++e) {
+            if (mass[e] <= 0.0) continue;
+            total += mass[e];
+            const bool res = ecache->resident(ExpertCache::GATE, il, e) &&
+                             ecache->resident(ExpertCache::UP,   il, e) &&
+                             ecache->resident(ExpertCache::DOWN, il, e);
+            if (!res) cands.push_back({ e, mass[e] });
+        }
+        std::sort(cands.begin(), cands.end(),
+                  [](const Cand & a, const Cand & b) { return a.m < b.m; });
+        std::vector<uint8_t> drop((size_t) n_exp, 0);
+        double dropped = 0.0;
+        int n_drop = 0;
+        for (const auto & c : cands) {
+            if (dropped + c.m > (double) prune_eps * total) break;
+            drop[c.e] = 1; dropped += c.m; ++n_drop;
+        }
+        if (!n_drop) return;
+        // Replacement ids for dropped entries: kept selected experts (they are
+        // fetched for this layer anyway, so a zero-weight reference is free).
+        std::vector<int> fillers;
+        for (int e = 0; e < n_exp; ++e)
+            if (mass[e] > 0.0 && !drop[e]) fillers.push_back(e);
+        if (fillers.empty()) return;
+
+        // Replace each dropped entry with a distinct zero-weight resident filler:
+        // an id may not repeat within a token's row (duplicate ids corrupt the
+        // CUDA mul_mat_id expert bookkeeping), and a resident id costs no fetch.
+        int fi = 0;
+        for (int t = 0; t < T; ++t) {
+            float   * w = wgt_host.data() + (size_t) t * n_used;
+            int32_t * s = sel.data()      + (size_t) t * n_used;
+            float sum_all = 0.0f, sum_kept = 0.0f;
+            bool changed = false;
+            for (int j = 0; j < n_used; ++j) {
+                sum_all += w[j];
+                if (drop[s[j]]) { changed = true; continue; }
+                sum_kept += w[j];
+            }
+            if (!changed || sum_kept <= 0.0f)
+                continue;                  // untouched, or everything dropped: keep as-is
+            const float rescale = sum_all / sum_kept;
+            for (int j = 0; j < n_used; ++j) {
+                if (!drop[s[j]]) { w[j] *= rescale; continue; }
+                w[j] = 0.0f;
+                for (int tries = 0; tries < (int) fillers.size(); ++tries) {
+                    const int f = fillers[(fi + tries) % (int) fillers.size()];
+                    bool dup = false;
+                    for (int q = 0; q < n_used; ++q)
+                        if (q != j && s[q] == f) { dup = true; break; }
+                    if (!dup) {
+                        s[j] = f;
+                        fi = (fi + tries + 1) % (int) fillers.size();
+                        break;
+                    }
+                }   // no filler found (n_used > distinct residents): keep original id, weight 0
+            }
+        }
+        ggml_backend_tensor_set(carry_wgt[il & 1], wgt_host.data(), 0, wgt_host.size() * sizeof(float));
+        if (pf_stats)
+            fprintf(stderr, "prefill-prune: chunk=%d layer=%d dropped=%d mass=%.4f\n",
+                    pf_chunk, il, n_drop, total > 0.0 ? dropped / total : 0.0);
+    };
+
+    if (T > sega_chunk) {
+        // ---- Layer-major prefill: for each layer, run seg A over attention-sized
+        // token sub-chunks (KV/GDN state chains within the layer), then seg B once
+        // over the whole chunk (union-bounded slices). Each layer's expert union
+        // is fetched once per chunk regardless of chunk length, so expert traffic
+        // is amortized over all T tokens instead of per pool-sized mini-chunk.
+        for (int il = 0; il < N; ++il) {
+            for (int tc0 = 0; tc0 < T; tc0 += sega_chunk) {
+                const int tlen = std::min(sega_chunk, T - tc0);
+                ggml_context * ctx = new_ctx();
+                ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+                ggml_tensor * selected = build_segA(ctx, gf, il, tc0, tlen);
+                run(ctx, gf);
+                set_attn_inputs(gf, tc0, tlen);
+                if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+                    throw std::runtime_error("decode_cached_batch: seg A compute failed");
+                ggml_backend_tensor_get(selected, sel.data() + (size_t) tc0 * n_used, 0,
+                                        (size_t) n_used * tlen * sizeof(int32_t));
+                ggml_free(ctx);
+            }
+            prune_layer(il);
+            plan_slices(il);
+            const auto s0 = ecache->stats();
+            const int nsl = (int) slices.size();
+            for (int k = 0; k < nsl; ++k) {
+                const auto [st0, slen] = slices[k];
+                ensure_slice(il, st0, slen);
+                ggml_context * ctx = new_ctx();
+                ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+                build_segB(ctx, gf, il, st0, slen);
+                run(ctx, gf);
+                if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+                    throw std::runtime_error("decode_cached_batch: seg B compute failed");
+                ggml_free(ctx);
+            }
+            log_layer(il, nsl, s0);
+        }
+    } else {
     // seg A(0) on its own, then fuse segB(L)+segA(L+1) per step so each layer
     // boundary is a single GPU submit instead of two (mirrors decode_cached).
+    // A layer whose union overflows its pool runs extra unfused seg-B slices first.
     {
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-        ggml_tensor * selected = build_segA(ctx, gf, 0);
+        ggml_tensor * selected = build_segA(ctx, gf, 0, 0, T);
         run(ctx, gf);
-        set_attn_inputs(gf);
+        set_attn_inputs(gf, 0, T);
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("decode_cached_batch: seg A0 compute failed");
-        ensure_layer(selected, 0);
+        ggml_backend_tensor_get(selected, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
         ggml_free(ctx);
     }
     for (int il = 0; il < N; ++il) {
-        ggml_context * ctx = new_ctx();
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-        build_segB(ctx, gf, il);
-        ggml_tensor * nsel = (il + 1 < N) ? build_segA(ctx, gf, il + 1) : nullptr;
-        run(ctx, gf);
-        set_attn_inputs(gf);
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
-            throw std::runtime_error("decode_cached_batch: fused segB/segA compute failed");
-        if (nsel) ensure_layer(nsel, il + 1);
-        ggml_free(ctx);
+        plan_slices(il);
+        const auto s0 = ecache->stats();
+        const int nsl = (int) slices.size();
+        for (int k = 0; k < nsl; ++k) {
+            const auto [st0, slen] = slices[k];
+            ensure_slice(il, st0, slen);
+            ggml_context * ctx = new_ctx();
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+            build_segB(ctx, gf, il, st0, slen);
+            ggml_tensor * nsel = (k == nsl - 1 && il + 1 < N) ? build_segA(ctx, gf, il + 1, 0, T) : nullptr;
+            run(ctx, gf);
+            set_attn_inputs(gf, 0, T);
+            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+                throw std::runtime_error("decode_cached_batch: fused segB/segA compute failed");
+            if (nsel)
+                ggml_backend_tensor_get(nsel, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
+            ggml_free(ctx);
+        }
+        log_layer(il, nsl, s0);
+    }
+    }
+
+    if (pf_stats) {
+        const double wall_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - pf_t0).count();
+        fprintf(stderr, "prefill-stats: chunk=%d SUMMARY T=%d layers=%d union_min=%d union_avg=%.1f union_max=%d/%d "
+                        "miss=%llu fetch_mb=%.1f fetch_ms=%.1f wall_ms=%.1f fetch_frac=%.2f\n",
+                pf_chunk, T, N, pf_tot.union_min, (double) pf_tot.union_sum / N, pf_tot.union_max, n_exp,
+                (unsigned long long) pf_tot.miss, (double) pf_tot.bytes / (1024.0 * 1024.0),
+                pf_tot.ms, wall_ms, pf_tot.ms / (wall_ms > 0 ? wall_ms : 1));
     }
 
     // MTP batched prefill: append every token's final hidden (pre-output-norm)
@@ -2452,6 +2735,42 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
             }
         ggml_backend_tensor_set(g2s_all, g2s_host.data(), 0, g2s_host.size() * sizeof(int32_t));
     };
+    // Refresh the router residency mask; true iff every layer is masked. A
+    // layer joins the mask only once it has a decent resident palette
+    // (QWEN_RESIDENT_MIN, default 32) — until then it stays unmasked so its
+    // misses keep warming the cache via the fallback path. Layers with
+    // concentrated routing may never reach that palette on a short prompt, so
+    // after QWEN_RESIDENT_WARMUP fast-decode tokens (default 16) the floor
+    // drops to n_used and whatever is resident gets frozen ("warm a few
+    // tokens, then pin" — the original design intent).
+    static const int res_min = []{ const char * c = getenv("QWEN_RESIDENT_MIN");
+                                   const int v = c ? atoi(c) : 32; return v < 1 ? 32 : v; }();
+    static const int warm_tok = []{ const char * c = getenv("QWEN_RESIDENT_WARMUP");
+                                    const int v = c ? atoi(c) : 16; return v < 0 ? 16 : v; }();
+    const int floor_res = fast_warm_tokens > warm_tok
+                              ? n_used
+                              : std::max(n_used, std::min(res_min, n_exp));
+    auto fill_resmask = [&]() {
+        bool complete = true;
+        for (int il = 0; il < n_layer; ++il) {
+            float * row = &resmask_host[(size_t) il * n_exp];
+            int n_res = 0;
+            for (int e = 0; e < n_exp; ++e) {
+                const bool res = ecache->resident(ExpertCache::GATE, il, e) &&
+                                 ecache->resident(ExpertCache::UP,   il, e) &&
+                                 ecache->resident(ExpertCache::DOWN, il, e);
+                row[e] = res ? 0.0f : -INFINITY;
+                n_res += res;
+            }
+            if (n_res < floor_res) {   // palette too thin: leave the layer unmasked
+                for (int e = 0; e < n_exp; ++e) row[e] = 0.0f;
+                complete = false;
+            }
+        }
+        ggml_backend_tensor_set(resmask_all, resmask_host.data(), 0,
+                                resmask_host.size() * sizeof(float));
+        return complete;
+    };
     // verify residency of every selected expert; returns true if all resident
     auto verify = [&]() {
         ggml_backend_tensor_get(sel_all, sel_host.data(), 0, sel_host.size() * sizeof(int32_t));
@@ -2466,27 +2785,79 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
         return ok;
     };
 
-    backup_states();   // so a speculative miss can be rolled back
+    // Residency only changes through fetches/evictions, so the mask and remap
+    // uploads are versioned by the miss+eviction count (and the warmup floor)
+    // and skipped while stale-free — steady-state resident decode uploads
+    // nothing but token/pos/mask.
+    ++fast_warm_tokens;
+    const uint64_t stamp = ecache->stats().misses + ecache->stats().evictions;
+    if (stamp != fast_remap_stamp || floor_res != fast_last_floor) {
+        fast_mask_complete = resident_decode && fill_resmask();
+        fill_g2s();
+        fast_remap_stamp = stamp;
+        fast_last_floor  = floor_res;
+    }
+    // Resident-only routing with a complete mask cannot miss: the run is not
+    // speculative, so state backup, the sel_all verify readback and the
+    // fallback are all skipped — one graph submit + one logits readback.
+    const bool masked = resident_decode && fast_mask_complete;
 
-    fill_g2s();
+    if (!masked) backup_states();   // so a speculative miss can be rolled back
     if (ggml_backend_graph_compute(backend, f_gf) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("decode_cached_fast: compute failed");
 
-    // On a miss the speculative result is wrong: roll back recurrent state,
-    // warm the cache, and recompute correctly via the slow per-layer path.
-    if (!verify()) {
-        restore_states();
-        return decode_cached(token);
-    }
-
-    // accept: bump LRU/frequency for the resident accesses, then read logits
-    for (int il = 0; il < n_layer; ++il)
-        for (int k = 0; k < n_used; ++k) {
-            const int e = sel_host[(size_t) il * n_used + k];
-            ecache->touch(ExpertCache::GATE, il, e);
-            ecache->touch(ExpertCache::UP,   il, e);
-            ecache->touch(ExpertCache::DOWN, il, e);
+    if (!masked) {
+        // On a miss the speculative result is wrong: roll back recurrent state,
+        // warm the cache, and recompute correctly via the slow per-layer path.
+        if (!verify()) {
+            restore_states();
+            return decode_cached(token);
         }
+
+        // accept: bump LRU/frequency for the resident accesses, then read logits
+        for (int il = 0; il < n_layer; ++il)
+            for (int k = 0; k < n_used; ++k) {
+                const int e = sel_host[(size_t) il * n_used + k];
+                ecache->touch(ExpertCache::GATE, il, e);
+                ecache->touch(ExpertCache::UP,   il, e);
+                ecache->touch(ExpertCache::DOWN, il, e);
+            }
+    } else {
+        // ---- background refill: keep the frozen palette tracking the input ----
+        // The graph recorded what the unmasked router wanted (want_all). Fetch
+        // wanted-but-absent experts within a per-token budget (they join the
+        // mask next token via the stamp), and touch the actually-used experts
+        // so the refill's LRU evictions land on stale entries, not hot ones.
+        // per-token fetch budget: RAM-tier installs are async H2D (cheap); the
+        // SSD tier reads synchronously, so default much lower there
+        static const int refill_budget = [this]{ const char * c = getenv("QWEN_RESIDENT_REFILL");
+                                                 const int v = c ? atoi(c) : (ssd_mode ? 2 : 8);
+                                                 return v < 0 ? 0 : v; }();
+        if (refill_budget > 0) {
+            ggml_backend_tensor_get(sel_all,  sel_host.data(),  0, sel_host.size()  * sizeof(int32_t));
+            ggml_backend_tensor_get(want_all, want_host.data(), 0, want_host.size() * sizeof(int32_t));
+            for (int il = 0; il < n_layer; ++il)
+                for (int k = 0; k < n_used; ++k) {
+                    const int e = sel_host[(size_t) il * n_used + k];
+                    ecache->touch(ExpertCache::GATE, il, e);
+                    ecache->touch(ExpertCache::UP,   il, e);
+                    ecache->touch(ExpertCache::DOWN, il, e);
+                }
+            int budget = refill_budget;
+            for (int step = 0; step < n_layer && budget > 0; ++step) {
+                const int il = (refill_cursor + step) % n_layer;
+                for (int k = 0; k < n_used && budget > 0; ++k) {
+                    const int e = want_host[(size_t) il * n_used + k];
+                    if (ecache->resident(ExpertCache::GATE, il, e) &&
+                        ecache->resident(ExpertCache::UP,   il, e) &&
+                        ecache->resident(ExpertCache::DOWN, il, e)) continue;
+                    ecache->ensure_resident(il, e);   // async H2D (RAM tier); joins mask next token
+                    --budget;
+                }
+            }
+            refill_cursor = (refill_cursor + 1) % n_layer;
+        }
+    }
 
     ggml_tensor * logits_t = ggml_graph_get_tensor(f_gf, "logits");
     const int n_vocab = (int) logits_t->ne[0];
@@ -2534,9 +2905,13 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
             return logits;
         }
         const int n_embd = model.hparams().n_embd;
-        int chunk = ecache->min_slots() / (model.hparams().n_expert_used > 0 ? model.hparams().n_expert_used : 1);
-        if (chunk < 1)   chunk = 1;
-        if (chunk > 256) chunk = 256;
+        // Chunk size is an activation bound only: per-layer expert residency is
+        // handled inside decode_cached_batch (layer-major seg A sub-chunking +
+        // union-bounded seg B slicing), so the chunk no longer needs to fit the
+        // expert pools. Bigger chunks amortize each layer's expert fetch over
+        // more tokens: expert traffic scales with the number of chunks, not T.
+        // 4096 tokens ≈ 100 MB of carry tensors (7 x n_embd x T floats).
+        int chunk = 4096;
         if (const char * c = getenv("QWEN_BATCH_CHUNK")) { int v = atoi(c); if (v >= 1) chunk = v; }
         int i = 0;
         while (i < n_tokens) {

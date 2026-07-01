@@ -20,6 +20,16 @@
 
 using namespace questwend;
 
+// CLI aliases for the offload tuning knobs (the runtime reads them as QWEN_*
+// env vars; the flag and the env var are equivalent, the flag wins if both).
+static void set_knob(const char * env, const char * val) {
+#ifdef _WIN32
+    _putenv_s(env, val);
+#else
+    setenv(env, val, /*overwrite=*/1);
+#endif
+}
+
 static void usage(const char * prog) {
     printf("usage: %s -m <model.gguf> [options]\n", prog);
     printf("  -p <text>      prompt (one-shot)\n");
@@ -44,6 +54,14 @@ static void usage(const char * prog) {
     printf("  --cpu          force CPU backend\n");
     printf("  --log-tokens-per-sec   print speed\n");
     printf("  --info         print model info and exit\n");
+    printf("offload tuning (equivalent to the QWEN_* env vars; flag wins):\n");
+    printf("  --resident-decode   resident-only routing decode: fused graph, no per-token miss\n");
+    printf("                      (lossy; auto-warmup + background refill keep quality)\n");
+    printf("  --resident-refill <N>  refilled experts per token while masked (default: RAM 8, SSD 2; 0 = frozen)\n");
+    printf("  --resident-warmup <N>  decode tokens before the mask locks in (default 16)\n");
+    printf("  --prefill-prune <eps>  skip fetching low-router-mass experts in prefill (lossy; e.g. 0.05)\n");
+    printf("  --batch-chunk <N>   prefill chunk length in tokens (default 4096)\n");
+    printf("  --ssd-direct        unbuffered SSD reads (bypass the OS page cache; with --experts-ssd)\n");
 }
 
 int main(int argc, char ** argv) {
@@ -81,6 +99,12 @@ int main(int argc, char ** argv) {
         else if (a == "--vision-test")      vision_test = true;
         else if (a == "--log-tokens-per-sec")    log_speed = true;
         else if (a == "--cpu")              force_cpu = true;
+        else if (a == "--resident-decode")  set_knob("QWEN_RESIDENT_DECODE", "1");
+        else if (a == "--resident-refill" && i + 1 < argc) set_knob("QWEN_RESIDENT_REFILL", next().c_str());
+        else if (a == "--resident-warmup" && i + 1 < argc) set_knob("QWEN_RESIDENT_WARMUP", next().c_str());
+        else if (a == "--prefill-prune" && i + 1 < argc)   set_knob("QWEN_PREFILL_PRUNE", next().c_str());
+        else if (a == "--batch-chunk" && i + 1 < argc)     set_knob("QWEN_BATCH_CHUNK", next().c_str());
+        else if (a == "--ssd-direct")       set_knob("QWEN_SSD_DIRECT", "1");
         else if (a == "--info")             info_only = true;
         else if (a == "-h" || a == "--help"){ usage(argv[0]); return 0; }
         else {
