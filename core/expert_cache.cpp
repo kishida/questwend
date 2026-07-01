@@ -220,6 +220,7 @@ ExpertCache::~ExpertCache() {
 #ifdef _WIN32
     for (auto & kv : hfiles_) if (kv.second) CloseHandle((HANDLE) kv.second);
 #endif
+    if (coal_stage_buf_) ggml_backend_buffer_free(coal_stage_buf_);
     if (stage_buf_) ggml_backend_buffer_free(stage_buf_);
     if (buf_) ggml_backend_buffer_free(buf_);
     if (ctx_) ggml_free(ctx_);
@@ -251,6 +252,26 @@ void * ExpertCache::stage_host(size_t nbytes) {
     }
     if (stage_.size() < nbytes) stage_.resize(nbytes);
     return stage_.data();
+}
+
+// 4KB-aligned staging for coalesced reads; pinned (page-locked) when the
+// backend offers a host buffer type, so slab uploads can be true async DMA.
+void * ExpertCache::coal_host(size_t nbytes) {
+    if (host_buft_ && coal_stage_cap_ < nbytes) {
+        if (coal_stage_buf_) ggml_backend_buffer_free(coal_stage_buf_);
+        coal_stage_buf_ = ggml_backend_buft_alloc_buffer(host_buft_, nbytes);
+        if (coal_stage_buf_) {
+            coal_stage_ptr_ = ggml_backend_buffer_get_base(coal_stage_buf_);
+            coal_stage_cap_ = nbytes;
+        } else {
+            coal_stage_ptr_ = nullptr;
+            coal_stage_cap_ = 0;
+        }
+    }
+    if (coal_stage_ptr_ && coal_stage_cap_ >= nbytes) { coal_pinned_ = true; return coal_stage_ptr_; }
+    coal_pinned_ = false;
+    if (coal_buf_.size() < nbytes + 4096) coal_buf_.resize(nbytes + 4096);
+    return (void *) (((uintptr_t) coal_buf_.data() + 4095) & ~(uintptr_t) 4095);
 }
 
 ggml_tensor * ExpertCache::tensor(Role role, int layer) const {
@@ -395,76 +416,270 @@ void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
     if (n == 0) return;
     const auto t0 = std::chrono::steady_clock::now();
 
-    std::vector<std::vector<uint8_t>> stage(n);
-    std::atomic<bool> ok{true};
-    const int nthreads = std::min(n, prefetch_threads_);
+    // ---- coalescing: expert slabs of one (role,layer) tensor are contiguous in
+    // the GGUF, and a prefill layer's union covers most of them, so scattered
+    // 0.6MB preads are merged into big sequential range reads (several times the
+    // drive's scattered throughput). Small gaps are read and discarded; small
+    // job sets (decode misses, background refill) keep the per-slab path below.
+    // Opt-in (QWEN_COALESCE=1): on drives whose sequential read beats their
+    // QD-parallel scattered read, merging a layer's union into range reads
+    // wins. Measured here on a drive with a degraded tail region (seq 1.9GB/s
+    // head / 0.15GB/s tail), 8-thread scattered slab reads extract more from
+    // the controller, so scattered stays the default.
+    static const bool use_coal = getenv("QWEN_COALESCE") != nullptr;
+    static const int  coal_gap = []{ const char * c = getenv("QWEN_COALESCE_GAP");
+                                     const int v = c ? atoi(c) : 8; return v < 0 ? 8 : v; }();
+    constexpr size_t SEG_BYTES  = 8u << 20;   // one worker read segment
+    constexpr size_t SPAN_BYTES = 64u << 20;  // staging cap: runs split at this size
+    constexpr int    COAL_MIN   = 16;         // fewer jobs per role: per-slab path
 
-    auto worker = [&](int tid) {
-        std::unordered_map<std::string, FILE *> tf;   // per-thread file cache
-#ifdef __APPLE__
-        std::unordered_map<std::string, int> tfd;     // per-thread fd cache (direct path)
-#endif
-#ifdef _WIN32
-        std::unordered_map<std::string, void *> th;   // per-thread HANDLE cache (direct path)
-        std::vector<uint8_t> tabuf;                   // per-thread aligned staging
-#endif
-        for (int j = tid; j < n; j += nthreads) {
-            const FetchJob & job = jobs[j];
-            const size_t nb2 = job.pool->t->nb[2];
-            const std::string & path = fpath_[job.role][layer];
-            const size_t off = foff_[job.role][layer] + (size_t) job.expert * nb2;
-#ifdef _WIN32
-            if (direct_) {
-                void *& hv = th[path];
-                if (!hv) hv = win_direct_open(path);
-                stage[j].resize(nb2);
-                if (!hv || !win_direct_read(hv, stage[j].data(), nb2, off, tabuf)) ok = false;
+    struct Run { Pool * pool; int role; int e_lo, e_hi; std::vector<const FetchJob *> jobs; };
+    std::vector<Run> runs;
+    std::vector<FetchJob> singles;
+
+    if (!use_coal) {
+        singles = jobs;
+    } else {
+        for (int r = 0; r < N_ROLE; ++r) {
+            std::vector<const FetchJob *> rj;
+            for (const auto & j : jobs) if (j.role == r) rj.push_back(&j);
+            if (rj.empty()) continue;
+            if ((int) rj.size() < COAL_MIN) {
+                for (const FetchJob * j : rj) singles.push_back(*j);
                 continue;
             }
-#endif
-#ifdef __APPLE__
-            if (job.pool->host) {
-                auto it = tfd.find(path);
-                int fd;
-                if (it == tfd.end()) { fd = open(path.c_str(), O_RDONLY); tfd[path] = fd; }
-                else fd = it->second;
-                if (fd < 0 ||
-                    pread(fd, job.pool->host + (size_t) job.slot * nb2, nb2, (off_t) off) != (ssize_t) nb2)
-                    ok = false;
-                continue;
+            std::sort(rj.begin(), rj.end(),
+                      [](const FetchJob * a, const FetchJob * b) { return a->expert < b->expert; });
+            const size_t nb2 = rj[0]->pool->t->nb[2];
+            std::vector<Run> rruns;
+            Run cur{ rj[0]->pool, r, rj[0]->expert, rj[0]->expert, { rj[0] } };
+            for (size_t i = 1; i < rj.size(); ++i) {
+                const int e = rj[i]->expert;
+                if (e - cur.e_hi - 1 <= coal_gap &&
+                    (size_t) (e - cur.e_lo + 1) * nb2 <= SPAN_BYTES) {
+                    cur.e_hi = e;
+                    cur.jobs.push_back(rj[i]);
+                } else {
+                    rruns.push_back(std::move(cur));
+                    cur = Run{ rj[i]->pool, r, e, e, { rj[i] } };
+                }
             }
-#endif
-            stage[j].resize(nb2);
-            FILE *& f = tf[path];
-            if (!f) { f = fopen(path.c_str(), "rb"); if (!f) { ok = false; continue; } }
-#ifdef _WIN32
-            if (_fseeki64(f, (long long) off, SEEK_SET) != 0 ||
-#else
-            if (fseeko(f, (off_t) off, SEEK_SET) != 0 ||
-#endif
-                fread(stage[j].data(), 1, nb2, f) != nb2) ok = false;
+            rruns.push_back(std::move(cur));
+            // waste guard: a sparse run reads mostly gap bytes — scattered
+            // QD-parallel per-slab reads of just the wanted slabs win there
+            for (auto & rr : rruns) {
+                const int span_slabs = rr.e_hi - rr.e_lo + 1;
+                if ((int) rr.jobs.size() * 2 < span_slabs) {
+                    for (const FetchJob * j : rr.jobs) singles.push_back(*j);
+                } else {
+                    runs.push_back(std::move(rr));
+                }
+            }
         }
-        for (auto & kv : tf) if (kv.second) fclose(kv.second);
+    }
+
+    // coalesced runs: workers read disjoint 4KB-aligned segments of the range
+    // straight into the (pinned) staging, then the slabs are uploaded — async
+    // DMA when pinned (the sync pageable per-slab copies used to dominate).
+    // The staging is reused across runs, so a pending async batch is synced
+    // before the next run's reads overwrite it.
+    for (auto & run : runs) {
+        const size_t nb2  = run.pool->t->nb[2];
+        const std::string & path = fpath_[run.role][layer];
+        const uint64_t base = foff_[run.role][layer] + (uint64_t) run.e_lo * nb2;
+        const size_t span = (size_t) (run.e_hi - run.e_lo + 1) * nb2;
+        const uint64_t a0    = base & ~4095ull;          // sector-aligned range start
+        const size_t   delta = (size_t) (base - a0);
+        const size_t   need  = (delta + span + 4095) & ~(size_t) 4095;
+
+        static const bool coal_dbg = getenv("QWEN_COAL_DEBUG") != nullptr;
+        const auto tr0 = std::chrono::steady_clock::now();
+        if (coal_async_pending_) {   // staging still feeding async H2D: drain first
+            ggml_backend_synchronize(backend_);
+            coal_async_pending_ = false;
+        }
+        uint8_t * cbuf = (uint8_t *) coal_host(need);
+        static bool coal_dbg_once = false;
+        if (coal_dbg && !coal_dbg_once) {
+            fprintf(stderr, "coal: staging %s (%zu MB)\n", coal_pinned_ ? "pinned" : "pageable", need >> 20);
+            coal_dbg_once = true;
+        }
+
+        std::vector<std::pair<size_t, size_t>> segs;   // (offset into range, length)
+        for (size_t o = 0; o < need; o += SEG_BYTES)
+            segs.push_back({ o, std::min(SEG_BYTES, need - o) });
+
+        std::atomic<size_t> seg_next{0};
+        std::atomic<bool>   seg_ok{true};
+        auto rworker = [&]() {
+            FILE * f = nullptr;
+#ifdef _WIN32
+            void * h = nullptr;
+            if (direct_) { h = win_direct_open(path); if (!h) { seg_ok = false; return; } }
+            if (!h)
+#endif
+            { f = fopen(path.c_str(), "rb"); if (!f) { seg_ok = false; return; } }
+            size_t i;
+            while ((i = seg_next.fetch_add(1)) < segs.size()) {
+                const size_t o = segs[i].first, len = segs[i].second;
+#ifdef _WIN32
+                if (h) {
+                    // aligned offset/len/buffer: read straight into the staging
+                    // (a short read is fine iff it still covers the needed span)
+                    OVERLAPPED ov{};
+                    ov.Offset     = (DWORD) ((a0 + o) & 0xffffffffull);
+                    ov.OffsetHigh = (DWORD) ((a0 + o) >> 32);
+                    DWORD got = 0;
+                    if (!ReadFile((HANDLE) h, cbuf + o, (DWORD) len, &got, &ov) ||
+                        (got < len && a0 + o + got < base + span))
+                        seg_ok = false;
+                    continue;
+                }
+                if (_fseeki64(f, (long long) (a0 + o), SEEK_SET) != 0 ||
+#else
+                if (fseeko(f, (off_t) (a0 + o), SEEK_SET) != 0 ||
+#endif
+                    fread(cbuf + o, 1, len, f) < std::min(len, (size_t) (base + span - (a0 + o))))
+                    seg_ok = false;
+            }
+            if (f) fclose(f);
+#ifdef _WIN32
+            if (h) CloseHandle((HANDLE) h);
+#endif
+        };
+        const int nth = std::min((int) segs.size(), prefetch_threads_);
+        std::vector<std::thread> rts;
+        rts.reserve(nth > 0 ? nth - 1 : 0);
+        for (int t = 1; t < nth; ++t) rts.emplace_back(rworker);
+        rworker();
+        for (auto & t : rts) t.join();
+        if (!seg_ok) throw std::runtime_error("ExpertCache: coalesced SSD read failed");
+        const auto tr1 = std::chrono::steady_clock::now();
+
+        for (const FetchJob * job : run.jobs) {
+            const uint8_t * src = cbuf + delta + (size_t) (job->expert - run.e_lo) * nb2;
+            if (run.pool->host) {
+                memcpy(run.pool->host + (size_t) job->slot * nb2, src, nb2);
+            } else if (coal_pinned_) {
+                ggml_backend_tensor_set_async(backend_, run.pool->t, src, (size_t) job->slot * nb2, nb2);
+                coal_async_pending_ = true;
+            } else {
+                ggml_backend_tensor_set(run.pool->t, src, (size_t) job->slot * nb2, nb2);
+            }
+            stats_.fetch_bytes += nb2;
+        }
+        if (coal_dbg) {
+            const auto tr2 = std::chrono::steady_clock::now();
+            fprintf(stderr, "coal: run role=%d e=[%d..%d] read %.1fms (%.2f GB/s) upload %.1fms\n",
+                    run.role, run.e_lo, run.e_hi,
+                    std::chrono::duration<double, std::milli>(tr1 - tr0).count(),
+                    need / 1073741824.0 / std::chrono::duration<double>(tr1 - tr0).count(),
+                    std::chrono::duration<double, std::milli>(tr2 - tr1).count());
+        }
+    }
+    // pending async uploads need no drain here: later graph compute and slot
+    // writes are ordered behind them on the backend stream; the staging itself
+    // is protected by the sync-before-reuse above (coal_async_pending_ persists
+    // across calls).
+
+    if (singles.empty()) {
+        stats_.fetch_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        return;
+    }
+
+    // Per-slab scattered reads (QD-parallel across workers) into batches of the
+    // pinned staging, uploaded as async DMA — the sync pageable per-slab copies
+    // used to cost more than the SSD reads themselves. The staging is drained
+    // before each batch reuses it.
+    const int ns = (int) singles.size();
+    size_t max_nb2 = 0;
+    for (const auto & j : singles) max_nb2 = std::max(max_nb2, (size_t) j.pool->t->nb[2]);
+    const int batch = std::max<int>(1, (int) ((64u << 20) / max_nb2));
+
+    for (int b0 = 0; b0 < ns; b0 += batch) {
+        const int bn = std::min(batch, ns - b0);
+        if (coal_async_pending_) {   // staging still feeding async H2D: drain first
+            ggml_backend_synchronize(backend_);
+            coal_async_pending_ = false;
+        }
+        uint8_t * cbuf = (uint8_t *) coal_host((size_t) bn * max_nb2);
+
+        std::atomic<bool> ok{true};
+        const int nthreads = std::min(bn, prefetch_threads_);
+        auto worker = [&](int tid) {
+            std::unordered_map<std::string, FILE *> tf;   // per-thread file cache
 #ifdef __APPLE__
-        for (auto & kv : tfd) if (kv.second >= 0) close(kv.second);
+            std::unordered_map<std::string, int> tfd;     // per-thread fd cache (direct path)
 #endif
 #ifdef _WIN32
-        for (auto & kv : th) if (kv.second) CloseHandle((HANDLE) kv.second);
+            std::unordered_map<std::string, void *> th;   // per-thread HANDLE cache (direct path)
+            std::vector<uint8_t> tabuf;                   // per-thread aligned bounce
 #endif
-    };
+            for (int j = tid; j < bn; j += nthreads) {
+                const FetchJob & job = singles[b0 + j];
+                const size_t nb2 = job.pool->t->nb[2];
+                const std::string & path = fpath_[job.role][layer];
+                const size_t off = foff_[job.role][layer] + (size_t) job.expert * nb2;
+                uint8_t * dst = cbuf + (size_t) j * max_nb2;
+#ifdef _WIN32
+                if (direct_) {
+                    void *& hv = th[path];
+                    if (!hv) hv = win_direct_open(path);
+                    if (!hv || !win_direct_read(hv, dst, nb2, off, tabuf)) ok = false;
+                    continue;
+                }
+#endif
+#ifdef __APPLE__
+                if (job.pool->host) {   // unified memory: straight into the slot
+                    auto it = tfd.find(path);
+                    int fd;
+                    if (it == tfd.end()) { fd = open(path.c_str(), O_RDONLY); tfd[path] = fd; }
+                    else fd = it->second;
+                    if (fd < 0 ||
+                        pread(fd, job.pool->host + (size_t) job.slot * nb2, nb2, (off_t) off) != (ssize_t) nb2)
+                        ok = false;
+                    continue;
+                }
+#endif
+                FILE *& f = tf[path];
+                if (!f) { f = fopen(path.c_str(), "rb"); if (!f) { ok = false; continue; } }
+#ifdef _WIN32
+                if (_fseeki64(f, (long long) off, SEEK_SET) != 0 ||
+#else
+                if (fseeko(f, (off_t) off, SEEK_SET) != 0 ||
+#endif
+                    fread(dst, 1, nb2, f) != nb2) ok = false;
+            }
+            for (auto & kv : tf) if (kv.second) fclose(kv.second);
+#ifdef __APPLE__
+            for (auto & kv : tfd) if (kv.second >= 0) close(kv.second);
+#endif
+#ifdef _WIN32
+            for (auto & kv : th) if (kv.second) CloseHandle((HANDLE) kv.second);
+#endif
+        };
 
-    std::vector<std::thread> ts;
-    ts.reserve(nthreads - 1);
-    for (int t = 1; t < nthreads; ++t) ts.emplace_back(worker, t);
-    worker(0);
-    for (auto & t : ts) t.join();
-    if (!ok) throw std::runtime_error("ExpertCache: parallel SSD read failed");
+        std::vector<std::thread> ts;
+        ts.reserve(nthreads > 0 ? nthreads - 1 : 0);
+        for (int t = 1; t < nthreads; ++t) ts.emplace_back(worker, t);
+        worker(0);
+        for (auto & t : ts) t.join();
+        if (!ok) throw std::runtime_error("ExpertCache: parallel SSD read failed");
 
-    for (int j = 0; j < n; ++j) {
-        stats_.fetch_bytes += jobs[j].pool->t->nb[2];
-        if (jobs[j].pool->host) continue;   // already written in place
-        ggml_tensor * dst = jobs[j].pool->t;
-        ggml_backend_tensor_set(dst, stage[j].data(), (size_t) jobs[j].slot * dst->nb[2], stage[j].size());
+        for (int j = 0; j < bn; ++j) {
+            const FetchJob & job = singles[b0 + j];
+            const size_t nb2 = job.pool->t->nb[2];
+            stats_.fetch_bytes += nb2;
+            if (job.pool->host) continue;   // already written in place
+            const uint8_t * src = cbuf + (size_t) j * max_nb2;
+            if (coal_pinned_) {
+                ggml_backend_tensor_set_async(backend_, job.pool->t, src, (size_t) job.slot * nb2, nb2);
+                coal_async_pending_ = true;
+            } else {
+                ggml_backend_tensor_set(job.pool->t, src, (size_t) job.slot * nb2, nb2);
+            }
+        }
     }
     stats_.fetch_ms += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();

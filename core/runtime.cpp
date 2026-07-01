@@ -1923,6 +1923,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             (size_t) ovr[k].count * n_embd * sizeof(float));
 
     std::vector<int32_t> sel(n_used * T), sg(n_used * T), su(n_used * T), sd(n_used * T);
+    std::vector<int32_t> pre_g, pre_u, pre_d;   // scratch for whole-union prefetch
 
     ggml_tensor * carry_ffn[2] = { ffn_in_b,  ffn_in_b2  };
     ggml_tensor * carry_res[2] = { resid_b,   resid_b2   };
@@ -2095,6 +2096,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     // between slices. The FFN is pointwise over tokens, so slicing is lossless.
     std::vector<std::pair<int, int>> slices;   // (t0, len) per seg-B pass
     std::vector<uint8_t> seen((size_t) n_exp, 0);
+    std::vector<int32_t> plan_list;            // the union as a list (whole-layer prefetch)
     int plan_union = 0;                        // distinct experts over the whole chunk (stats)
     // Length cap per seg-B pass: bounds the [n_ff, n_used, len] MoE activations
     // (a length-capped follow-up slice re-hits the same resident experts, so it
@@ -2107,12 +2109,13 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         std::fill(seen.begin(), seen.end(), 0);
         int distinct = 0, t0 = 0;
         plan_union = 0;
+        plan_list.clear();
         std::vector<uint8_t> useen((size_t) n_exp, 0);
         for (int t = 0; t < T; ++t) {
             int nnew = 0;
             for (int j = 0; j < n_used; ++j) {
                 const int e = sel[(size_t) t * n_used + j];
-                if (!useen[e]) { useen[e] = 1; ++plan_union; }
+                if (!useen[e]) { useen[e] = 1; ++plan_union; plan_list.push_back(e); }
                 if (!seen[e])  { seen[e] = 1; ++nnew; }
             }
             if ((distinct + nnew > cap || t - t0 >= max_slice) && t > t0) {
@@ -2271,6 +2274,17 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             plan_slices(il);
             const auto s0 = ecache->stats();
             const int nsl = (int) slices.size();
+            // Prefetch the layer's whole union with one ensure() when it fits
+            // the pool: the per-slice ensures below then only hit, so the SSD
+            // sweep happens once per layer as one dense coalesced read instead
+            // of sparse per-slice residual fetches (which re-read the tensor).
+            if (nsl > 1 && plan_union <= ecache->capacity(il) - 8) {
+                pre_g.resize(plan_list.size());
+                pre_u.resize(plan_list.size());
+                pre_d.resize(plan_list.size());
+                ecache->ensure(il, plan_list.data(), (int) plan_list.size(),
+                               pre_g.data(), pre_u.data(), pre_d.data());
+            }
             for (int k = 0; k < nsl; ++k) {
                 const auto [st0, slen] = slices[k];
                 ensure_slice(il, st0, slen);

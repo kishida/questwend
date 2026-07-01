@@ -243,6 +243,8 @@ qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40000 --e
 | `QWEN_RESIDENT_WARMUP=N` | = `--resident-warmup`（この decode トークン数の後は常駐数を問わず固定; 既定 16） |
 | `QWEN_RESIDENT_REFILL=N` | = `--resident-refill`（マスク中の補充 expert 数/トークン; 既定 RAM 8 / SSD 2, 0=凍結） |
 | `QWEN_SSD_DIRECT=1` | = `--ssd-direct`（Windows: unbuffered read でページキャッシュをバイパス） |
+| `QWEN_COALESCE=1` | SSD 読みで層の和集合を大きな連続レンジ読みに合体（シーケンシャルがランダム QD8 より速いドライブ向け） |
+| `QWEN_COAL_DEBUG=1` | 合体読みの run ごとの read/upload 時間を表示 |
 | `QWEN_PF_CHUNK=N` | = `--pf-chunk`（サーバー prefill のスライス長; 既定 4096） |
 | `QWEN_PREFILL_CHUNK=N` | 常駐／RAM階層 build_graph prefill のチャンク長（既定 512） |
 | `QWEN_CPU_PREFILL=1` | RAM 階層の prefill をエキスパート CPU 実行（sched）に戻す（既定は GPU キャッシュ経路。GPU が遊ぶ代わりに H2D 転送を省く旧挙動） |

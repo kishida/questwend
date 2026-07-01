@@ -142,6 +142,15 @@ private:
 
     uint64_t clock_ = 0;
     std::vector<uint8_t> stage_;   // host staging buffer for fetch (pageable fallback)
+    // Staging for coalesced (range) SSD reads: pinned when available so the
+    // per-slab H2D can be async (the sync pageable copies dominated fetch time).
+    std::vector<uint8_t>  coal_buf_;                    // pageable fallback (4KB-align inside)
+    ggml_backend_buffer_t coal_stage_buf_ = nullptr;    // pinned staging (or null)
+    void *                coal_stage_ptr_ = nullptr;
+    size_t                coal_stage_cap_ = 0;
+    bool                  coal_pinned_ = false;         // coal_host() returned pinned memory
+    bool                  coal_async_pending_ = false;  // async H2D in flight from the staging
+    void * coal_host(size_t nbytes);                    // >= nbytes, 4KB-aligned
 
     // Pinned (page-locked) host staging buffer: the H2D source for a slab upload.
     // Bounded to one slab, so it is always allocatable (unlike pinning all experts)

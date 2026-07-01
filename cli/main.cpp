@@ -20,6 +20,59 @@
 
 using namespace questwend;
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <chrono>
+// Raw unbuffered read benchmark of a file (--bench-read): sequential 16MB and
+// random 0.6MB passes with FILE_FLAG_NO_BUFFERING — measures what the drive
+// itself delivers to the expert-streaming path (no page cache, no ggml).
+static int bench_read(const std::string & path) {
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { fprintf(stderr, "bench-read: cannot open %s\n", path.c_str()); return 1; }
+    LARGE_INTEGER fsz; GetFileSizeEx(h, &fsz);
+    const uint64_t fbytes = (uint64_t) fsz.QuadPart & ~4095ull;
+    auto read_at = [&](void * buf, uint64_t off, size_t len) -> bool {
+        OVERLAPPED ov{}; ov.Offset = (DWORD) (off & 0xffffffffull); ov.OffsetHigh = (DWORD) (off >> 32);
+        DWORD got = 0;
+        return ReadFile(h, buf, (DWORD) len, &got, &ov) && got == len;
+    };
+    const size_t SEQ = 16u << 20;
+    void * buf = VirtualAlloc(nullptr, SEQ, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    auto seq_pass = [&](uint64_t start, uint64_t len, const char * name) {
+        start &= ~4095ull;
+        auto t0 = std::chrono::steady_clock::now();
+        for (uint64_t off = start; off + SEQ <= start + len; off += SEQ)
+            if (!read_at(buf, off, SEQ)) { fprintf(stderr, "bench-read: sequential read failed\n"); exit(1); }
+        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        printf("sequential %s : %.1f GB in %.1fs = %.2f GB/s\n",
+               name, len / 1073741824.0, s, len / 1073741824.0 / s);
+    };
+    const uint64_t quarter = std::min(fbytes / 2, 4ull << 30);
+    seq_pass(0, quarter, "head");
+    seq_pass(fbytes - quarter, quarter, "tail");
+
+    const size_t RND = 640 * 1024;   // ~one expert slab, sector-rounded
+    const uint64_t rtotal = 4ull << 30;
+    uint64_t seed = 0x243F6A8885A308D3ull, done = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (done < rtotal) {
+        seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+        const uint64_t off = (seed % ((fbytes - RND) >> 12)) << 12;   // 4KB-aligned
+        if (!read_at(buf, off, RND)) { fprintf(stderr, "bench-read: random read failed\n"); return 1; }
+        done += RND;
+    }
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    printf("random   0.6MB : %.1f GB in %.1fs = %.2f GB/s\n",
+           rtotal / 1073741824.0, s, rtotal / 1073741824.0 / s);
+    CloseHandle(h);
+    return 0;
+}
+#endif
+
 // CLI aliases for the offload tuning knobs (the runtime reads them as QWEN_*
 // env vars; the flag and the env var are equivalent, the flag wins if both).
 static void set_knob(const char * env, const char * val) {
@@ -62,6 +115,9 @@ static void usage(const char * prog) {
     printf("  --prefill-prune <eps>  skip fetching low-router-mass experts in prefill (lossy; e.g. 0.05)\n");
     printf("  --batch-chunk <N>   prefill chunk length in tokens (default 4096)\n");
     printf("  --ssd-direct        unbuffered SSD reads (bypass the OS page cache; with --experts-ssd)\n");
+#ifdef _WIN32
+    printf("  --bench-read <file> raw unbuffered read benchmark (sequential head/tail + random) and exit\n");
+#endif
 }
 
 int main(int argc, char ** argv) {
@@ -105,6 +161,9 @@ int main(int argc, char ** argv) {
         else if (a == "--prefill-prune" && i + 1 < argc)   set_knob("QWEN_PREFILL_PRUNE", next().c_str());
         else if (a == "--batch-chunk" && i + 1 < argc)     set_knob("QWEN_BATCH_CHUNK", next().c_str());
         else if (a == "--ssd-direct")       set_knob("QWEN_SSD_DIRECT", "1");
+#ifdef _WIN32
+        else if (a == "--bench-read" && i + 1 < argc) return bench_read(next());
+#endif
         else if (a == "--info")             info_only = true;
         else if (a == "-h" || a == "--help"){ usage(argv[0]); return 0; }
         else {
