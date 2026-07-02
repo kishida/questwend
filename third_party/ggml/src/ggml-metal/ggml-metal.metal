@@ -9730,49 +9730,60 @@ kernel void kernel_mul_mm_id_map0(
         threadgroup   char * shmem [[threadgroup(0)]],
         ushort tpitg[[thread_position_in_threadgroup]],
         ushort   ntg[[threads_per_threadgroup]]) {
-    const short ide = tpitg; // expert id
-
-    uint32_t n_all = 0;
-
-    device int32_t * ids_i32 = (device int32_t *) hids + ide*args.ne21;
-
-    for (int i21 = 0; i21 < args.ne21; i21 += ntg) { // n_tokens
-        if (i21 + tpitg < args.ne21) {
-            device const int32_t * src2_i32 = (device const int32_t *) (src2 + (i21 + tpitg)*args.nb21);
-
-            threadgroup uint16_t * sids = (threadgroup uint16_t *) shmem + tpitg*ne20;
-
-            #pragma unroll(ne20)
-            for (short i20 = 0; i20 < ne20; i20++) {
-                sids[i20] = src2_i32[i20];
-            }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (short t = 0; t < ntg; t++) {
-            if (i21 + t >= args.ne21) {
-                break;
-            }
-
-            threadgroup const uint16_t * sids = (threadgroup const uint16_t *) shmem + t*ne20;
-
-            short sel = 0;
-            #pragma unroll(ne20)
-            for (short i20 = 0; i20 < ne20; i20++) {
-                sel += (sids[i20] == ide)*(i20 + 1);
-            }
-
-            ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;
-
-            n_all += sel > 0;
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
     device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
-    tpe_u32[ide] = n_all;
+
+    // [qwencpp] the expert dimension can exceed the threadgroup thread limit
+    // when src0 is an expert-cache slot pool (thousands of slots), so process
+    // experts in blocks of ntg instead of one thread per expert. Upstream
+    // dispatches ntg = ne02 and the outer loop runs once.
+    for (int ide0 = 0; ide0 < args.ne02; ide0 += ntg) {
+        const int ide = ide0 + tpitg; // expert id
+
+        uint32_t n_all = 0;
+
+        device int32_t * ids_i32 = (device int32_t *) hids + (uint64_t) ide*args.ne21;
+
+        for (int i21 = 0; i21 < args.ne21; i21 += ntg) { // n_tokens
+            if (i21 + tpitg < args.ne21) {
+                device const int32_t * src2_i32 = (device const int32_t *) (src2 + (i21 + tpitg)*args.nb21);
+
+                threadgroup uint16_t * sids = (threadgroup uint16_t *) shmem + tpitg*ne20;
+
+                #pragma unroll(ne20)
+                for (short i20 = 0; i20 < ne20; i20++) {
+                    sids[i20] = src2_i32[i20];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (ide < args.ne02) {
+                for (short t = 0; t < ntg; t++) {
+                    if (i21 + t >= args.ne21) {
+                        break;
+                    }
+
+                    threadgroup const uint16_t * sids = (threadgroup const uint16_t *) shmem + t*ne20;
+
+                    int sel = 0;
+                    #pragma unroll(ne20)
+                    for (short i20 = 0; i20 < ne20; i20++) {
+                        sel += (sids[i20] == ide)*(i20 + 1);
+                    }
+
+                    ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;
+
+                    n_all += sel > 0;
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (ide < args.ne02) {
+            tpe_u32[ide] = n_all;
+        }
+    }
 }
 
 typedef decltype(kernel_mul_mm_id_map0<1>) kernel_mul_mm_id_map0_t;

@@ -2350,9 +2350,14 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20);
 
-            const size_t smem = pipeline.smem;
+            // [qwencpp] ne02 can exceed the threadgroup thread limit when src0
+            // is an expert-cache slot pool; the kernel loops over expert blocks
+            // of ntg, so cap the thread count (and size shmem for ntg staging
+            // rows) instead of asserting ne02 <= max threads.
+            const int ntg_max = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
+            const int ntg     = ne02 < ntg_max ? ne02 : ntg_max;
 
-            GGML_ASSERT(ne02 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+            const size_t smem = (size_t) ntg*ne20*sizeof(uint16_t);
 
             GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
 
@@ -2364,7 +2369,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ntg, 1, 1);
         }
 
         // this barrier is always needed because the next kernel has to wait for the id maps to be computed
