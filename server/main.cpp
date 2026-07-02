@@ -667,36 +667,41 @@ int main(int argc, char ** argv) {
                         " re-prefills its whole context on resume\n");
 
     // prefill progress: the offload (SSD/RAM-tier) prefill runs in chunks and
-    // reports (done,total); throttle the log line to one per ~10s. The clock is
-    // reset at each request's prefill start (requests are serialized).
+    // reports (done,total); throttle the log line to one per ~10s.
     // The runtime callback's (done,total) is per decode() call, which is too
     // local when the server itself chunks prefill (time-slicing): report
-    // progress against the whole prefill instead. pf_total = full tail tokens,
-    // pf_base = tokens prefilled by earlier server chunks; both set per request.
+    // progress against the whole prefill instead. Each request owns its own
+    // counters (Prog); `cur_prog` points at the request currently holding the
+    // runtime, so interleaved requests never mix their numbers.
     using lclk = std::chrono::steady_clock;
-    auto pf_start = std::make_shared<lclk::time_point>(lclk::now());
-    auto pf_last  = std::make_shared<lclk::time_point>(lclk::now());
-    auto pf_base  = std::make_shared<int>(0);
-    auto pf_total = std::make_shared<int>(0);
-    auto pf_shown = std::make_shared<bool>(false);   // any progress line shown this request
-    rt->set_progress_cb([pf_start, pf_last, pf_base, pf_total, pf_shown](int done, int total) {
-        const int gtot  = *pf_total > 0 ? *pf_total : total;
-        const int gdone = *pf_base + done;
+    struct Prog {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point last  = std::chrono::steady_clock::now();
+        int  base = 0;      // tokens prefilled by earlier server chunks
+        int  total = 0;     // full tail tokens of this request
+        bool shown = false; // any progress line shown for this request
+    };
+    auto cur_prog = std::make_shared<std::shared_ptr<Prog>>();
+    rt->set_progress_cb([cur_prog](int done, int total) {
+        const std::shared_ptr<Prog> p = *cur_prog;
+        if (!p) return;
+        const int gtot  = p->total > 0 ? p->total : total;
+        const int gdone = p->base + done;
         const auto now = lclk::now();
         auto emit = [&] {
-            const double el = std::chrono::duration<double>(now - *pf_start).count();
+            const double el = std::chrono::duration<double>(now - p->start).count();
             fprintf(stderr, "  prefill %d/%d (%.0f%%) %.0f tok/s\n",
                     gdone, gtot, 100.0 * gdone / gtot, el > 0 ? gdone / el : 0.0);
-            *pf_last = now;
+            p->last = now;
         };
         if (gdone >= gtot) {
             // a long prefill finishing between ticks would otherwise stall the
             // log at e.g. 93%; emit a closing 100% line (only if we ever showed
             // progress, so short prefills stay quiet)
-            if (*pf_shown) { emit(); *pf_shown = false; }
-        } else if (now - *pf_last >= std::chrono::seconds(10)) {
+            if (p->shown) { emit(); p->shown = false; }
+        } else if (now - p->last >= std::chrono::seconds(10)) {
             emit();
-            *pf_shown = true;
+            p->shown = true;
         }
     });
 
@@ -885,7 +890,8 @@ int main(int argc, char ** argv) {
 
     auto prepare_prompt = [&](std::vector<int32_t> & prompt,
                               std::vector<Runtime::EmbdOverride> & ovr,
-                              std::vector<ImgSpan> spans, uint64_t owner) -> int {
+                              std::vector<ImgSpan> spans, uint64_t owner,
+                              const std::shared_ptr<Prog> & prog) -> int {
         const int n_full = (int) prompt.size();
         const bool has_img = !spans.empty();
         int n = match_cov(rt->kv_tokens(), *kv_imgs, prompt, spans, "live");
@@ -935,12 +941,26 @@ int main(int argc, char ** argv) {
                 clock_hms().c_str(), n_full, has_img ? " +img" : "",
                 n, n > 0 ? src : "none", (int) prompt.size(),
                 rt->has_expert_cache() ? "" : " (resident)");
-        *pf_start = lclk::now();
-        *pf_last  = lclk::now();
-        *pf_total = (int) prompt.size();   // full tail to prefill (overall progress)
-        *pf_base  = 0;
-        *pf_shown = false;
+        prog->start = prog->last = lclk::now();
+        prog->total = (int) prompt.size();   // full tail to prefill (overall progress)
+        prog->base  = 0;
+        prog->shown = false;
+        *cur_prog   = prog;
         return n;
+    };
+
+    // Can the runtime be handed to a waiting request? Without cache slots the
+    // evicted state cannot be parked, and the switch costs a full re-prefill
+    // on BOTH sides every slice (observed as catastrophic slowdown with
+    // concurrent requests, issue #2) — run back-to-back instead.
+    auto yieldable = [&]() -> bool {
+        if (!tlock.contended()) return false;
+        if (!slots.empty()) return true;
+        static std::atomic<bool> once{false};
+        if (!once.exchange(true))
+            fprintf(stderr, "note: request queued mid-run; without --cache-slots there is "
+                            "nowhere to park the live state, so requests run back-to-back\n");
+        return false;
     };
 
     // completion log: prefill/decode tok/s, output tokens, expert hit-rate
@@ -1207,6 +1227,7 @@ int main(int argc, char ** argv) {
                 std::string hold;                 // marker holdback buffer
                 std::string pend_r;               // UTF-8 holdback (reasoning channel)
                 std::map<std::string, int> pkind; // tool-arg schema types (see parse_tool_calls)
+                std::shared_ptr<Prog> prog = std::make_shared<Prog>();   // prefill progress
                 std::shared_ptr<std::vector<std::vector<float>>> vembs;   // keep image embds alive
                 std::vector<Runtime::EmbdOverride> ovr;
                 std::vector<ImgSpan> spans;       // image spans for the prefix cache
@@ -1399,7 +1420,10 @@ int main(int argc, char ** argv) {
                     try {
                         const bool was_holding = st->holding;
                         if (!st->holding) { tlock.lock(); st->holding = true; }
-                        if (!was_holding) st->slice_used = 0;   // fresh slice on (re)acquisition
+                        if (!was_holding) {
+                            st->slice_used = 0;   // fresh slice on (re)acquisition
+                            *cur_prog = st->prog; // progress lines report this request
+                        }
 
                         // clip the image-embedding overrides to a prompt chunk
                         // [pos, pos+n), shifting indices to be chunk-relative
@@ -1436,7 +1460,7 @@ int main(int argc, char ** argv) {
                                 st->started = true;
                                 st->t0 = clk::now();
                                 st->had_images = !st->ovr.empty();
-                                st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid);
+                                st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog);
                                 st->cstat0 = rt->cache_stats();
                                 st->my_imgs = *kv_imgs;
                                 st->resp_base = rt->kv_tokens().size() + st->prompt.size();
@@ -1459,13 +1483,13 @@ int main(int argc, char ** argv) {
                                     st->finished = true; tlock.unlock(); st->holding = false;
                                     return false;
                                 }
-                                *pf_base = (int) st->pf_pos;   // overall-progress offset
+                                st->prog->base = (int) st->pf_pos;   // overall-progress offset
                                 rt->set_embd_overrides(chunk_ovr(st->pf_pos, pf_chunk));
                                 rt->prefill(std::vector<int32_t>(st->prompt.begin() + st->pf_pos,
                                                                  st->prompt.begin() + st->pf_pos + pf_chunk), true);
                                 rt->snapshot_ckpt();           // rewind point at the chunk boundary
                                 st->pf_pos += pf_chunk;
-                                if (tlock.contended()) {                 // yield mid-prefill
+                                if (yieldable()) {                       // yield mid-prefill
                                     st->my_toks = rt->kv_tokens();
                                     st->my_imgs = *kv_imgs;
                                     if (getenv("QWEN_CACHE_DEBUG"))
@@ -1480,7 +1504,7 @@ int main(int argc, char ** argv) {
                             // the reasoning) re-tokenizes identically up to here
                             const int gen_rel = st->gen_begin < 0 ? -1 : st->gen_begin - st->n_cached;
                             if (gen_rel > (int) st->pf_pos && gen_rel < (int) st->prompt.size()) {
-                                *pf_base = (int) st->pf_pos;
+                                st->prog->base = (int) st->pf_pos;
                                 rt->set_embd_overrides(chunk_ovr(st->pf_pos, gen_rel - st->pf_pos));
                                 rt->prefill(std::vector<int32_t>(st->prompt.begin() + st->pf_pos,
                                                                  st->prompt.begin() + gen_rel), true);
@@ -1489,7 +1513,7 @@ int main(int argc, char ** argv) {
                             }
                             std::vector<int32_t> rp;             // tokens to feed generate_mtp
                             if (st->pf_pos < st->prompt.size()) {
-                                *pf_base = (int) st->pf_pos;     // overall-progress offset
+                                st->prog->base = (int) st->pf_pos;     // overall-progress offset
                                 rp.assign(st->prompt.begin() + st->pf_pos, st->prompt.end());
                                 rt->set_embd_overrides(chunk_ovr(st->pf_pos, rp.size()));
                                 st->pf_pos = st->prompt.size();
@@ -1527,7 +1551,7 @@ int main(int argc, char ** argv) {
                                              [&](int32_t t) -> bool {
                                 if (is_stop(t) || rt->n_past() + 1 >= n_ctx) { st->done = true; return false; }
                                 if (time_slice > 0 && st->slice_used >= time_slice) {
-                                    if (tlock.contended()) { st->paused = true; return false; }
+                                    if (yieldable()) { st->paused = true; return false; }
                                     st->slice_used = 0;     // nobody waiting: fresh slice
                                 }
                                 if (first) { st->t_prefill = st->t_first = clk::now(); first = false; }
@@ -1556,7 +1580,7 @@ int main(int argc, char ** argv) {
                             st->started = true;
                             st->t0 = clk::now();
                             st->had_images = !st->ovr.empty();
-                            st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid);
+                            st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog);
                             st->cstat0 = rt->cache_stats();
                             st->my_imgs = *kv_imgs;
                         } else if (!was_holding) {
@@ -1582,13 +1606,13 @@ int main(int argc, char ** argv) {
                             const int gen_rel = st->gen_begin < 0 ? -1 : st->gen_begin - st->n_cached;
                             if (gen_rel > (int) st->pf_pos && gen_rel < (int) (st->pf_pos + n))
                                 n = (size_t) gen_rel - st->pf_pos;
-                            *pf_base = (int) st->pf_pos;   // overall-progress offset
+                            st->prog->base = (int) st->pf_pos;   // overall-progress offset
                             rt->set_embd_overrides(chunk_ovr(st->pf_pos, n));
                             st->logits = rt->decode(std::vector<int32_t>(st->prompt.begin() + st->pf_pos,
                                                                          st->prompt.begin() + st->pf_pos + n));
                             rt->snapshot_ckpt();   // rewind point (incl. prompt end)
                             st->pf_pos += n;
-                            if (st->pf_pos < st->prompt.size() && tlock.contended()) {
+                            if (st->pf_pos < st->prompt.size() && yieldable()) {
                                 st->my_toks = rt->kv_tokens();           // yield mid-prefill
                                 st->my_imgs = *kv_imgs;
                                 if (getenv("QWEN_CACHE_DEBUG"))
@@ -1610,7 +1634,7 @@ int main(int argc, char ** argv) {
                         if (!emit_piece(next)) { st->finished = true; tlock.unlock(); st->holding = false; return false; }
                         st->generated++;
                         st->logits = rt->decode({ next });
-                        if (time_slice > 0 && ++st->slice_used >= time_slice && tlock.contended()) {
+                        if (time_slice > 0 && ++st->slice_used >= time_slice && yieldable()) {
                             st->my_toks = rt->kv_tokens();   // yield the runtime
                             st->my_imgs = *kv_imgs;
                             if (getenv("QWEN_CACHE_DEBUG"))
@@ -1640,7 +1664,8 @@ int main(int argc, char ** argv) {
                 Guard(TicketLock & t_) : t(t_) { t.lock(); }
                 ~Guard() { t.unlock(); }
             } lk(tlock);
-            n_cached = prepare_prompt(prompt, ovr, std::move(spans), 0);
+            auto prog = std::make_shared<Prog>();
+            n_cached = prepare_prompt(prompt, ovr, std::move(spans), 0, prog);
             cstat0 = rt->cache_stats();
             t0 = clk::now();
             // checkpoint at the generation-prompt boundary (see streaming path)
