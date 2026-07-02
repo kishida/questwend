@@ -150,12 +150,12 @@ QWEN_COAL_DEBUG=1 で run ごとの read/upload 時間を表示。
   (「数トークン動かして温めてから expert を固定する」動的 pruning 案の実装形)
 - **締め切り**: ルーティングが集中した終盤層は短いプロンプトだと常駐 32 種に永遠に届かず
   マスクが完成しない(サーバの短プロンプトで発覚、gen 21 tok/s のまま)。
-  QWEN_RESIDENT_WARMUP(既定16)トークンの decode 後は floor を n_used に下げて
+  QWEN_RESIDENT_WARMUP(既定32)トークンの decode 後は floor を n_used に下げて
   「その時点の常駐で固定」する。修正後: 27 tok プロンプトで gen 51.0 tok/s・出力正常。
 - **バックグラウンド補充(重要)**: 完全凍結は短プロンプト+コード生成で顕著に破綻する
   (ユーザー報告: Java コードが壊れ、コメント羅列に退化)。融合グラフ内でマスク前 logits の
   top-k(=本来選びたかった expert、`want_all`)も記録し、毎トークン読み戻して
-  「欲しかったが不在」の expert を QWEN_RESIDENT_REFILL 個/トークン(既定: RAM 8 / SSD 2、
+  「欲しかったが不在」の expert を QWEN_RESIDENT_REFILL 個/トークン(既定: RAM 8 / SSD 4、
   0で無効)まで裏から取り寄せ、次トークンからマスクに合流させる。実際に使った expert は
   touch して LRU を保つ(補充の追い出しが古株に当たるように)。
   実測(短プロンプト → Java Swing コード 400 tok、greedy):
@@ -178,6 +178,9 @@ perplexity 級の定量評価は今後。
 ## 今後
 
 - pruning / 常駐限定 decode の品質定量評価(perplexity、長文ループ検査)、層別 eps。
-- 常駐限定 decode 中のバックグラウンド補充(「欲しかったが不在」の集計と copy stream 補充)。
 - CUDA graph 実キャプチャ(マスク完成後は入力アドレス固定が可能)。
 - server の切断検出をチャンク間 → 層間コールバックに(要 GDN state の整合設計)。
+
+運用知見(48GB Mac, Qwen3.5-122B-A10B, SSD tier, 16 tok/s): 常駐限定 decode で日本語の
+カタカナ語が欠ける軽微な劣化(「コンポーネット」等)→ **日本語ワークロードで作った
+--cache-profile の preload が最も効いた**。refill/warmup の既定を SSD 4 / 32 に引き上げ。

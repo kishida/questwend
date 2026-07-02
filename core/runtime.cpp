@@ -2760,7 +2760,7 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     static const int res_min = []{ const char * c = getenv("QWEN_RESIDENT_MIN");
                                    const int v = c ? atoi(c) : 32; return v < 1 ? 32 : v; }();
     static const int warm_tok = []{ const char * c = getenv("QWEN_RESIDENT_WARMUP");
-                                    const int v = c ? atoi(c) : 16; return v < 0 ? 16 : v; }();
+                                    const int v = c ? atoi(c) : 32; return v < 0 ? 32 : v; }();
     const int floor_res = fast_warm_tokens > warm_tok
                               ? n_used
                               : std::max(n_used, std::min(res_min, n_exp));
@@ -2845,7 +2845,7 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
         // per-token fetch budget: RAM-tier installs are async H2D (cheap); the
         // SSD tier reads synchronously, so default much lower there
         static const int refill_budget = [this]{ const char * c = getenv("QWEN_RESIDENT_REFILL");
-                                                 const int v = c ? atoi(c) : (ssd_mode ? 2 : 8);
+                                                 const int v = c ? atoi(c) : (ssd_mode ? 4 : 8);
                                                  return v < 0 ? 0 : v; }();
         if (refill_budget > 0) {
             ggml_backend_tensor_get(sel_all,  sel_host.data(),  0, sel_host.size()  * sizeof(int32_t));
