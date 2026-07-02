@@ -39,7 +39,7 @@ softmax / top-k する。効果:
    終盤層が短いプロンプトで32種に届かない問題への締め切り。
 3. **バックグラウンド補充** — グラフは**マスク前のrouterが本来選びたかった
    top-k(`want_all`)も記録**しており、ホストが毎トークン
-   `QWEN_RESIDENT_REFILL` 個(既定: RAM 8 / SSD 4、**全層合計**)を上限に
+   `QWEN_RESIDENT_REFILL` 個(既定 8、**全層合計**)を上限に
    「欲しいのに不在」のexpertを非同期ロードする。走査の開始層は
    毎トークン1つずつ回る(round-robin)が、予算は層をまたいで共有なので、
    最初に走査された層の不足が多いとそのトークンの枠を使い切る。
@@ -65,9 +65,9 @@ softmax / top-k する。効果:
   会話・コードで目視破綻なし。
 - **ドメイン切替に弱い**: 凍結パレットは「プロンプト+最初の~32トークン」で
   決まるため、生成の途中で話題の層が変わる(例: 説明文 → CSSの数値列)と、
-  その文脈が要求するexpertがパレットに無いことがある。補充はSSD階層で
-  毎トークン4個なので、48層×最大k個の不足が同時発生すると追いつくまで
-  百トークン以上のラグがあり、その間**同じ文脈では毎回同じ代替が起きる**。
+  その文脈が要求するexpertがパレットに無いことがある。補充は全層合計で
+  毎トークン8個なので、48層×最大k個の不足が同時発生すると追いつくまで
+  数十〜百トークンのラグがあり、その間**同じ文脈では毎回同じ代替が起きる**。
   ランダムなノイズではなく「特定パターンが全域で一貫して崩れる」形で現れる
   (実例: OpenCodeでのWeb画面生成時、スタイルシートの数値の後の `px` が
   全域で欠落)。
@@ -79,7 +79,7 @@ softmax / top-k する。効果:
 
 1. 同じプロンプトを `--resident-decode` なしで再実行 → 直れば本機能の近似が原因
    (llama.cpp同一GGUFとの比較なら量子化・モデル素の挙動も切り分けられる)
-2. `--resident-refill` を増やす(SSDでも 8〜16)、`--resident-warmup` を伸ばす
+2. `--resident-refill` を増やす(16 など)、`--resident-warmup` を伸ばす
 3. 対象ドメインのテキストがプロンプトに含まれるようにする(prefillが温める)。
    その際 `--prefill-prune` は切る
 4. 精度優先タスク(コード生成など)では `--resident-decode` を外す運用が確実
@@ -91,6 +91,6 @@ softmax / top-k する。効果:
 | `--resident-decode` / `QWEN_RESIDENT_DECODE=1` | off | 常駐限定ルーティングdecode(lossy) |
 | `QWEN_RESIDENT_MIN=N` | 32 | マスク発動に必要な層あたり常駐数 |
 | `--resident-warmup` / `QWEN_RESIDENT_WARMUP=N` | 32 | このdecodeトークン数の後は常駐数を問わずマスク固定 |
-| `--resident-refill` / `QWEN_RESIDENT_REFILL=N` | RAM 8 / SSD 4 | マスク中の補充expert数/トークン(**全層合計**; 0=完全凍結、非推奨) |
+| `--resident-refill` / `QWEN_RESIDENT_REFILL=N` | 8 | マスク中の補充expert数/トークン(**全層合計**; 0=完全凍結、非推奨) |
 | `--prefill-prune <eps>` | off | prefillでの低質量非常駐expertのfetchスキップ(lossy) |
 | `QWEN_FASTCACHE=1` | off | マスク無しの楽観単一グラフ版(全常駐前提+ミス時フォールバック) |

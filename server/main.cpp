@@ -529,7 +529,7 @@ int main(int argc, char ** argv) {
             "offload tuning (equivalent to the QWEN_* env vars; flag wins):\n"
             "  --resident-decode   resident-only routing decode: fused graph, no per-token miss\n"
             "                      (lossy; auto-warmup + background refill keep quality)\n"
-            "  --resident-refill <N>  refilled experts per token while masked (default: RAM 8, SSD 4; 0 = frozen)\n"
+            "  --resident-refill <N>  refilled experts per token while masked, all layers combined (default 8; 0 = frozen)\n"
             "  --resident-warmup <N>  decode tokens before the mask locks in (default 32)\n"
             "  --prefill-prune <eps>  skip fetching low-router-mass experts in prefill (lossy; e.g. 0.05)\n"
             "  --batch-chunk <N>   prefill chunk length in tokens (default 4096)\n"

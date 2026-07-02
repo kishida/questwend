@@ -155,7 +155,7 @@ QWEN_COAL_DEBUG=1 で run ごとの read/upload 時間を表示。
 - **バックグラウンド補充(重要)**: 完全凍結は短プロンプト+コード生成で顕著に破綻する
   (ユーザー報告: Java コードが壊れ、コメント羅列に退化)。融合グラフ内でマスク前 logits の
   top-k(=本来選びたかった expert、`want_all`)も記録し、毎トークン読み戻して
-  「欲しかったが不在」の expert を QWEN_RESIDENT_REFILL 個/トークン(既定: RAM 8 / SSD 4、
+  「欲しかったが不在」の expert を QWEN_RESIDENT_REFILL 個/トークン(全層合計、既定 8、
   0で無効)まで裏から取り寄せ、次トークンからマスクに合流させる。実際に使った expert は
   touch して LRU を保つ(補充の追い出しが古株に当たるように)。
   実測(短プロンプト → Java Swing コード 400 tok、greedy):

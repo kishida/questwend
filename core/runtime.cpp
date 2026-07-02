@@ -2954,11 +2954,13 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
         // wanted-but-absent experts within a per-token budget (they join the
         // mask next token via the stamp), and touch the actually-used experts
         // so the refill's LRU evictions land on stale entries, not hot ones.
-        // per-token fetch budget: RAM-tier installs are async H2D (cheap); the
-        // SSD tier reads synchronously, so default much lower there
-        static const int refill_budget = [this]{ const char * c = getenv("QWEN_RESIDENT_REFILL");
-                                                 const int v = c ? atoi(c) : (ssd_mode ? 4 : 8);
-                                                 return v < 0 ? 0 : v; }();
+        // per-token fetch budget, shared across all layers (see the round-robin
+        // scan below). One default for both tiers: the SSD tier reads
+        // synchronously and used to default lower (4), but that starves the
+        // palette after a mid-generation domain shift (docs/resident_decode.md)
+        static const int refill_budget = []{ const char * c = getenv("QWEN_RESIDENT_REFILL");
+                                             const int v = c ? atoi(c) : 8;
+                                             return v < 0 ? 0 : v; }();
         if (refill_budget > 0) {
             ggml_backend_tensor_get(sel_all,  sel_host.data(),  0, sel_host.size()  * sizeof(int32_t));
             ggml_backend_tensor_get(want_all, want_host.data(), 0, want_host.size() * sizeof(int32_t));
