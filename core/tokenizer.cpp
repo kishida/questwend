@@ -86,9 +86,22 @@ int32_t Tokenizer::token_to_id(const std::string & tok) const {
     return it == token_ids_.end() ? -1 : it->second;
 }
 
-// GPT-2-style pretokenization (approximate). Splits into pieces of:
-// contraction | optional-space+letters | optional-space+digits |
-// optional-space+others | whitespace runs.
+// Qwen3.5 pretokenization (tokenizer.json / llama.cpp pre_type "qwen35"):
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)
+// | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+// | \p{N}
+// |  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+// | \s*[\r\n]+
+// | \s+(?!\S)
+// | \s+
+// Alternatives are tried in order at each position, like the regex engine.
+// The details matter for staying on the model's canonical tokenization:
+// a word absorbs ONE preceding symbol (".spring" is a single piece, which
+// is how "org.springframework" tokenizes), an indentation run leaves its
+// last space to the following word (" return"), digits split one at a
+// time, and a symbol run absorbs trailing newlines (";\n").
+// \p{L}\p{M} is approximated as "ASCII letters or any codepoint > 0x7F"
+// (CJK punctuation counts as letters; acceptable for chat text).
 std::vector<std::string> Tokenizer::pretokenize(const std::string & text) const {
     auto cps = utf8_decode(text);
     std::vector<std::string> pieces;
@@ -96,6 +109,8 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string & text) const 
     auto is_space  = [](uint32_t c){ return c==' '||c=='\t'||c=='\n'||c=='\r'||c==0x0b||c==0x0c; };
     auto is_letter = [](uint32_t c){ return (c>='A'&&c<='Z')||(c>='a'&&c<='z')|| c>0x7F; };
     auto is_digit  = [](uint32_t c){ return c>='0'&&c<='9'; };
+    auto is_punct  = [&](uint32_t c){ return !is_space(c) && !is_letter(c) && !is_digit(c); };
+    auto lower     = [](uint32_t c){ return c>='A'&&c<='Z' ? c+32 : c; };
 
     const size_t n = cps.size();
     size_t i = 0;
@@ -106,32 +121,40 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string & text) const 
 
     while (i < n) {
         const uint32_t c = cps[i].cp;
-        // contractions: 'x
+        // (?i:'s|'t|'re|'ve|'m|'ll|'d)
         if (c == '\'' && i + 1 < n) {
-            // 's 't 'm 'd
-            uint32_t d = cps[i+1].cp;
+            const uint32_t d = lower(cps[i+1].cp);
             if (d=='s'||d=='t'||d=='m'||d=='d') { emit(i, i+2); i += 2; continue; }
             if (i + 2 < n) {
-                uint32_t e = cps[i+2].cp;
+                const uint32_t e = lower(cps[i+2].cp);
                 if ((d=='r'&&e=='e')||(d=='v'&&e=='e')||(d=='l'&&e=='l')) { emit(i, i+3); i += 3; continue; }
             }
         }
-        const bool lead_space = is_space(c);
-        size_t start = i;
-        if (lead_space && i + 1 < n && !is_space(cps[i+1].cp)) {
-            // " ?" + word/number/other: consume the single leading space with the run
-            size_t j = i + 1;
-            uint32_t c1 = cps[j].cp;
-            if (is_letter(c1))      { while (j<n && is_letter(cps[j].cp)) ++j; }
-            else if (is_digit(c1))  { while (j<n && is_digit(cps[j].cp)) ++j; }
-            else                    { while (j<n && !is_space(cps[j].cp) && !is_letter(cps[j].cp) && !is_digit(cps[j].cp)) ++j; }
-            emit(start, j); i = j; continue;
+        // [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+        if (is_letter(c)) {
+            size_t j = i + 1; while (j < n && is_letter(cps[j].cp)) ++j;
+            emit(i, j); i = j; continue;
         }
-        if (is_letter(c))      { size_t j=i; while (j<n && is_letter(cps[j].cp)) ++j; emit(i,j); i=j; continue; }
-        if (is_digit(c))       { size_t j=i; while (j<n && is_digit(cps[j].cp)) ++j; emit(i,j); i=j; continue; }
-        if (is_space(c))       { size_t j=i; while (j<n && is_space(cps[j].cp)) ++j; emit(i,j); i=j; continue; }
-        // other run
-        { size_t j=i; while (j<n && !is_space(cps[j].cp) && !is_letter(cps[j].cp) && !is_digit(cps[j].cp)) ++j; emit(i,j); i=j; }
+        if (c != '\r' && c != '\n' && !is_digit(c) && i + 1 < n && is_letter(cps[i+1].cp)) {
+            size_t j = i + 2; while (j < n && is_letter(cps[j].cp)) ++j;
+            emit(i, j); i = j; continue;
+        }
+        // \p{N}  (one digit per piece)
+        if (is_digit(c)) { emit(i, i + 1); ++i; continue; }
+        //  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+        if (is_punct(c) || (c == ' ' && i + 1 < n && is_punct(cps[i+1].cp))) {
+            size_t j = c == ' ' ? i + 1 : i;
+            while (j < n && is_punct(cps[j].cp)) ++j;
+            while (j < n && (cps[j].cp=='\n' || cps[j].cp=='\r')) ++j;
+            emit(i, j); i = j; continue;
+        }
+        // \s*[\r\n]+ | \s+(?!\S) | \s+
+        size_t j = i; while (j < n && is_space(cps[j].cp)) ++j;
+        size_t nl_end = i;   // one past the last \r\n in the run (i: none)
+        for (size_t k = i; k < j; ++k) if (cps[k].cp=='\n' || cps[k].cp=='\r') nl_end = k + 1;
+        if (nl_end > i)         { emit(i, nl_end); i = nl_end; continue; }  // \s*[\r\n]+
+        if (j < n && j - i > 1) { emit(i, j - 1); i = j - 1; continue; }    // \s+(?!\S)
+        emit(i, j); i = j;                                                  // \s+
     }
     return pieces;
 }

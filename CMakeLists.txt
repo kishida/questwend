@@ -45,6 +45,10 @@ target_link_libraries(questwend_core PUBLIC ggml)
 add_executable(qw-cli cli/main.cpp)
 target_link_libraries(qw-cli PRIVATE questwend_core)
 
+# ---- tokenizer cross-check tool (tests/tokenize_main.cpp) ----
+add_executable(qw-tokenize tests/tokenize_main.cpp)
+target_link_libraries(qw-tokenize PRIVATE questwend_core)
+
 # ---- Server (OpenAI-compatible) ----
 add_executable(qw-server server/main.cpp third_party/cpp-httplib/httplib.cpp)
 target_include_directories(qw-server PRIVATE
