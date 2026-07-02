@@ -39,8 +39,12 @@ softmax / top-k する。効果:
    終盤層が短いプロンプトで32種に届かない問題への締め切り。
 3. **バックグラウンド補充** — グラフは**マスク前のrouterが本来選びたかった
    top-k(`want_all`)も記録**しており、ホストが毎トークン
-   `QWEN_RESIDENT_REFILL` 個(既定: RAM 8 / SSD 4)を上限に
-   「欲しいのに不在」のexpertを非同期ロードする。ロード済みは次トークン
+   `QWEN_RESIDENT_REFILL` 個(既定: RAM 8 / SSD 4、**全層合計**)を上限に
+   「欲しいのに不在」のexpertを非同期ロードする。走査の開始層は
+   毎トークン1つずつ回る(round-robin)が、予算は層をまたいで共有なので、
+   最初に走査された層の不足が多いとそのトークンの枠を使い切る。
+   全層に不足がある状態(ドメイン切替直後)では各層への補充は
+   数十トークンに1回のペースになる点に注意。ロード済みは次トークン
    からマスクに合流する。実際に使ったexpertは毎トークンtouchされ、
    補充による追い出しが古株に当たるようにしている。
 
@@ -87,6 +91,6 @@ softmax / top-k する。効果:
 | `--resident-decode` / `QWEN_RESIDENT_DECODE=1` | off | 常駐限定ルーティングdecode(lossy) |
 | `QWEN_RESIDENT_MIN=N` | 32 | マスク発動に必要な層あたり常駐数 |
 | `--resident-warmup` / `QWEN_RESIDENT_WARMUP=N` | 32 | このdecodeトークン数の後は常駐数を問わずマスク固定 |
-| `--resident-refill` / `QWEN_RESIDENT_REFILL=N` | RAM 8 / SSD 4 | マスク中の補充expert数/トークン(0=完全凍結、非推奨) |
+| `--resident-refill` / `QWEN_RESIDENT_REFILL=N` | RAM 8 / SSD 4 | マスク中の補充expert数/トークン(**全層合計**; 0=完全凍結、非推奨) |
 | `--prefill-prune <eps>` | off | prefillでの低質量非常駐expertのfetchスキップ(lossy) |
 | `QWEN_FASTCACHE=1` | off | マスク無しの楽観単一グラフ版(全常駐前提+ミス時フォールバック) |
