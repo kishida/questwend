@@ -332,8 +332,22 @@ struct Runtime::Impl {
     void decode_verify_cached(const std::vector<int32_t> & toks); // offload variant (decode_cached_batch)
     void generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                       const std::function<bool(int32_t)> & on_token,
-                      int32_t * out_pending = nullptr);
+                      int32_t * out_pending = nullptr,
+                      bool ckpt_after_prefill = false);
     void prefill(const std::vector<int32_t> & toks, bool mtp_kv);
+
+    // ---- prompt-position checkpoints (prefix-cache rewind) ----
+    // Attention KV rows survive a rewind in place, but the GDN recurrent state
+    // only exists "as of n_past", so mid-prompt reuse needs host snapshots.
+    struct PromptCkpt {
+        int pos = 0, mtp_past = 0, mrope = 0;
+        std::vector<float>   hidden;   // mtp_hidden at pos (nextn KV bridge)
+        std::vector<uint8_t> blob;     // conv+ssm states, layer order
+    };
+    std::vector<PromptCkpt> pk;        // sorted by pos ascending
+    void pk_snapshot();
+    int  pk_best(int n) const;
+    int  pk_rewind(int n);
 
     // ---- Phase B v2 dynamic-cache decode (single token) ----
     void init_cache();
@@ -1592,7 +1606,7 @@ void Runtime::Impl::prefill(const std::vector<int32_t> & toks, bool mtp_kv) {
 
 void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                                  const std::function<bool(int32_t)> & on_token,
-                                 int32_t * out_pending) {
+                                 int32_t * out_pending, bool ckpt_after_prefill) {
     const auto & hp = model.hparams();
     const bool gdn = hp.has_gdn;
     const int  K   = n_draft < 1 ? 1 : n_draft;
@@ -1619,6 +1633,9 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
     if (P > 0) prefill(prompt, /*mtp_kv=*/true);
     std::vector<float> mlog = logits;    // logits of the last prefilled token
     kv_toks.insert(kv_toks.end(), prompt.begin(), prompt.end());
+    // prompt fully in KV, nothing generated yet: the state the next request
+    // rewinds to when the client edits/drops parts of this turn's output
+    if (ckpt_after_prefill && P > 0) pk_snapshot();
     int32_t x = argmax(mlog);            // first generated token
     // invariant at loop top: n_past = pos(x), mtp_past = pos(x)-1, mtp_hidden = h_{pos(x)-1}
     int generated = 0;
@@ -2697,6 +2714,101 @@ void Runtime::Impl::restore_ckpt(int t) {
     }
 }
 
+// ---- prompt-position checkpoints (prefix-cache rewind) ----
+// A history edit (e.g. a client dropping the previous turn's reasoning) makes
+// the new prompt diverge mid-way through the cached tokens. The attention KV
+// prefix stays valid in place, but GDN states cannot be truncated — they are
+// restored from the newest host snapshot at or before the divergence point,
+// and only the tail after it is re-prefilled.
+static size_t pk_max() {
+    static const size_t v = []{
+        const char * c = getenv("QWEN_PROMPT_CKPTS");
+        return (size_t) (c ? atoi(c) : 8);
+    }();
+    return v;
+}
+
+void Runtime::Impl::pk_snapshot() {
+    const auto & hp = model.hparams();
+    if (!hp.has_gdn || pk_max() == 0) return;   // attention-only: truncation is free
+    if (n_past <= 0) return;
+    if (!pk.empty() && pk.back().pos == n_past) return;
+    PromptCkpt c;
+    c.pos      = n_past;
+    c.mtp_past = mtp_past;
+    c.mrope    = mrope_next;
+    c.hidden   = mtp_hidden;
+    size_t total = 0;
+    for (int il = 0; il < (int) hp.n_layer; ++il)
+        if (conv_state[il]) total += ggml_nbytes(conv_state[il]) + ggml_nbytes(ssm_state[il]);
+    c.blob.resize(total);
+    size_t off = 0;
+    for (int il = 0; il < (int) hp.n_layer; ++il) {
+        if (!conv_state[il]) continue;
+        ggml_backend_tensor_get(conv_state[il], c.blob.data() + off, 0, ggml_nbytes(conv_state[il]));
+        off += ggml_nbytes(conv_state[il]);
+        ggml_backend_tensor_get(ssm_state[il], c.blob.data() + off, 0, ggml_nbytes(ssm_state[il]));
+        off += ggml_nbytes(ssm_state[il]);
+    }
+    auto it = std::lower_bound(pk.begin(), pk.end(), c.pos,
+                               [](const PromptCkpt & a, int p) { return a.pos < p; });
+    if (it != pk.end() && it->pos == c.pos) *it = std::move(c);
+    else pk.insert(it, std::move(c));
+    // evict the checkpoint whose removal leaves the smallest gap to its
+    // predecessor (never the newest) — keeps positions spread over the prefix
+    while (pk.size() > pk_max()) {
+        size_t worst = 0;
+        int wgap = pk[0].pos;
+        for (size_t i = 1; i + 1 < pk.size(); ++i) {
+            const int gap = pk[i].pos - pk[i-1].pos;
+            if (gap < wgap) { wgap = gap; worst = i; }
+        }
+        pk.erase(pk.begin() + worst);
+    }
+}
+
+int Runtime::Impl::pk_best(int n) const {
+    if (n <= 0) return -1;
+    const auto & hp = model.hparams();
+    if (!hp.has_gdn)   // attention-only: any position works (text-only lineage)
+        return mrope_next == n_past ? std::min(n, n_past) : -1;
+    int best = -1;
+    for (const auto & c : pk) { if (c.pos > n) break; best = c.pos; }
+    return best;
+}
+
+int Runtime::Impl::pk_rewind(int n) {
+    const auto & hp = model.hparams();
+    if (n >= (int) kv_toks.size()) return (int) kv_toks.size();   // nothing to rewind
+    if (!hp.has_gdn) {
+        if (mrope_next != n_past) return -1;   // image lineage: positions ambiguous
+        n_past = n;
+        mrope_next = n;
+        if (mtp_past > n) mtp_past = n;
+        kv_toks.resize(n);
+        return n;
+    }
+    int bi = -1;
+    for (int i = 0; i < (int) pk.size(); ++i) { if (pk[i].pos > n) break; bi = i; }
+    if (bi < 0) return -1;
+    const PromptCkpt & c = pk[bi];
+    size_t off = 0;
+    for (int il = 0; il < (int) hp.n_layer; ++il) {
+        if (!conv_state[il]) continue;
+        ggml_backend_tensor_set(conv_state[il], c.blob.data() + off, 0, ggml_nbytes(conv_state[il]));
+        off += ggml_nbytes(conv_state[il]);
+        ggml_backend_tensor_set(ssm_state[il], c.blob.data() + off, 0, ggml_nbytes(ssm_state[il]));
+        off += ggml_nbytes(ssm_state[il]);
+    }
+    n_past     = c.pos;
+    mtp_past   = c.mtp_past;
+    mrope_next = c.mrope;
+    mtp_hidden = c.hidden;
+    kv_toks.resize(c.pos);
+    pk.erase(pk.begin() + bi + 1, pk.end());   // later snapshots: dead lineage
+    return c.pos;
+}
+
 // Optimistic single-graph decode: run the whole token in one persistent
 // (CUDA-graph friendly) graph that reads experts from the VRAM cache via an
 // in-graph slot remap, then verify residency. On a miss, roll back recurrent
@@ -3086,14 +3198,17 @@ const std::vector<float> & Runtime::mtp_draft(int32_t token) { return impl_->mtp
 bool Runtime::has_mtp() const { return impl_->model.hparams().has_mtp(); }
 void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                            const std::function<bool(int32_t)> & on_token,
-                           int32_t * out_pending) {
-    impl_->generate_mtp(prompt, max_new, n_draft, on_token, out_pending);
+                           int32_t * out_pending, bool ckpt_after_prefill) {
+    impl_->generate_mtp(prompt, max_new, n_draft, on_token, out_pending, ckpt_after_prefill);
 }
 void Runtime::prefill(const std::vector<int32_t> & tokens, bool mtp_kv) {
     impl_->prefill(tokens, mtp_kv);
     impl_->kv_toks.insert(impl_->kv_toks.end(), tokens.begin(), tokens.end());
 }
-void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->mrope_next = 0; impl_->kv_toks.clear(); impl_->zero_states(); }
+void Runtime::snapshot_ckpt()          { impl_->pk_snapshot(); }
+int  Runtime::best_ckpt(int n) const   { return impl_->pk_best(n); }
+int  Runtime::rewind_to(int n)         { return impl_->pk_rewind(n); }
+void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->mrope_next = 0; impl_->kv_toks.clear(); impl_->pk.clear(); impl_->zero_states(); }
 int  Runtime::n_past() const { return impl_->n_past; }
 const std::vector<int32_t> & Runtime::kv_tokens() const { return impl_->kv_toks; }
 bool Runtime::has_expert_cache() const { return impl_->ecache != nullptr; }
@@ -3209,6 +3324,7 @@ void Runtime::load_state(const std::function<void(void *, size_t)> & src) {
     impl_->mrope_next = h.mrope_next;
     impl_->kv_toks    = std::move(toks);
     impl_->mtp_hidden = std::move(hidden);
+    impl_->pk.clear();   // checkpoints belong to the replaced lineage
 }
 
 } // namespace questwend

@@ -67,9 +67,12 @@ public:
     // tokens that were never offered to on_token can additionally sit at the
     // tail of kv_tokens() (a mid-cycle stop); the caller is responsible for
     // delivering those before resuming.
+    // ckpt_after_prefill: take a prompt checkpoint (see snapshot_ckpt) once the
+    // prompt is fully in KV, before any token is generated.
     void generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                       const std::function<bool(int32_t)> & on_token,
-                      int32_t * out_pending = nullptr);
+                      int32_t * out_pending = nullptr,
+                      bool ckpt_after_prefill = false);
 
     void reset();                 // clear KV cache / position
     int  n_past() const;
@@ -87,9 +90,25 @@ public:
     // Tokens currently represented in the KV cache / recurrent state, in order.
     // Maintained across decode() / generate_mtp(); cleared by reset(). Enables
     // prompt prefix reuse: if a new prompt extends exactly these tokens, the
-    // caller may skip reset() and decode only the tail (GDN state cannot be
-    // rewound, so reuse requires the full token list to be a prompt prefix).
+    // caller may skip reset() and decode only the tail. When the new prompt
+    // diverges mid-way, rewind_to() can resume from a prompt checkpoint at or
+    // before the divergence instead of a full reset.
     const std::vector<int32_t> & kv_tokens() const;
+
+    // ---- prompt checkpoints (mid-prefix rewind) ----
+    // Attention KV rows survive a rewind in place; the GDN recurrent state
+    // cannot be truncated, so snapshot_ckpt() copies it (plus the MTP bridge
+    // state) to host RAM tagged with the current n_past (~2 MB per GDN layer;
+    // ring of QWEN_PROMPT_CKPTS, default 8, geometric thinning). Call it at
+    // prefill chunk boundaries / prompt end. rewind_to(n) restores the newest
+    // checkpoint at pos <= n, truncates kv_tokens()/n_past to it and drops
+    // later checkpoints; returns the new position, or -1 (caller resets).
+    // best_ckpt(n) previews that position without touching state. On a pure
+    // attention model rewind_to(n) is exact (no snapshots needed). All
+    // checkpoints are dropped on reset() and load_state().
+    void snapshot_ckpt();
+    int  best_ckpt(int n) const;
+    int  rewind_to(int n);
 
     // ---- prompt-cache slots: save / restore the full inference state ----
     // The stream covers the KV prefix for the current n_past (and the MTP KV

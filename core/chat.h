@@ -61,6 +61,11 @@ struct ChatPrompt {
     // <|image_pad|> run, plus the ContentPart::image_index it refers to.
     struct ImageSpan { int first = 0, count = 0, image_index = -1; };
     std::vector<ImageSpan> image_spans;
+    // Index in `ids` where the generation prompt (<|im_start|>assistant ...)
+    // starts; -1 without add_generation_prompt. A future request that rewrites
+    // the assistant turn (e.g. drops its reasoning) re-tokenizes identically up
+    // to exactly this point, so it is a natural prompt-checkpoint position.
+    int gen_prompt_begin = -1;
 };
 
 // Build the full prompt token sequence (Qwen3.6 template semantics).

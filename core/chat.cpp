@@ -81,7 +81,10 @@ ChatPrompt build_qwen_prompt(const Tokenizer & tok,
             if (has_image(m)) throw std::runtime_error("chat: model has no ChatML/vision tokens");
             emit_text(m.role + ": " + flat_text(m) + "\n");
         }
-        if (opts.add_generation_prompt) emit_text("assistant: ");
+        if (opts.add_generation_prompt) {
+            out.gen_prompt_begin = (int) ids.size();
+            emit_text("assistant: ");
+        }
         return out;
     }
 
@@ -199,8 +202,16 @@ ChatPrompt build_qwen_prompt(const Tokenizer & tok,
             reasoning = trim_ws(reasoning);
 
             emit_tok(im_start);
+            // Official template: turns after the last user query always carry a
+            // <think> block (empty if the client dropped the reasoning); older
+            // turns lose it. preserve_thinking additionally keeps *non-empty*
+            // reasoning on older turns so a history that echoes reasoning back
+            // re-tokenizes identically to what was generated (prefix cache hit).
+            // An empty block on older turns would deviate from the template for
+            // clients that never echo reasoning (e.g. OpenCode), so it is not kept.
             const bool keep_think =
-                (opts.preserve_thinking || (int) i > last_query_index) &&
+                ((int) i > last_query_index ||
+                 (opts.preserve_thinking && !reasoning.empty())) &&
                 think_open >= 0 && think_close >= 0;
             if (keep_think) {
                 emit_text("assistant\n");
@@ -241,6 +252,7 @@ ChatPrompt build_qwen_prompt(const Tokenizer & tok,
 
     // ---- generation prompt ----
     if (opts.add_generation_prompt) {
+        out.gen_prompt_begin = (int) ids.size();
         emit_tok(im_start);
         emit_text("assistant\n");
         if (think_open >= 0) {
