@@ -10,6 +10,7 @@
 
 #include <cassert>
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <cmath>
 
@@ -2319,7 +2320,12 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     // ne21 = n_rows (batch size)
     const int ne21_mm_id_min = 32;
 
-    if (props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
+    // [qwencpp] QWEN_METAL_MMID_MV=1 forces the matrix-vector path for every
+    // batch size: A/B switch for validating the blocked mm_id_map0 kernel
+    // (expert-pool ne02 > threadgroup limit) against the simple mv kernel.
+    static const bool force_mv = getenv("QWEN_METAL_MMID_MV") != nullptr;
+
+    if (!force_mv && props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
         // some Metal matrix data types require aligned pointers
         // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf (Table 2.5)
         //switch (op->src[0]->type) {
