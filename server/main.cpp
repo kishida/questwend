@@ -492,6 +492,7 @@ int main(int argc, char ** argv) {
     std::string cache_slots_dir;
     int  time_slice = 64;   // generation tokens per turn when requests contend
                             // (needs --cache-slots to park state; 0 = back-to-back)
+    float repeat_penalty_default = 1.0f;   // used when the request sends none
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -512,6 +513,7 @@ int main(int argc, char ** argv) {
         else if (a == "--cache-slots-dir" && i + 1 < argc) cache_slots_dir = argv[++i];
         else if (a == "--time-slice" && i + 1 < argc) time_slice = std::stoi(argv[++i]);
         else if (a == "--heartbeat" && i + 1 < argc) set_knob("QWEN_HEARTBEAT", argv[++i]);
+        else if (a == "--repeat-penalty" && i + 1 < argc) repeat_penalty_default = std::stof(argv[++i]);
         else if (a == "--cpu")              force_cpu = true;
         else if (a == "--resident-decode")  set_knob("QWEN_RESIDENT_DECODE", "1");
         else if (a == "--resident-refill" && i + 1 < argc) set_knob("QWEN_RESIDENT_REFILL", argv[++i]);
@@ -549,6 +551,8 @@ int main(int argc, char ** argv) {
             "  --time-slice <N>    interleave concurrent streaming requests every N generated tokens\n"
             "                      (default 64; takes effect with --cache-slots; 0 = run back-to-back)\n"
             "  --heartbeat <on|off>  SSE keepalive chunks while queued / between prefill chunks (default on)\n"
+            "  --repeat-penalty <f>  default repetition penalty when the request sends none\n"
+            "                      (plain decode only, MTP is greedy; default 1 = off)\n"
             "  --cpu               force CPU backend\n"
             "offload tuning (equivalent to the QWEN_* env vars; flag wins):\n"
             "  --resident-decode   resident-only routing decode: fused graph, no per-token miss\n"
@@ -1113,12 +1117,18 @@ int main(int argc, char ** argv) {
         }
         return msgs;
     };
-    auto make_sampler = [](const json & body) {
+    auto make_sampler = [repeat_penalty_default](const json & body) {
         SamplerConfig sc;
         sc.temperature = body.value("temperature", 0.7f);
         sc.top_p       = body.value("top_p", 0.95f);
         sc.top_k       = body.value("top_k", 40);
         sc.seed        = body.value("seed", 0);
+        // repetition control (plain decode; MTP is greedy and ignores sampling)
+        sc.repeat_penalty    = body.value("repetition_penalty",
+                               body.value("repeat_penalty", repeat_penalty_default));
+        sc.presence_penalty  = body.value("presence_penalty", 0.0f);
+        sc.frequency_penalty = body.value("frequency_penalty", 0.0f);
+        sc.repeat_last_n     = body.value("repeat_last_n", 64);
         return sc;
     };
 
@@ -1297,6 +1307,7 @@ int main(int argc, char ** argv) {
                 int generated = 0, max_tokens = 0, prompt_tokens = 0;
                 bool started = false, finished = false;
                 clk::time_point t0, t_prefill, t_first;
+                clk::time_point gen_log;          // last long-output progress line
                 State(const SamplerConfig & sc) : smp(sc) {}
                 ~State() { if (holding && tl) tl->unlock(); }   // client disconnect mid-slice
             };
@@ -1323,6 +1334,7 @@ int main(int argc, char ** argv) {
             // the stream starts inside the reasoning block
             st->phase = (reasoning && tok->token_to_id("<think>") >= 0)
                 ? State::Phase::Reason : State::Phase::Content;
+            st->smp.prime(prompt);   // repetition-penalty window (prompt tail)
 
             res.set_chunked_content_provider("text/event-stream",
                 [&, st, id, created, req_mtp, n_draft](size_t, httplib::DataSink & sink) -> bool {
@@ -1414,7 +1426,16 @@ int main(int argc, char ** argv) {
                         return false;
                     };
                     auto emit_piece = [&](int32_t t) -> bool {   // SSE chunk(s) for one token
-                        if (st->generated == 0) st->t_first = clk::now();
+                        if (st->generated == 0) {
+                            st->t_first = clk::now();
+                            st->gen_log = st->t_first;
+                        } else if (clk::now() - st->gen_log >= std::chrono::seconds(10)) {
+                            // long-output progress, throttled like the prefill lines
+                            const double el = std::chrono::duration<double>(clk::now() - st->t_first).count();
+                            fprintf(stderr, "  [%s] gen %d tok, %.1f tok/s\n",
+                                    clock_hms().c_str(), st->generated, el > 0 ? st->generated / el : 0.0);
+                            st->gen_log = clk::now();
+                        }
                         const std::string piece = tok->decode(t);
                         st->text += piece;
                         st->hold += piece;
@@ -1710,6 +1731,7 @@ int main(int argc, char ** argv) {
                             st->t_first   = st->t_prefill;   // overwritten on the first emitted token
                         }
                         int next = st->smp.sample(st->logits);
+                        st->smp.accept(next);   // repetition-penalty window
                         // stop on EOS, token budget, or context limit (avoids overflow crash)
                         if (is_stop(next) || st->generated >= st->max_tokens || rt->n_past() + 1 >= n_ctx)
                             return finish();
@@ -1761,11 +1783,18 @@ int main(int argc, char ** argv) {
                     prompt.erase(prompt.begin(), prompt.begin() + gen_rel);
                 }
                 bool first = true;
+                clk::time_point glog = clk::now();
                 rt->generate_mtp(prompt, max_tokens, n_draft, [&](int32_t t) -> bool {
                     if (is_stop(t) || rt->n_past() + 1 >= n_ctx) return false;
-                    if (first) { t_prefill = clk::now(); first = false; }
+                    if (first) { t_prefill = clk::now(); glog = t_prefill; first = false; }
                     text += tok->decode(t);
                     ++generated;
+                    if (clk::now() - glog >= std::chrono::seconds(10)) {   // long-output progress
+                        const double el = std::chrono::duration<double>(clk::now() - t_prefill).count();
+                        fprintf(stderr, "  [%s] gen %d tok, %.1f tok/s\n",
+                                clock_hms().c_str(), generated, el > 0 ? generated / el : 0.0);
+                        glog = clk::now();
+                    }
                     return generated < max_tokens;
                 }, nullptr, /*ckpt_after_prefill=*/true);
             } else {
@@ -1779,11 +1808,20 @@ int main(int argc, char ** argv) {
                 auto logits = rt->decode(prompt);
                 rt->snapshot_ckpt();   // rewind point at prompt end
                 t_prefill = clk::now();
+                smp.prime(cp.ids);     // repetition-penalty window (prompt tail)
+                clk::time_point glog = clk::now();
                 for (int t = 0; t < max_tokens; ++t) {
                     int next = smp.sample(logits);
+                    smp.accept(next);
                     if (is_stop(next) || rt->n_past() + 1 >= n_ctx) break;
                     text += tok->decode(next);
                     ++generated;
+                    if (clk::now() - glog >= std::chrono::seconds(10)) {   // long-output progress
+                        const double el = std::chrono::duration<double>(clk::now() - t_prefill).count();
+                        fprintf(stderr, "  [%s] gen %d tok, %.1f tok/s\n",
+                                clock_hms().c_str(), generated, el > 0 ? generated / el : 0.0);
+                        glog = clk::now();
+                    }
                     logits = rt->decode({ next });
                 }
             }

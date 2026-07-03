@@ -99,6 +99,8 @@ static void usage(const char * prog) {
     printf("  --n-ctx <N>    context length (default 4096)\n");
     printf("  --temp <f>     temperature (0 = greedy, default 0)\n");
     printf("  --top-p <f>    nucleus top-p (default 0.95)\n");
+    printf("  --repeat-penalty <f>  repetition penalty over the last N tokens (default 1 = off)\n");
+    printf("  --repeat-last-n <N>   penalty window (default 64)\n");
     printf("  --top-k <N>    top-k (default 40)\n");
     printf("  --seed <N>     RNG seed (0 = random)\n");
     printf("  --vram-budget <MB>  offload expert weights to CPU; keep non-expert on GPU\n");
@@ -143,6 +145,8 @@ int main(int argc, char ** argv) {
         else if (a == "--top-p" && i + 1 < argc) sc.top_p = std::stof(next());
         else if (a == "--top-k" && i + 1 < argc) sc.top_k = std::stoi(next());
         else if (a == "--seed" && i + 1 < argc)  sc.seed = (uint32_t) std::stoul(next());
+        else if (a == "--repeat-penalty" && i + 1 < argc) sc.repeat_penalty = std::stof(next());
+        else if (a == "--repeat-last-n" && i + 1 < argc)  sc.repeat_last_n = std::stoi(next());
         else if (a == "--vram-budget" && i + 1 < argc) vram_budget_mb = (size_t) std::stoul(next());
         else if (a == "--cache-profile" && i + 1 < argc) cache_profile = next();
         else if (a == "--experts-ssd")      experts_ssd = true;
@@ -387,10 +391,12 @@ int main(int argc, char ** argv) {
             double prefill_s = secs(clk::now() - tp0);
 
             // token generation
+            smp.prime(ids);   // repetition-penalty window (prompt tail)
             int generated = 0;
             auto tg0 = clk::now();
             for (int t = 0; t < max_tokens; ++t) {
                 int next = smp.sample(logits);
+                smp.accept(next);
                 if (is_stop(next)) break;
                 std::cout << tok.decode(next) << std::flush;
                 ++generated;

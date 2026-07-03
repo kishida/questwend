@@ -11,19 +11,59 @@ Sampler::Sampler(const SamplerConfig & cfg) : cfg_(cfg) {
     rng_.seed(seed);
 }
 
+bool Sampler::penalized() const {
+    return cfg_.repeat_last_n > 0 &&
+           (cfg_.repeat_penalty != 1.0f || cfg_.presence_penalty != 0.0f ||
+            cfg_.frequency_penalty != 0.0f);
+}
+
+void Sampler::accept(int32_t id) {
+    if (!penalized()) return;
+    recent_.push_back(id);
+    ++counts_[id];
+    while ((int) recent_.size() > cfg_.repeat_last_n) {
+        const int32_t old = recent_.front();
+        recent_.pop_front();
+        auto it = counts_.find(old);
+        if (it != counts_.end() && --it->second == 0) counts_.erase(it);
+    }
+}
+
+void Sampler::prime(const std::vector<int32_t> & prompt) {
+    if (!penalized()) return;
+    const size_t n = std::min(prompt.size(), (size_t) cfg_.repeat_last_n);
+    for (size_t i = prompt.size() - n; i < prompt.size(); ++i) accept(prompt[i]);
+}
+
 int32_t Sampler::sample(const std::vector<float> & logits) {
     const int n = (int) logits.size();
+
+    // repetition control: adjust the logits of recently seen tokens
+    const std::vector<float> * src = &logits;
+    if (penalized() && !counts_.empty()) {
+        scratch_ = logits;
+        for (const auto & kv : counts_) {
+            const int32_t id = kv.first;
+            if (id < 0 || id >= n) continue;
+            float & l = scratch_[id];
+            if (cfg_.repeat_penalty != 1.0f)
+                l = l > 0.0f ? l / cfg_.repeat_penalty : l * cfg_.repeat_penalty;
+            l -= cfg_.presence_penalty + cfg_.frequency_penalty * kv.second;
+        }
+        src = &scratch_;
+    }
+    const std::vector<float> & lg = *src;
 
     // greedy
     if (cfg_.temperature <= 0.0f) {
         int best = 0;
-        for (int i = 1; i < n; ++i) if (logits[i] > logits[best]) best = i;
+        for (int i = 1; i < n; ++i) if (lg[i] > lg[best]) best = i;
         return best;
     }
 
     work_.clear();
     work_.reserve(n);
-    for (int i = 0; i < n; ++i) work_.emplace_back(logits[i], i);
+    for (int i = 0; i < n; ++i) work_.emplace_back(lg[i], i);
 
     // top-k: keep highest-k by logit
     int k = cfg_.top_k > 0 ? std::min(cfg_.top_k, n) : n;
