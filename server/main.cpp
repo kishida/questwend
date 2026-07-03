@@ -1260,6 +1260,7 @@ int main(int argc, char ** argv) {
                 std::map<std::string, int> pkind; // tool-arg schema types (see parse_tool_calls)
                 std::shared_ptr<Prog> prog = std::make_shared<Prog>();   // prefill progress
                 lclk::time_point t_recv;          // arrival (for the queued 0% marker)
+                std::string hb;                   // heartbeat: empty-delta chunk (see below)
                 std::shared_ptr<std::vector<std::vector<float>>> vembs;   // keep image embds alive
                 std::vector<Runtime::EmbdOverride> ovr;
                 std::vector<ImgSpan> spans;       // image spans for the prefix cache
@@ -1296,6 +1297,13 @@ int main(int argc, char ** argv) {
             st->pkind = std::move(pkind);
             st->gen_begin = cp.gen_prompt_begin;
             st->t_recv = t_recv;
+            // Heartbeat sent while queued / between prefill chunks so client
+            // body-idle timeouts don't kill a byte-silent stream. An OpenAI
+            // chunk with an empty delta (not an SSE comment): every client
+            // parses it and applies nothing.
+            st->hb = "data: " + dumpj(json{{"id", id}, {"object", "chat.completion.chunk"},
+                {"created", created}, {"model", model_id}, {"choices", json::array({
+                    {{"index", 0}, {"delta", json::object()}, {"finish_reason", nullptr}}})}}) + "\n\n";
             // the generation prompt pre-opens <think> when reasoning is on, so
             // the stream starts inside the reasoning block
             st->phase = (reasoning && tok->token_to_id("<think>") >= 0)
@@ -1457,12 +1465,11 @@ int main(int argc, char ** argv) {
                             // request. An SSE stream that stays byte-silent that long
                             // gets killed by client body-idle timeouts (Node/undici
                             // defaults to 300 s -> OpenCode reports "terminated"), so
-                            // heartbeat with SSE comment lines (ignored by parsers)
-                            // every 10 s; a failed write doubles as disconnect
-                            // detection while still queued.
+                            // heartbeat (empty-delta chunk, st->hb) every 10 s; a
+                            // failed write doubles as disconnect detection while
+                            // still queued.
                             while (!tlock.lock_for(std::chrono::seconds(10))) {
-                                const char * hb = ": waiting for the runtime\n\n";
-                                if (!sink.is_writable() || !sink.write(hb, strlen(hb))) {
+                                if (!sink.is_writable() || !sink.write(st->hb.data(), st->hb.size())) {
                                     fprintf(stderr, "client gone while queued, dropping request\n");
                                     st->finished = true;
                                     return false;
@@ -1529,8 +1536,7 @@ int main(int argc, char ** argv) {
                             while (st->prompt.size() - st->pf_pos > pf_chunk) {
                                 // heartbeat between chunks: keeps client body-idle
                                 // timeouts at bay; a failed write = client gone
-                                const char * hb = ": prefill\n\n";
-                                if (!sink.is_writable() || !sink.write(hb, strlen(hb))) {
+                                if (!sink.is_writable() || !sink.write(st->hb.data(), st->hb.size())) {
                                     fprintf(stderr, "client gone during prefill (%zu/%zu), aborting\n",
                                             st->pf_pos, st->prompt.size());
                                     st->finished = true; tlock.unlock(); st->holding = false;
@@ -1649,8 +1655,7 @@ int main(int argc, char ** argv) {
                         while (st->pf_pos < st->prompt.size()) {
                             // heartbeat between chunks: keeps client body-idle
                             // timeouts at bay; a failed write = client gone
-                            const char * hb = ": prefill\n\n";
-                            if (!sink.is_writable() || !sink.write(hb, strlen(hb))) {
+                            if (!sink.is_writable() || !sink.write(st->hb.data(), st->hb.size())) {
                                 fprintf(stderr, "client gone during prefill (%zu/%zu), aborting\n",
                                         st->pf_pos, st->prompt.size());
                                 st->finished = true; tlock.unlock(); st->holding = false;
