@@ -71,6 +71,10 @@ struct TicketLock {
         std::lock_guard<std::mutex> lk(m);
         return waiting > 0;
     }
+    bool busy() {   // held or has waiters (a fresh request would queue)
+        std::lock_guard<std::mutex> lk(m);
+        return next > serving;
+    }
 };
 
 // dump JSON replacing invalid UTF-8 instead of throwing: a token budget can
@@ -907,7 +911,8 @@ int main(int argc, char ** argv) {
     auto prepare_prompt = [&](std::vector<int32_t> & prompt,
                               std::vector<Runtime::EmbdOverride> & ovr,
                               std::vector<ImgSpan> spans, uint64_t owner,
-                              const std::shared_ptr<Prog> & prog) -> int {
+                              const std::shared_ptr<Prog> & prog,
+                              lclk::time_point t_recv) -> int {
         const int n_full = (int) prompt.size();
         const bool has_img = !spans.empty();
         int n = match_cov(rt->kv_tokens(), *kv_imgs, prompt, spans, "live");
@@ -957,6 +962,10 @@ int main(int argc, char ** argv) {
                 clock_hms().c_str(), n_full, has_img ? " +img" : "",
                 n, n > 0 ? src : "none", (int) prompt.size(),
                 rt->has_expert_cache() ? "" : " (resident)");
+        // a request that sat in the queue gets an explicit 0% marker, so the
+        // gap between its recv: line and the actual prefill start is visible
+        if (!prompt.empty() && lclk::now() - t_recv > std::chrono::seconds(1))
+            fprintf(stderr, "  prefill 0/%d (0%%)\n", (int) prompt.size());
         prog->start = prog->last = lclk::now();
         prog->total = (int) prompt.size();   // full tail to prefill (overall progress)
         prog->base  = 0;
@@ -1211,6 +1220,12 @@ int main(int argc, char ** argv) {
         const int n_prompt_full = (int) prompt.size();
         const bool req_mtp = mtp;
 
+        // arrival log: the "req:" line below only appears once the runtime is
+        // acquired, which can be minutes later behind a running request
+        const auto t_recv = lclk::now();
+        fprintf(stderr, "[%s] recv: %d tok%s%s\n", clock_hms().c_str(), n_prompt_full,
+                images.empty() ? "" : " +img", tlock.busy() ? " (queued)" : "");
+
         // the prompt must fit the context window with room to generate
         if (n_prompt_full >= n_ctx) {
             res.status = 400;
@@ -1244,6 +1259,7 @@ int main(int argc, char ** argv) {
                 std::string pend_r;               // UTF-8 holdback (reasoning channel)
                 std::map<std::string, int> pkind; // tool-arg schema types (see parse_tool_calls)
                 std::shared_ptr<Prog> prog = std::make_shared<Prog>();   // prefill progress
+                lclk::time_point t_recv;          // arrival (for the queued 0% marker)
                 std::shared_ptr<std::vector<std::vector<float>>> vembs;   // keep image embds alive
                 std::vector<Runtime::EmbdOverride> ovr;
                 std::vector<ImgSpan> spans;       // image spans for the prefix cache
@@ -1279,6 +1295,7 @@ int main(int argc, char ** argv) {
             st->spans = std::move(spans);
             st->pkind = std::move(pkind);
             st->gen_begin = cp.gen_prompt_begin;
+            st->t_recv = t_recv;
             // the generation prompt pre-opens <think> when reasoning is on, so
             // the stream starts inside the reasoning block
             st->phase = (reasoning && tok->token_to_id("<think>") >= 0)
@@ -1493,7 +1510,7 @@ int main(int argc, char ** argv) {
                                 st->started = true;
                                 st->t0 = clk::now();
                                 st->had_images = !st->ovr.empty();
-                                st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog);
+                                st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog, st->t_recv);
                                 st->cstat0 = rt->cache_stats();
                                 st->my_imgs = *kv_imgs;
                                 st->resp_base = rt->kv_tokens().size() + st->prompt.size();
@@ -1616,7 +1633,7 @@ int main(int argc, char ** argv) {
                             st->started = true;
                             st->t0 = clk::now();
                             st->had_images = !st->ovr.empty();
-                            st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog);
+                            st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog, st->t_recv);
                             st->cstat0 = rt->cache_stats();
                             st->my_imgs = *kv_imgs;
                         } else if (!was_holding) {
@@ -1704,7 +1721,7 @@ int main(int argc, char ** argv) {
                 ~Guard() { t.unlock(); }
             } lk(tlock);
             auto prog = std::make_shared<Prog>();
-            n_cached = prepare_prompt(prompt, ovr, std::move(spans), 0, prog);
+            n_cached = prepare_prompt(prompt, ovr, std::move(spans), 0, prog, t_recv);
             cstat0 = rt->cache_stats();
             t0 = clk::now();
             // checkpoint at the generation-prompt boundary (see streaming path)
