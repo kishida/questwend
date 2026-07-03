@@ -712,8 +712,9 @@ int main(int argc, char ** argv) {
         const auto now = lclk::now();
         auto emit = [&] {
             const double el = std::chrono::duration<double>(now - p->start).count();
-            fprintf(stderr, "  prefill %d/%d (%.0f%%) %.0f tok/s\n",
-                    gdone, gtot, 100.0 * gdone / gtot, el > 0 ? gdone / el : 0.0);
+            fprintf(stderr, "  [%s] prefill %d/%d (%.0f%%) %.0f tok/s\n",
+                    clock_hms().c_str(), gdone, gtot, 100.0 * gdone / gtot,
+                    el > 0 ? gdone / el : 0.0);
             p->last = now;
         };
         if (gdone >= gtot) {
@@ -967,7 +968,7 @@ int main(int argc, char ** argv) {
         // a request that sat in the queue gets an explicit 0% marker, so the
         // gap between its recv: line and the actual prefill start is visible
         if (!prompt.empty() && lclk::now() - t_recv > std::chrono::seconds(1))
-            fprintf(stderr, "  prefill 0/%d (0%%)\n", (int) prompt.size());
+            fprintf(stderr, "  [%s] prefill 0/%d (0%%)\n", clock_hms().c_str(), (int) prompt.size());
         prog->start = prog->last = lclk::now();
         prog->total = (int) prompt.size();   // full tail to prefill (overall progress)
         prog->base  = 0;
@@ -1484,7 +1485,7 @@ int main(int argc, char ** argv) {
                             if (hb_on) {
                                 while (!tlock.lock_for(std::chrono::seconds(10))) {
                                     if (!sink.is_writable() || !sink.write(st->hb.data(), st->hb.size())) {
-                                        fprintf(stderr, "client gone while queued, dropping request\n");
+                                        fprintf(stderr, "[%s] client gone while queued, dropping request\n", clock_hms().c_str());
                                         st->finished = true;
                                         return false;
                                     }
@@ -1554,7 +1555,7 @@ int main(int argc, char ** argv) {
                                 // heartbeat between chunks: keeps client body-idle
                                 // timeouts at bay; a failed write = client gone
                                 if (!sink.is_writable() || (hb_on && !sink.write(st->hb.data(), st->hb.size()))) {
-                                    fprintf(stderr, "client gone during prefill (%zu/%zu), aborting\n",
+                                    fprintf(stderr, "[%s] client gone during prefill (%zu/%zu), aborting\n", clock_hms().c_str(),
                                             st->pf_pos, st->prompt.size());
                                     st->finished = true; tlock.unlock(); st->holding = false;
                                     return false;
@@ -1569,7 +1570,7 @@ int main(int argc, char ** argv) {
                                     st->my_toks = rt->kv_tokens();
                                     st->my_imgs = *kv_imgs;
                                     if (getenv("QWEN_CACHE_DEBUG"))
-                                        fprintf(stderr, "time-slice: prefill yield at %zu/%zu (sid=%llu)\n",
+                                        fprintf(stderr, "[%s] time-slice: prefill yield at %zu/%zu (sid=%llu)\n", clock_hms().c_str(),
                                                 st->pf_pos, st->prompt.size(), (unsigned long long) st->sid);
                                     tlock.unlock(); st->holding = false;
                                     return true;
@@ -1643,7 +1644,7 @@ int main(int argc, char ** argv) {
                                 st->my_toks = rt->kv_tokens();
                                 st->my_imgs = *kv_imgs;
                                 if (getenv("QWEN_CACHE_DEBUG"))
-                                    fprintf(stderr, "time-slice: yield at %d tokens (sid=%llu)\n",
+                                    fprintf(stderr, "[%s] time-slice: yield at %d tokens (sid=%llu)\n", clock_hms().c_str(),
                                             st->generated, (unsigned long long) st->sid);
                                 tlock.unlock(); st->holding = false;
                                 return true;                            // resumed on the next call
@@ -1673,7 +1674,7 @@ int main(int argc, char ** argv) {
                             // heartbeat between chunks: keeps client body-idle
                             // timeouts at bay; a failed write = client gone
                             if (!sink.is_writable() || (hb_on && !sink.write(st->hb.data(), st->hb.size()))) {
-                                fprintf(stderr, "client gone during prefill (%zu/%zu), aborting\n",
+                                fprintf(stderr, "[%s] client gone during prefill (%zu/%zu), aborting\n", clock_hms().c_str(),
                                         st->pf_pos, st->prompt.size());
                                 st->finished = true; tlock.unlock(); st->holding = false;
                                 return false;
@@ -1694,7 +1695,7 @@ int main(int argc, char ** argv) {
                                 st->my_toks = rt->kv_tokens();           // yield mid-prefill
                                 st->my_imgs = *kv_imgs;
                                 if (getenv("QWEN_CACHE_DEBUG"))
-                                    fprintf(stderr, "time-slice: prefill yield at %zu/%zu (sid=%llu)\n",
+                                    fprintf(stderr, "[%s] time-slice: prefill yield at %zu/%zu (sid=%llu)\n", clock_hms().c_str(),
                                             st->pf_pos, st->prompt.size(), (unsigned long long) st->sid);
                                 tlock.unlock(); st->holding = false;
                                 return true;
@@ -1716,7 +1717,7 @@ int main(int argc, char ** argv) {
                             st->my_toks = rt->kv_tokens();   // yield the runtime
                             st->my_imgs = *kv_imgs;
                             if (getenv("QWEN_CACHE_DEBUG"))
-                                fprintf(stderr, "time-slice: yield at %d tokens (sid=%llu)\n",
+                                fprintf(stderr, "[%s] time-slice: yield at %d tokens (sid=%llu)\n", clock_hms().c_str(),
                                         st->generated, (unsigned long long) st->sid);
                             tlock.unlock(); st->holding = false;
                         }
