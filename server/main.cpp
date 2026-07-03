@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <set>
 #include <mutex>
 #include <string>
 
@@ -39,6 +40,7 @@ struct TicketLock {
     std::condition_variable cv;
     uint64_t next = 0, serving = 0;
     int waiting = 0;
+    std::set<uint64_t> dead;   // abandoned tickets (lock_for timeouts)
     void lock() {
         std::unique_lock<std::mutex> lk(m);
         const uint64_t t = next++;
@@ -46,9 +48,23 @@ struct TicketLock {
         cv.wait(lk, [&] { return serving == t; });
         --waiting;
     }
+    // Bounded wait: take a ticket, give up after `d`. On timeout the ticket is
+    // abandoned (unlock() skips it) and a later retry re-queues at the back —
+    // fairness is traded for letting the waiter do work (SSE heartbeats,
+    // disconnect checks) between attempts.
+    bool lock_for(std::chrono::milliseconds d) {
+        std::unique_lock<std::mutex> lk(m);
+        const uint64_t t = next++;
+        ++waiting;
+        const bool got = cv.wait_for(lk, d, [&] { return serving == t; });
+        --waiting;
+        if (!got) dead.insert(t);
+        return got;
+    }
     void unlock() {
         std::lock_guard<std::mutex> lk(m);
         ++serving;
+        while (dead.count(serving)) { dead.erase(serving); ++serving; }
         cv.notify_all();
     }
     bool contended() {
@@ -1419,7 +1435,24 @@ int main(int argc, char ** argv) {
                     };
                     try {
                         const bool was_holding = st->holding;
-                        if (!st->holding) { tlock.lock(); st->holding = true; }
+                        if (!st->holding) {
+                            // Waiting for the runtime can take minutes behind a long
+                            // request. An SSE stream that stays byte-silent that long
+                            // gets killed by client body-idle timeouts (Node/undici
+                            // defaults to 300 s -> OpenCode reports "terminated"), so
+                            // heartbeat with SSE comment lines (ignored by parsers)
+                            // every 10 s; a failed write doubles as disconnect
+                            // detection while still queued.
+                            while (!tlock.lock_for(std::chrono::seconds(10))) {
+                                const char * hb = ": waiting for the runtime\n\n";
+                                if (!sink.is_writable() || !sink.write(hb, strlen(hb))) {
+                                    fprintf(stderr, "client gone while queued, dropping request\n");
+                                    st->finished = true;
+                                    return false;
+                                }
+                            }
+                            st->holding = true;
+                        }
                         if (!was_holding) {
                             st->slice_used = 0;   // fresh slice on (re)acquisition
                             *cur_prog = st->prog; // progress lines report this request
@@ -1477,7 +1510,10 @@ int main(int argc, char ** argv) {
                             // ---- preemptible prefill: all but the last chunk; the
                             // final chunk goes through generate_mtp below ----
                             while (st->prompt.size() - st->pf_pos > pf_chunk) {
-                                if (!sink.is_writable()) {   // client disconnected mid-prefill
+                                // heartbeat between chunks: keeps client body-idle
+                                // timeouts at bay; a failed write = client gone
+                                const char * hb = ": prefill\n\n";
+                                if (!sink.is_writable() || !sink.write(hb, strlen(hb))) {
                                     fprintf(stderr, "client gone during prefill (%zu/%zu), aborting\n",
                                             st->pf_pos, st->prompt.size());
                                     st->finished = true; tlock.unlock(); st->holding = false;
@@ -1594,7 +1630,10 @@ int main(int argc, char ** argv) {
                         }
                         // preemptible prefill: the last chunk's logits feed sampling
                         while (st->pf_pos < st->prompt.size()) {
-                            if (!sink.is_writable()) {   // client gone mid-prefill
+                            // heartbeat between chunks: keeps client body-idle
+                            // timeouts at bay; a failed write = client gone
+                            const char * hb = ": prefill\n\n";
+                            if (!sink.is_writable() || !sink.write(hb, strlen(hb))) {
                                 fprintf(stderr, "client gone during prefill (%zu/%zu), aborting\n",
                                         st->pf_pos, st->prompt.size());
                                 st->finished = true; tlock.unlock(); st->holding = false;
