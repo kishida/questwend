@@ -490,7 +490,8 @@ int main(int argc, char ** argv) {
     bool no_mmproj = false;
     int  cache_slots = 0;
     std::string cache_slots_dir;
-    int  time_slice = 0;
+    int  time_slice = 64;   // generation tokens per turn when requests contend
+                            // (needs --cache-slots to park state; 0 = back-to-back)
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -545,7 +546,8 @@ int main(int argc, char ** argv) {
             "  --no-mmproj         disable image input even if an mmproj file is present\n"
             "  --cache-slots <N>   extra prompt-cache slots for interleaved conversations (default 0)\n"
             "  --cache-slots-dir <dir>  store the slots on disk instead of RAM (persists across restarts)\n"
-            "  --time-slice <N>    interleave concurrent streaming requests every N tokens (default 0 = serialize)\n"
+            "  --time-slice <N>    interleave concurrent streaming requests every N generated tokens\n"
+            "                      (default 64; takes effect with --cache-slots; 0 = run back-to-back)\n"
             "  --heartbeat <on|off>  SSE keepalive chunks while queued / between prefill chunks (default on)\n"
             "  --cpu               force CPU backend\n"
             "offload tuning (equivalent to the QWEN_* env vars; flag wins):\n"
@@ -1515,18 +1517,19 @@ int main(int argc, char ** argv) {
                         };
                         // prefill slice unit: token slices would be too fine (batch
                         // efficiency), so prefill works in coarser chunks; a client
-                        // disconnect is noticed between chunks instead of after the
-                        // whole prefill. With expert offload, per-chunk expert fetch
-                        // is amortized over the chunk (layer-major prefill), so
-                        // bigger chunks = less streaming: 4096 by default (~10s of
-                        // disconnect-abort latency), QWEN_PF_CHUNK to tune.
-                        static const size_t pf_chunk_plain = []{
+                        // disconnect / a yield to a queued request happens between
+                        // chunks instead of after the whole prefill. With expert
+                        // offload, per-chunk expert fetch is amortized over the chunk
+                        // (layer-major prefill), so bigger chunks = less streaming:
+                        // 4096 by default, QWEN_PF_CHUNK / --pf-chunk to tune.
+                        // Deliberately NOT tied to --time-slice: shrinking prefill
+                        // chunks to the slice length would destroy the layer-major
+                        // fetch amortization on the offload tiers.
+                        static const size_t pf_chunk = []{
                             const char * c = getenv("QWEN_PF_CHUNK");
                             const int v = c ? atoi(c) : 0;
                             return (size_t) (v >= 1 ? v : 4096);
                         }();
-                        const size_t pf_chunk = time_slice > 0
-                            ? (size_t) std::max(time_slice, 256) : pf_chunk_plain;
 
                         // ---- MTP self-speculative decode: one time slice per provider
                         // call (the whole run when --time-slice is off / uncontended) ----

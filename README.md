@@ -174,7 +174,7 @@ qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15000
 | `--no-mmproj` | mmproj があっても画像入力を無効化 |
 | `--cache-slots <N>` | プレフィックスキャッシュの追加スロット数（既定 0; 複数会話の並行アクセス用） |
 | `--cache-slots-dir <dir>` | スロットの退避先を RAM ではなくディスクにする（再起動後もキャッシュが残る） |
-| `--time-slice <N>` | 同時ストリーミングを N トークンごとに交互実行（既定 0 = 完全直列） |
+| `--time-slice <N>` | 同時ストリーミングを N 生成トークンごとに交互実行（既定 64。`--cache-slots` があるときに有効。`0` で完全直列＝性能優先） |
 | `--cpu` | CPU バックエンドを強制 |
 | `--resident-decode` ほか | オフロード調整ノブ（`--resident-refill/-warmup`, `--prefill-prune`, `--batch-chunk`, `--ssd-direct`; CLI と共通、上のオフロード節を参照） |
 | `--pf-chunk <N>` | サーバー prefill のスライス長（切断検出の粒度; 既定 4096） |
