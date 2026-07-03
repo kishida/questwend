@@ -510,6 +510,7 @@ int main(int argc, char ** argv) {
         else if (a == "--cache-slots" && i + 1 < argc) cache_slots = std::stoi(argv[++i]);
         else if (a == "--cache-slots-dir" && i + 1 < argc) cache_slots_dir = argv[++i];
         else if (a == "--time-slice" && i + 1 < argc) time_slice = std::stoi(argv[++i]);
+        else if (a == "--heartbeat" && i + 1 < argc) set_knob("QWEN_HEARTBEAT", argv[++i]);
         else if (a == "--cpu")              force_cpu = true;
         else if (a == "--resident-decode")  set_knob("QWEN_RESIDENT_DECODE", "1");
         else if (a == "--resident-refill" && i + 1 < argc) set_knob("QWEN_RESIDENT_REFILL", argv[++i]);
@@ -545,6 +546,7 @@ int main(int argc, char ** argv) {
             "  --cache-slots <N>   extra prompt-cache slots for interleaved conversations (default 0)\n"
             "  --cache-slots-dir <dir>  store the slots on disk instead of RAM (persists across restarts)\n"
             "  --time-slice <N>    interleave concurrent streaming requests every N tokens (default 0 = serialize)\n"
+            "  --heartbeat <on|off>  SSE keepalive chunks while queued / between prefill chunks (default on)\n"
             "  --cpu               force CPU backend\n"
             "offload tuning (equivalent to the QWEN_* env vars; flag wins):\n"
             "  --resident-decode   resident-only routing decode: fused graph, no per-token miss\n"
@@ -973,6 +975,16 @@ int main(int argc, char ** argv) {
         *cur_prog   = prog;
         return n;
     };
+
+    // Heartbeat on/off (--heartbeat off / QWEN_HEARTBEAT=0): A/B switch.
+    // Off restores the pre-heartbeat behavior exactly — blocking lock waits
+    // and no bytes written between prefill chunks (disconnects are then only
+    // noticed via is_writable, and byte-silent waits may hit client timeouts).
+    const bool hb_on = [] {
+        const char * c = getenv("QWEN_HEARTBEAT");
+        return !(c && (strcmp(c, "0") == 0 || strcmp(c, "off") == 0));
+    }();
+    if (!hb_on) fprintf(stderr, "heartbeat: OFF (QWEN_HEARTBEAT)\n");
 
     // Can the runtime be handed to a waiting request? Without cache slots the
     // evicted state cannot be parked, and the switch costs a full re-prefill
@@ -1467,13 +1479,18 @@ int main(int argc, char ** argv) {
                             // defaults to 300 s -> OpenCode reports "terminated"), so
                             // heartbeat (empty-delta chunk, st->hb) every 10 s; a
                             // failed write doubles as disconnect detection while
-                            // still queued.
-                            while (!tlock.lock_for(std::chrono::seconds(10))) {
-                                if (!sink.is_writable() || !sink.write(st->hb.data(), st->hb.size())) {
-                                    fprintf(stderr, "client gone while queued, dropping request\n");
-                                    st->finished = true;
-                                    return false;
+                            // still queued. QWEN_HEARTBEAT=0 restores the plain
+                            // blocking wait (pre-heartbeat behavior, for A/B tests).
+                            if (hb_on) {
+                                while (!tlock.lock_for(std::chrono::seconds(10))) {
+                                    if (!sink.is_writable() || !sink.write(st->hb.data(), st->hb.size())) {
+                                        fprintf(stderr, "client gone while queued, dropping request\n");
+                                        st->finished = true;
+                                        return false;
+                                    }
                                 }
+                            } else {
+                                tlock.lock();
                             }
                             st->holding = true;
                         }
@@ -1536,7 +1553,7 @@ int main(int argc, char ** argv) {
                             while (st->prompt.size() - st->pf_pos > pf_chunk) {
                                 // heartbeat between chunks: keeps client body-idle
                                 // timeouts at bay; a failed write = client gone
-                                if (!sink.is_writable() || !sink.write(st->hb.data(), st->hb.size())) {
+                                if (!sink.is_writable() || (hb_on && !sink.write(st->hb.data(), st->hb.size()))) {
                                     fprintf(stderr, "client gone during prefill (%zu/%zu), aborting\n",
                                             st->pf_pos, st->prompt.size());
                                     st->finished = true; tlock.unlock(); st->holding = false;
@@ -1655,7 +1672,7 @@ int main(int argc, char ** argv) {
                         while (st->pf_pos < st->prompt.size()) {
                             // heartbeat between chunks: keeps client body-idle
                             // timeouts at bay; a failed write = client gone
-                            if (!sink.is_writable() || !sink.write(st->hb.data(), st->hb.size())) {
+                            if (!sink.is_writable() || (hb_on && !sink.write(st->hb.data(), st->hb.size()))) {
                                 fprintf(stderr, "client gone during prefill (%zu/%zu), aborting\n",
                                         st->pf_pos, st->prompt.size());
                                 st->finished = true; tlock.unlock(); st->holding = false;
