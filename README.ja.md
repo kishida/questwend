@@ -14,6 +14,9 @@ Qwen3 / Qwen3.5 / Qwen3.6 をスクラッチ実装した推論エンジン（ven
   - **画像入力**（Qwen3-VL 系 + mmproj GGUF; vision tower を ggml/GPU で実行。CLI `--image`、サーバーは OpenAI 形式の `image_url`）
   - **tool calling**（OpenAI 互換: `tools` / `tool_calls` / `role:"tool"`、Qwen3.6 の `<function=...>` 形式を双方向変換）
   - 分割（sharded）GGUF 対応（`-NNNNN-of-MMMMM.gguf`）
+  - **サブ 1bit 量子化 `IQ1_XS` / `IQ1_XXS` / `IQ1_XXXS`**（1.4375 / 1.3125 / 1.1875 bpw、
+    unsloth の [PR#61](https://github.com/unslothai/llama.cpp/pull/61) を取り込み。CPU / CUDA / **Metal** 対応。
+    このブランチ限定 — 本家に入れば不要になる）
   - 大語彙モデルの K-quant 埋め込みは、バックエンドの get_rows が非対応の場合のみ F16 変換版を VRAM に保持（CUDA のみ; Metal/CPU はネイティブ対応のためコピー不要。`--embd-q8` で Q8_0 化も可）
   - OpenAI 互換サーバー（`qw-server`）＋ブラウザ・チャット UI
 

@@ -10,8 +10,16 @@
 | 01 | `01-qwencpp-metal-mmid-blocked.patch` | Metal `mm_id_map0` を expert ブロック単位ループに変更。expert キャッシュのスロットプールは `ne02` が threadgroup のスレッド上限を超えるため、upstream の `GGML_ASSERT(ne02 <= max_threads)` では動かない。`QWEN_METAL_MMID_MV=1` で mat-vec 経路に強制切替する A/B スイッチも含む |
 | 02 | `02-qwencpp-cuda-quiet-graph-logs.patch` | CUDA graph の `GGML_LOG_DEBUG` 3 行を削除（グラフキーごとに毎回出て自前のログを埋める） |
 
-> サブ 1bit 量子化（`IQ1_XS` / `IQ1_XXS` / `IQ1_XXXS`）は **`iq1-narrow` ブランチ**に分けてあります。
-> 本家 llama.cpp に取り込まれたら、そのブランチを捨てて通常の再 vendor で拾えば済みます。
+このブランチ（`iq1-narrow`）ではさらに以下の 2 本を当てています。**third-party 由来で、
+本家 llama.cpp に取り込まれたら不要**になります（その時はこのブランチを捨て、通常の再 vendor で拾う）。
+
+| # | パッチ | 出所 | 内容 |
+|---|---|---|---|
+| 03 | `03-unsloth-iq1-narrow-ggml.patch` | [unslothai/llama.cpp#61](https://github.com/unslothai/llama.cpp/pull/61) の `ggml/` 部分のみ | IQ1_S 未満の 3 量子化型 `IQ1_XS`(1.4375bpw) / `IQ1_XXS`(1.3125bpw) / `IQ1_XXXS`(1.1875bpw)。型 enum・グリッド表・CPU/CUDA カーネル |
+| 04 | `04-metal-iq1-narrow.patch` | ユーザー提供（PR#61 に Metal 実装が無いため） | 03 の 3 型の Metal 対応: `mul_mv` / `mul_mv_id` / `mul_mm` / `mul_mm_id` / `get_rows` と dequantize |
+
+適用順は 01→04 の番号順だが、ローカル分（01/02）と third-party 分（03/04）は
+触る箇所が重ならないので順序は入れ替えても同じツリーになる（検証済み）。
 
 ## 再 vendor の手順
 
