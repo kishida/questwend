@@ -26,6 +26,8 @@ Qwen3 / Qwen3.5 / Qwen3.6 をスクラッチ実装した推論エンジン（ven
 | その他 | CUDA Toolkit 12.x | — | — |
 
 リポジトリは vendored ggml を含み自己完結しています（`third_party/ggml`）。サブモジュール取得は不要。
+vendor 元のコミットは `third_party/ggml/GGML_VERSION`、その上に当てている qwencpp 固有の
+パッチは [`patches/`](patches/README.md) にあります。再 vendor の手順と落とし穴もそちらに。
 
 ---
 

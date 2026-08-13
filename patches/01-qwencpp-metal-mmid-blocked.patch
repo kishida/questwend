@@ -1,0 +1,145 @@
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <cassert>
+ #include <algorithm>
++#include <cstdlib>
+ #include <limits>
+ #include <cmath>
+ 
+@@ -2592,7 +2593,12 @@
+     // ne21 = n_rows (batch size)
+     const int ne21_mm_id_min = 32;
+ 
+-    if (props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
++    // [qwencpp] QWEN_METAL_MMID_MV=1 forces the matrix-vector path for every
++    // batch size: A/B switch for validating the blocked mm_id_map0 kernel
++    // (expert-pool ne02 > threadgroup limit) against the simple mv kernel.
++    static const bool force_mv = getenv("QWEN_METAL_MMID_MV") != nullptr;
++
++    if (!force_mv && props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
+         // some Metal matrix data types require aligned pointers
+         // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf (Table 2.5)
+         //switch (op->src[0]->type) {
+@@ -2623,9 +2629,14 @@
+ 
+             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20);
+ 
+-            const size_t smem = pipeline.smem;
++            // [qwencpp] ne02 can exceed the threadgroup thread limit when src0
++            // is an expert-cache slot pool; the kernel loops over expert blocks
++            // of ntg, so cap the thread count (and size shmem for ntg staging
++            // rows) instead of asserting ne02 <= max threads.
++            const int ntg_max = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
++            const int ntg     = ne02 < ntg_max ? ne02 : ntg_max;
+ 
+-            GGML_ASSERT(ne02 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
++            const size_t smem = (size_t) ntg*ne20*sizeof(uint16_t);
+ 
+             GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
+ 
+@@ -2637,7 +2648,7 @@
+ 
+             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+ 
+-            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02, 1, 1);
++            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ntg, 1, 1);
+         }
+ 
+         // this barrier is always needed because the next kernel has to wait for the id maps to be computed
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -10759,49 +10759,60 @@
+         threadgroup   char * shmem [[threadgroup(0)]],
+         ushort tpitg[[thread_position_in_threadgroup]],
+         ushort   ntg[[threads_per_threadgroup]]) {
+-    const short ide = tpitg; // expert id
+-
+-    uint32_t n_all = 0;
+-
+-    device int32_t * ids_i32 = (device int32_t *) hids + ide*args.ne21;
+-
+-    for (int i21 = 0; i21 < args.ne21; i21 += ntg) { // n_tokens
+-        if (i21 + tpitg < args.ne21) {
+-            device const int32_t * src2_i32 = (device const int32_t *) (src2 + (i21 + tpitg)*args.nb21);
+-
+-            threadgroup uint16_t * sids = (threadgroup uint16_t *) shmem + tpitg*ne20;
++    device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
+ 
+-            #pragma unroll(ne20)
+-            for (short i20 = 0; i20 < ne20; i20++) {
+-                sids[i20] = src2_i32[i20];
++    // [qwencpp] the expert dimension can exceed the threadgroup thread limit
++    // when src0 is an expert-cache slot pool (thousands of slots), so process
++    // experts in blocks of ntg instead of one thread per expert. Upstream
++    // dispatches ntg = ne02 and the outer loop runs once.
++    for (int ide0 = 0; ide0 < args.ne02; ide0 += ntg) {
++        const int ide = ide0 + tpitg; // expert id
++
++        uint32_t n_all = 0;
++
++        device int32_t * ids_i32 = (device int32_t *) hids + (uint64_t) ide*args.ne21;
++
++        for (int i21 = 0; i21 < args.ne21; i21 += ntg) { // n_tokens
++            if (i21 + tpitg < args.ne21) {
++                device const int32_t * src2_i32 = (device const int32_t *) (src2 + (i21 + tpitg)*args.nb21);
++
++                threadgroup uint16_t * sids = (threadgroup uint16_t *) shmem + tpitg*ne20;
++
++                #pragma unroll(ne20)
++                for (short i20 = 0; i20 < ne20; i20++) {
++                    sids[i20] = src2_i32[i20];
++                }
+             }
+-        }
+ 
+-        threadgroup_barrier(mem_flags::mem_threadgroup);
++            threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+-        for (short t = 0; t < ntg; t++) {
+-            if (i21 + t >= args.ne21) {
+-                break;
+-            }
++            if (ide < args.ne02) {
++                for (short t = 0; t < ntg; t++) {
++                    if (i21 + t >= args.ne21) {
++                        break;
++                    }
++
++                    threadgroup const uint16_t * sids = (threadgroup const uint16_t *) shmem + t*ne20;
++
++                    int sel = 0;
++                    #pragma unroll(ne20)
++                    for (short i20 = 0; i20 < ne20; i20++) {
++                        sel += (sids[i20] == ide)*(i20 + 1);
++                    }
+ 
+-            threadgroup const uint16_t * sids = (threadgroup const uint16_t *) shmem + t*ne20;
++                    ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;
+ 
+-            short sel = 0;
+-            #pragma unroll(ne20)
+-            for (short i20 = 0; i20 < ne20; i20++) {
+-                sel += (sids[i20] == ide)*(i20 + 1);
++                    n_all += sel > 0;
++                }
+             }
+ 
+-            ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;
+-
+-            n_all += sel > 0;
++            threadgroup_barrier(mem_flags::mem_threadgroup);
+         }
+ 
+-        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (ide < args.ne02) {
++            tpe_u32[ide] = n_all;
++        }
+     }
+-
+-    device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
+-    tpe_u32[ide] = n_all;
+ }
+ 
+ typedef decltype(kernel_mul_mm_id_map0<1>) kernel_mul_mm_id_map0_t;

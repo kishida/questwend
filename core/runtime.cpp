@@ -779,8 +779,10 @@ ggml_tensor * Runtime::Impl::build_gdn(ggml_context * ctx, ggml_cgraph * gf, int
     k = ggml_cont(ctx, k);
     v = ggml_cont(ctx, v);
 
-    // fused gated delta net: returns output + new state packed in one tensor
-    ggml_tensor * s_in  = ggml_reshape_3d(ctx, ssm_state[il], S * S * H_v, 1, 1);
+    // fused gated delta net: returns output + new state packed in one tensor.
+    // The state input is the initial state s0 only, shaped [S, S, H_v, n_seqs];
+    // the snapshot slot count K is an op param (1 = keep the final state only).
+    ggml_tensor * s_in  = ggml_reshape_4d(ctx, ssm_state[il], S, S, H_v, 1);
     ggml_tensor * output;
     if (gdn_ckpt == n_tokens && n_tokens > 1) {
         // verify mode: run the scan per token (same sequential math, same FLOPs)
@@ -794,7 +796,7 @@ ggml_tensor * Runtime::Impl::build_gdn(ggml_context * ctx, ggml_cgraph * gf, int
                         x4->nb[1], x4->nb[2], x4->nb[3], (size_t) t * x4->nb[2]);
             };
             ggml_tensor * rt = ggml_gated_delta_net(ctx,
-                    slice(q), slice(k), slice(v), slice(g), slice(beta), s_in);
+                    slice(q), slice(k), slice(v), slice(g), slice(beta), s_in, /*K=*/1);
             ggml_tensor * out_t = ggml_view_4d(ctx, rt, S, H_v, 1, 1,
                     rs(S), rs(S * H_v), rs(S * H_v), 0);
             ggml_tensor * st_t = ggml_view_4d(ctx, rt, S, S, H_v, 1,
@@ -804,12 +806,12 @@ ggml_tensor * Runtime::Impl::build_gdn(ggml_context * ctx, ggml_cgraph * gf, int
             if (t + 1 == n_tokens)
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, st_t,
                         ggml_reshape_3d(ctx, ssm_state[il], S, S, H_v)));
-            s_in = ggml_view_3d(ctx, rt, S * S * H_v, 1, 1,
-                    rs(S * S * H_v), rs(S * S * H_v), rs(S * H_v));   // chain
+            s_in = ggml_view_4d(ctx, rt, S, S, H_v, 1,
+                    rs(S), rs(S * S), rs(S * S * H_v), rs(S * H_v));   // chain
             output = output ? ggml_concat(ctx, output, out_t, 2) : out_t;
         }
     } else {
-        ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, s_in);
+        ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, s_in, /*K=*/1);
 
         output = ggml_view_4d(ctx, result, S, H_v, n_tokens, 1,
                 ggml_row_size(result->type, S),

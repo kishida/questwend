@@ -1,0 +1,33 @@
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4220,9 +4220,7 @@
+ 
+     if (graph->graph == nullptr) {
+         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+-            if (!graph->disable_due_to_gpu_arch) {
+-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
+-            }
++            // [qwencpp] log line dropped: fires on every graph key, drowning our own output
+             graph->disable_due_to_gpu_arch = true;
+         }
+     }
+@@ -4254,8 +4252,7 @@
+             if (!graph->warmup_complete) {
+                 // Warmup: need at least 2 calls with no property change on the 2nd call
+                 if (!properties_changed) {
+-                    graph->warmup_complete = true;
+-                    GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
++                    graph->warmup_complete = true;   // [qwencpp] log line dropped (per-graph noise)
+                     use_cuda_graph = true;
+                     cuda_graph_update_required = true;
+                 }
+@@ -4264,8 +4261,7 @@
+                 // Post-warmup: normal CUDA graph operation
+                 if (properties_changed) {
+                     // Properties changed - reset warmup, execute directly until stable again
+-                    graph->warmup_complete = false;
+-                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
++                    graph->warmup_complete = false;  // [qwencpp] log line dropped (per-graph noise)
+                 } else {
+                     use_cuda_graph = true;
+                     cuda_graph_update_required = graph->instance == nullptr;

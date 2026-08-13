@@ -61,3 +61,17 @@ target_link_libraries(qw-server PRIVATE Threads::Threads)
 if(WIN32)
     target_link_libraries(qw-server PRIVATE ws2_32)
 endif()
+
+# ---- keep the ggml DLLs next to the executables (Windows) ----
+# ggml builds its DLLs into build/bin/<config> while the executables land in
+# build/<config>, so Windows resolves them from the exe directory instead --
+# a stale copy there silently shadows a freshly built ggml. Copy them after
+# every link so the two can never drift apart.
+if(WIN32)
+    foreach(tgt qw-cli qw-server qw-tokenize)
+        add_custom_command(TARGET ${tgt} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_RUNTIME_DLLS:${tgt}> $<TARGET_FILE_DIR:${tgt}>
+            COMMAND_EXPAND_LISTS)
+    endforeach()
+endif()
