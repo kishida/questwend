@@ -492,6 +492,7 @@ int main(int argc, char ** argv) {
     int  time_slice = 64;   // generation tokens per turn when requests contend
                             // (needs --cache-slots to park state; 0 = back-to-back)
     float repeat_penalty_default = 1.0f;   // used when the request sends none
+    bool want_help = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -533,17 +534,20 @@ int main(int argc, char ** argv) {
         else if (a == "--batch-chunk" && i + 1 < argc)     set_knob("QWEN_BATCH_CHUNK", argv[++i]);
         else if (a == "--pf-chunk" && i + 1 < argc)        set_knob("QWEN_PF_CHUNK", argv[++i]);
         else if (a == "--ssd-direct")       set_knob("QWEN_SSD_DIRECT", "1");
+        else if (a == "-h" || a == "--help") want_help = true;
         else {
             // unknown flag, or a known flag missing its value (e.g. a typo like
             // --time-clice): fail loudly instead of silently ignoring it
             fprintf(stderr, "error: unknown or malformed argument: %s\n"
-                            "run with -m <model.gguf> and no other args to see usage\n", a.c_str());
+                            "run with --help to see usage\n", a.c_str());
             return 1;
         }
     }
     if (!cache_slots_dir.empty() && cache_slots <= 0) cache_slots = 4;   // dir implies slots
-    if (model_path.empty()) {
-        fprintf(stderr,
+    if (want_help || model_path.empty()) {
+        // --help goes to stdout and succeeds; a missing -m is an error
+        FILE * out = want_help ? stdout : stderr;
+        fprintf(out,
             "usage: %s -m <model.gguf> [options]\n"
             "  --port <N>          listen port (default 8080)\n"
             "  --host <addr>       bind address (default 127.0.0.1)\n"
@@ -574,8 +578,9 @@ int main(int argc, char ** argv) {
             "  --prefill-prune <eps>  skip fetching low-router-mass experts in prefill (lossy; e.g. 0.05)\n"
             "  --batch-chunk <N>   prefill chunk length in tokens (default 4096)\n"
             "  --pf-chunk <N>      server prefill slice (disconnect-abort granularity, default 4096)\n"
-            "  --ssd-direct        unbuffered SSD reads (bypass the OS page cache; with --experts-ssd)\n", argv[0]);
-        return 1;
+            "  --ssd-direct        unbuffered SSD reads (bypass the OS page cache; with --experts-ssd)\n"
+            "  -h, --help          show this help and exit\n", argv[0]);
+        return want_help ? 0 : 1;
     }
 
     std::unique_ptr<Model> model;
