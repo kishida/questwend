@@ -36,6 +36,10 @@ re-vendoring procedure and its pitfalls.
 
 ## 2. Build
 
+`CMAKE_BUILD_TYPE` does not need to be passed: the project forces `Release` when it is
+unset. (Visual Studio is multi-config, so there you pick the config at build time with
+`--config Release`.)
+
 ### Windows (CUDA)
 
 ```powershell
@@ -56,7 +60,7 @@ cmake --build build --config Release --target qw-cli qw-server
 ### macOS (Metal)
 
 ```bash
-cmake -B build -DQW_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DQW_METAL=ON
 cmake --build build -j --target qw-cli qw-server
 ```
 
@@ -66,11 +70,13 @@ cmake --build build -j --target qw-cli qw-server
 ### AMD (HIP / ROCm)
 
 ```bash
-cmake -B build -DQW_HIP=ON -DGPU_TARGETS=gfx1100 -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DQW_HIP=ON
 cmake --build build -j --target qw-cli qw-server
 ```
 
-- Replace `GPU_TARGETS` with your GPU's gfx name (`rocminfo | grep gfx`; RX 7900 series = `gfx1100`,
+- The GPU architecture is normally detected for you. Pass `-DGPU_TARGETS=gfx1100` only when the
+  detection misses, when building for a machine with a different GPU, or when you want several
+  architectures in one binary (`rocminfo | grep gfx` prints yours; RX 7900 series = `gfx1100`,
   MI300 = `gfx942`). The older `AMDGPU_TARGETS` spelling also works.
 - HIP graphs are on by default in ggml (`GGML_HIP_GRAPHS`), so unlike CUDA there is nothing to pass.
 - To avoid installing ROCm, Vulkan should also work: `-DGGML_VULKAN=ON` (there is no `QW_*` wrapper,
@@ -82,7 +88,7 @@ cmake --build build -j --target qw-cli qw-server
 ### CPU only (any platform)
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake -B build
 cmake --build build -j --target qw-cli
 # pass --cpu at runtime, or build without a GPU backend and it runs on CPU automatically
 ```

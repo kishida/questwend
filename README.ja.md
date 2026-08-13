@@ -35,6 +35,9 @@ vendor 元のコミットは `third_party/ggml/GGML_VERSION`、その上に当�
 
 ## 2. ビルド
 
+`CMAKE_BUILD_TYPE` の指定は不要です（未指定なら `Release` を強制します）。
+Visual Studio はマルチ構成なので、そちらはビルド時に `--config Release` で選びます。
+
 ### Windows（CUDA）
 
 ```powershell
@@ -54,7 +57,7 @@ cmake --build build --config Release --target qw-cli qw-server
 ### macOS（Metal）
 
 ```bash
-cmake -B build -DQW_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DQW_METAL=ON
 cmake --build build -j --target qw-cli qw-server
 ```
 
@@ -64,12 +67,14 @@ cmake --build build -j --target qw-cli qw-server
 ### AMD（HIP / ROCm）
 
 ```bash
-cmake -B build -DQW_HIP=ON -DGPU_TARGETS=gfx1100 -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DQW_HIP=ON
 cmake --build build -j --target qw-cli qw-server
 ```
 
-- `GPU_TARGETS` は自分の GPU の gfx 名に置き換える（`rocminfo | grep gfx` で確認。
-  RX 7900 系 = `gfx1100`, MI300 = `gfx942` など）。旧名の `AMDGPU_TARGETS` も可。
+- GPU アーキは通常は自動検出される。`-DGPU_TARGETS=gfx1100` を付けるのは、検出が外れるとき・
+  別の GPU のマシン向けにビルドするとき・複数アーキを1バイナリに含めたいときだけ
+  （自分の値は `rocminfo | grep gfx` で確認。RX 7900 系 = `gfx1100`, MI300 = `gfx942` など）。
+  旧名の `AMDGPU_TARGETS` も可。
 - HIP graph は ggml 側で既定 ON（`GGML_HIP_GRAPHS`）。CUDA と違い明示指定は不要。
 - ROCm を入れずに済ませたい場合は Vulkan でも動くはず: `-DGGML_VULKAN=ON`（`QW_*` の
   ラッパーは無いので ggml のオプションを直接指定）。
@@ -80,7 +85,7 @@ cmake --build build -j --target qw-cli qw-server
 ### CPU のみ（任意プラットフォーム）
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake -B build
 cmake --build build -j --target qw-cli
 # 実行時に --cpu を付けるか、GPU バックエンド無効ビルドで自動的に CPU で動作
 ```
