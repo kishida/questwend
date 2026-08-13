@@ -205,6 +205,11 @@ Open `http://<host>:<port>/` for the chat UI (shows TTFT / tok/s / prefill tok/s
 | `--resident-decode` and friends | offload tuning knobs (`--resident-refill/-warmup`, `--prefill-prune`, `--batch-chunk`, `--ssd-direct`; shared with the CLI, see the offloading section above) |
 | `--pf-chunk <N>` | server prefill slice length (disconnect-detection granularity; default 4096) |
 
+> `max_tokens` is optional: when it is omitted (or <= 0) generation runs until the context is
+> exhausted, matching llama.cpp's server — set a budget only when you want one. `finish_reason` is
+> `"length"` when generation was cut by either the budget or the context. OpenAI's newer
+> `max_completion_tokens` spelling is accepted as an alias.
+
 > Images are accepted in OpenAI form (a base64 data URI in `image_url` inside the `content` array).
 > The browser UI has a 📎 button. Image input also works with MTP enabled.
 > Loading an mmproj subtracts the vision tower's GPU usage (weights + compute buffers, logged at

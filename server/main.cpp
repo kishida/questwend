@@ -308,7 +308,6 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
   <b>QuestWend</b><span class="model" id="model">…</span>
   <span class="spacer"></span>
   <label>temp <input type="number" id="temp" value="0.7" step="0.1" min="0" max="2"></label>
-  <label>max <input type="number" id="maxtok" value="512" step="64" min="1"></label>
   <label><input type="checkbox" id="think" checked> think</label>
   <button id="clear">Clear</button>
 </header>
@@ -395,7 +394,7 @@ async function send(){
       body: JSON.stringify({
         messages: history, stream: true,
         temperature: parseFloat(document.getElementById('temp').value)||0,
-        max_tokens: parseInt(document.getElementById('maxtok').value)||512,
+        // no max_tokens: the server generates until the context runs out
         reasoning: document.getElementById('think').checked
       })
     });
@@ -1164,7 +1163,14 @@ int main(int argc, char ** argv) {
         if (getenv("QWEN_LOG_RESPONSE"))
             fprintf(stderr, "=== request body ===\n%s\n", req.body.c_str());
 
-        const int  max_tokens = body.value("max_tokens", 512);
+        // Omitted (or <= 0) max_tokens means "generate until the context runs
+        // out", matching llama.cpp's server: the caller sets a budget only when
+        // it wants one. n_ctx is a safe cap because the generation loops also
+        // stop on `n_past + 1 >= n_ctx`, which always trips first; both paths
+        // then report finish_reason "length". OpenAI's newer spelling
+        // max_completion_tokens is accepted as an alias.
+        int max_tokens = body.value("max_tokens", body.value("max_completion_tokens", 0));
+        if (max_tokens <= 0) max_tokens = n_ctx;
         const bool stream      = body.value("stream", false);
         const SamplerConfig sc = make_sampler(body);
         const std::string id   = now_id("chatcmpl-");

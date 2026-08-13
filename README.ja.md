@@ -199,6 +199,10 @@ qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15000
 | `--resident-decode` ほか | オフロード調整ノブ（`--resident-refill/-warmup`, `--prefill-prune`, `--batch-chunk`, `--ssd-direct`; CLI と共通、上のオフロード節を参照） |
 | `--pf-chunk <N>` | サーバー prefill のスライス長（切断検出の粒度; 既定 4096） |
 
+> `max_tokens` は省略可。**未指定（または 0 以下）ならコンテキストが尽きるまで生成する**（llama.cpp の
+> サーバーと同じ挙動。上限を掛けたいときだけ指定する）。予算・コンテキストのどちらで打ち切られた場合も
+> `finish_reason` は `"length"`。OpenAI の新しい綴り `max_completion_tokens` も別名として受け付ける。
+
 > 画像は OpenAI 形式（`content` 配列の `image_url` に base64 data URI）で受け付け。ブラウザ UI にも 📎 ボタンあり。MTP 有効時もそのまま画像入力可。
 > mmproj をロードすると vision tower の GPU 使用分（重み + 計算バッファ; 起動時にログ表示）が `--vram-budget` から自動で差し引かれる。Metal の作業セット上限いっぱいに budget を張っていても OOM しない。テキストのみで使うときは `--no-mmproj` でその分を expert キャッシュに戻せる。
 > tool calling は `tools` を渡すと `<tool_call>` 出力を OpenAI の `tool_calls` に変換して返す（`finish_reason: "tool_calls"`）。`role:"tool"` の応答メッセージにも対応。
