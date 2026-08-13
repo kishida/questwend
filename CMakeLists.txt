@@ -10,14 +10,24 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ---- options ----
-option(QW_CUDA  "Enable CUDA backend"  OFF)
-option(QW_METAL "Enable Metal backend" OFF)
+option(QW_CUDA  "Enable CUDA backend"            OFF)
+option(QW_HIP   "Enable HIP (AMD ROCm) backend"  OFF)
+option(QW_METAL "Enable Metal backend"           OFF)
 
 if(QW_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
     # ggml defaults CUDA graphs OFF for standalone builds ("llama.cpp only");
     # enable them to eliminate per-kernel launch overhead during decode.
     set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
+endif()
+if(QW_HIP)
+    # AMD. Pick the arch with -DGPU_TARGETS=gfx#### (see `rocminfo | grep gfx`);
+    # ggml forwards it to CMAKE_HIP_ARCHITECTURES. Unlike GGML_CUDA_GRAPHS,
+    # ggml already defaults GGML_HIP_GRAPHS to ON, so there is nothing to force.
+    # NOTE: untested on real hardware -- the engine itself is backend-agnostic
+    # (it just takes the first GGML_BACKEND_DEVICE_TYPE_GPU device), but the
+    # expert-offload paths have only ever been exercised on CUDA and Metal.
+    set(GGML_HIP ON CACHE BOOL "" FORCE)
 endif()
 if(QW_METAL)
     set(GGML_METAL ON CACHE BOOL "" FORCE)

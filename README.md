@@ -59,6 +59,22 @@ cmake --build build -j --target qw-cli qw-server
 - 生成物: `build/qw-cli`, `build/qw-server`。
 - 起動時に `backend: GPU [MTL0] ...` と出れば Metal が有効。
 
+### AMD（HIP / ROCm）
+
+```bash
+cmake -B build -DQW_HIP=ON -DGPU_TARGETS=gfx1100 -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target qw-cli qw-server
+```
+
+- `GPU_TARGETS` は自分の GPU の gfx 名に置き換える（`rocminfo | grep gfx` で確認。
+  RX 7900 系 = `gfx1100`, MI300 = `gfx942` など）。旧名の `AMDGPU_TARGETS` も可。
+- HIP graph は ggml 側で既定 ON（`GGML_HIP_GRAPHS`）。CUDA と違い明示指定は不要。
+- ROCm を入れずに済ませたい場合は Vulkan でも動くはず: `-DGGML_VULKAN=ON`（`QW_*` の
+  ラッパーは無いので ggml のオプションを直接指定）。
+- **未検証**: バックエンド選択は汎用（最初の GPU デバイスを掴む）なのでコード変更なしに
+  動く見込みだが、エキスパート・オフロード経路は CUDA と Metal でしか実機確認していない。
+  動作報告歓迎。
+
 ### CPU のみ（任意プラットフォーム）
 
 ```bash
