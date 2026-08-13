@@ -66,6 +66,15 @@
 #define N_R0_IQ1_M 4
 #define N_SG_IQ1_M 2
 
+#define N_R0_IQ1_XS 4
+#define N_SG_IQ1_XS 2
+
+#define N_R0_IQ1_XXS 4
+#define N_SG_IQ1_XXS 2
+
+#define N_R0_IQ1_XXXS 4
+#define N_SG_IQ1_XXXS 2
+
 #define N_R0_IQ2_XXS 4
 #define N_SG_IQ2_XXS 2
 

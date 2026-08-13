@@ -14,6 +14,9 @@ A from-scratch inference engine for Qwen3 / Qwen3.5 / Qwen3.6, built on vendored
   - **Image input** (Qwen3-VL family + mmproj GGUF; the vision tower runs on ggml/GPU. CLI `--image`, server takes OpenAI-style `image_url`)
   - **Tool calling** (OpenAI-compatible: `tools` / `tool_calls` / `role:"tool"`, with two-way conversion of Qwen3.6's `<function=...>` form)
   - Sharded GGUF support (`-NNNNN-of-MMMMM.gguf`)
+  - **Sub-1-bit quantization `IQ1_XS` / `IQ1_XXS` / `IQ1_XXXS`** (1.4375 / 1.3125 / 1.1875 bpw,
+    from unsloth's [PR#61](https://github.com/unslothai/llama.cpp/pull/61); CPU / CUDA / **Metal**.
+    This branch only — it goes away once the types land upstream)
   - K-quant embeddings on large-vocab models are converted to F16 in VRAM only when the backend's `get_rows` does not support the type (CUDA only; Metal/CPU support them natively so no copy is made. `--embd-q8` gives Q8_0 instead)
   - OpenAI-compatible server (`qw-server`) with a browser chat UI
 
