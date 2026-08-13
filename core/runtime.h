@@ -27,6 +27,14 @@ struct RuntimeConfig {
     bool   embd_q8        = false;   // use Q8_0 (not F16) for token embedding fallback (saves VRAM)
 };
 
+// Parse a --vram-budget argument into MB (the unit RuntimeConfig stores).
+// The documented unit is GB and fractions are allowed ("13.5"); an explicit
+// "M"/"MB" or "G"/"GB" suffix always wins. A bare number >= 512 is read as MB
+// instead, because that is what every command line and doc used before the
+// switch to GB and nobody budgets 512 GB of VRAM; `legacy_mb` is set so the
+// caller can say so. Returns 0 (offloading off) for a non-positive value.
+size_t parse_vram_budget_mb(const std::string & arg, bool * legacy_mb = nullptr);
+
 class Runtime {
 public:
     Runtime(Model & model, const RuntimeConfig & cfg);

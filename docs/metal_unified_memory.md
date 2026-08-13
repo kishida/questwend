@@ -5,7 +5,7 @@
 
 ```bash
 qw-cli -m Qwen3.5-122B-A10B-UD-Q3_K_M-00001-of-00003.gguf \
-  -p "..." -n 100 --vram-budget 36000 --experts-ssd \
+  -p "..." -n 100 --vram-budget 36 --experts-ssd \
   --cache-profile q122b.prof --log-tokens-per-sec
 ```
 

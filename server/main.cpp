@@ -499,7 +499,19 @@ int main(int argc, char ** argv) {
         else if (a == "--port" && i + 1 < argc) port = std::stoi(argv[++i]);
         else if (a == "--host" && i + 1 < argc) host = argv[++i];
         else if (a == "--n-ctx" && i + 1 < argc) n_ctx = std::stoi(argv[++i]);
-        else if (a == "--vram-budget" && i + 1 < argc) vram_budget_mb = (size_t) std::stoul(argv[++i]);
+        else if (a == "--vram-budget" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            bool legacy = false;
+            vram_budget_mb = parse_vram_budget_mb(v, &legacy);
+            if (vram_budget_mb == 0) {
+                fprintf(stderr, "error: bad --vram-budget value: %s (expected e.g. 14, 13.5, 14G, 13500M)\n", v.c_str());
+                return 1;
+            }
+            if (legacy)
+                fprintf(stderr, "note: --vram-budget %s read as %zu MB (%.1f GB); the unit is now GB, "
+                                "write %.1f or %sM to be explicit\n",
+                        v.c_str(), vram_budget_mb, vram_budget_mb / 1024.0, vram_budget_mb / 1024.0, v.c_str());
+        }
         else if (a == "--cache-profile" && i + 1 < argc) cache_profile = argv[++i];
         else if (a == "--experts-ssd")      experts_ssd = true;
         else if (a == "--reasoning" && i + 1 < argc) { std::string v = argv[++i]; reasoning_default = (v != "off" && v != "0" && v != "false"); }
@@ -536,7 +548,8 @@ int main(int argc, char ** argv) {
             "  --port <N>          listen port (default 8080)\n"
             "  --host <addr>       bind address (default 127.0.0.1)\n"
             "  --n-ctx <N>         context length (default 4096)\n"
-            "  --vram-budget <MB>  offload expert weights; keep non-expert on GPU\n"
+            "  --vram-budget <GB>  offload expert weights; keep non-expert on GPU\n"
+            "                      GB, fractions ok (13.5); suffix M/G to be explicit (13500M)\n"
             "  --cache-profile <f> prefetch hot-expert profile (read-only on the server)\n"
             "  --experts-ssd       stream experts from the GGUF on SSD (no RAM copy)\n"
             "  --reasoning <on|off> default thinking mode (per-request override: \"reasoning\")\n"

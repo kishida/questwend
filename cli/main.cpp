@@ -103,7 +103,8 @@ static void usage(const char * prog) {
     printf("  --repeat-last-n <N>   penalty window (default 64)\n");
     printf("  --top-k <N>    top-k (default 40)\n");
     printf("  --seed <N>     RNG seed (0 = random)\n");
-    printf("  --vram-budget <MB>  offload expert weights to CPU; keep non-expert on GPU\n");
+    printf("  --vram-budget <GB>  offload expert weights to CPU; keep non-expert on GPU\n");
+    printf("                      GB, fractions ok (13.5); suffix M/G to be explicit (13500M)\n");
     printf("  --cache-profile <f> persist/prefetch hot-expert profile (warm restarts)\n");
     printf("  --experts-ssd  stream experts from the GGUF on SSD (no RAM copy)\n");
     printf("  --cpu          force CPU backend\n");
@@ -147,7 +148,19 @@ int main(int argc, char ** argv) {
         else if (a == "--seed" && i + 1 < argc)  sc.seed = (uint32_t) std::stoul(next());
         else if (a == "--repeat-penalty" && i + 1 < argc) sc.repeat_penalty = std::stof(next());
         else if (a == "--repeat-last-n" && i + 1 < argc)  sc.repeat_last_n = std::stoi(next());
-        else if (a == "--vram-budget" && i + 1 < argc) vram_budget_mb = (size_t) std::stoul(next());
+        else if (a == "--vram-budget" && i + 1 < argc) {
+            const std::string v = next();
+            bool legacy = false;
+            vram_budget_mb = parse_vram_budget_mb(v, &legacy);
+            if (vram_budget_mb == 0) {
+                fprintf(stderr, "error: bad --vram-budget value: %s (expected e.g. 14, 13.5, 14G, 13500M)\n", v.c_str());
+                return 1;
+            }
+            if (legacy)
+                fprintf(stderr, "note: --vram-budget %s read as %zu MB (%.1f GB); the unit is now GB, "
+                                "write %.1f or %sM to be explicit\n",
+                        v.c_str(), vram_budget_mb, vram_budget_mb / 1024.0, vram_budget_mb / 1024.0, v.c_str());
+        }
         else if (a == "--cache-profile" && i + 1 < argc) cache_profile = next();
         else if (a == "--experts-ssd")      experts_ssd = true;
         else if (a == "--reasoning" && i + 1 < argc) { std::string v = next(); reasoning = (v != "off" && v != "0" && v != "false"); }

@@ -125,16 +125,19 @@ qw-cli -m model.gguf --info                  # print model info and exit
 ```bash
 # RAM tier: non-expert weights on the GPU, experts in pinned host RAM,
 #           streamed through the dynamic VRAM cache (PCIe)
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15000
+qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15
 
 # SSD tier: experts read straight from the GGUF on disk (no RAM copy)
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 12000 --experts-ssd
+qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 12 --experts-ssd
 
 # residency profile: saved on the first run, then hot experts are preloaded at startup
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15000 --cache-profile hot.prof
+qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15 --cache-profile hot.prof
 ```
 
-- `--vram-budget <MB>`: VRAM budget for the slot pools (offloading is enabled when > 0).
+- `--vram-budget <GB>`: VRAM budget for the slot pools (offloading is enabled when > 0).
+  The unit is **GB** and fractions work (`13.5`); an explicit `M`/`G` suffix always wins
+  (`13500M`, `14G`). A bare number of 512 or more is read as MB, so command lines written
+  before the unit changed keep working (with a note pointing at the GB spelling).
 - `--experts-ssd`: stream experts from disk (for models too large for RAM).
 - `--cache-profile <file>`: persist the hot-expert frequency profile. **On the same or a similar
   workload the hit rate reaches ~100%, streaming essentially disappears and throughput jumps.**
@@ -179,7 +182,7 @@ qw-cli -m model-MTP.gguf -p "..." -n 128 --mtp --draft 2  # look ahead 2 tokens 
 Provides an OpenAI-compatible `/v1/chat/completions` (with SSE streaming) plus a browser chat UI.
 
 ```bash
-qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15000
+qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15
 ```
 
 Open `http://<host>:<port>/` for the chat UI (shows TTFT / tok/s / prefill tok/s / output tokens).
@@ -190,7 +193,7 @@ Open `http://<host>:<port>/` for the chat UI (shows TTFT / tok/s / prefill tok/s
 | `--host <addr>` | bind address (default `127.0.0.1`; use `0.0.0.0` to expose on the LAN) |
 | `--port <N>` | port (default 8080) |
 | `--n-ctx <N>` | context length |
-| `--vram-budget <MB>` / `--experts-ssd` | expert offloading |
+| `--vram-budget <GB>` / `--experts-ssd` | expert offloading (GB, fractions ok; `M`/`G` suffix to be explicit) |
 | `--cache-profile <file>` | residency profile (**the server only reads it**, never overwrites) |
 | `--reasoning <on\|off>` | default thinking mode (also reflected in the UI checkbox) |
 | `--mtp` | MTP self-speculative decoding (models with a nextn block; enabled at startup) |
@@ -271,7 +274,7 @@ For models split as `model-00001-of-00003.gguf`, pass the **first shard** to `-m
 shards are discovered and merged automatically (5-digit zero-padded naming, starting at 00001).
 
 ```bash
-qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40000 --experts-ssd
+qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40 --experts-ssd
 ```
 
 ---

@@ -3331,4 +3331,30 @@ void Runtime::load_state(const std::function<void(void *, size_t)> & src) {
     impl_->pk.clear();   // checkpoints belong to the replaced lineage
 }
 
+size_t parse_vram_budget_mb(const std::string & arg, bool * legacy_mb) {
+    if (legacy_mb) *legacy_mb = false;
+
+    const char * s = arg.c_str();
+    char * end = nullptr;
+    const double v = strtod(s, &end);
+    if (end == s || v <= 0.0) return 0;
+
+    std::string suf;
+    for (const char * p = end; *p; ++p)
+        if (!isspace((unsigned char) *p)) suf += (char) tolower((unsigned char) *p);
+
+    double mb;
+    if (suf == "m" || suf == "mb") {
+        mb = v;
+    } else if (suf == "g" || suf == "gb" || suf.empty()) {
+        // bare values large enough to be nonsense as GB are the pre-GB spelling
+        const bool legacy = suf.empty() && v >= 512.0;
+        if (legacy && legacy_mb) *legacy_mb = true;
+        mb = legacy ? v : v * 1024.0;
+    } else {
+        return 0;   // unknown suffix: caller reports it as a bad value
+    }
+    return (size_t) (mb + 0.5);
+}
+
 } // namespace questwend

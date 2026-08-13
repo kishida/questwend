@@ -123,16 +123,19 @@ qw-cli -m model.gguf --info                  # モデル情報を表示して終
 ```bash
 # RAM 階層: 非エキスパート重みを GPU、エキスパートは pinned host RAM に置き
 #           動的 VRAM キャッシュ経由でストリーミング（PCIe）
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15000
+qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15
 
 # SSD 階層: エキスパートを GGUF からディスク直読（RAM コピーなし）
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 12000 --experts-ssd
+qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 12 --experts-ssd
 
 # 常駐プロファイル: 1回目に保存、2回目以降は起動時にホットなエキスパートを事前常駐
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15000 --cache-profile hot.prof
+qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15 --cache-profile hot.prof
 ```
 
-- `--vram-budget <MB>`: スロットプールに使う VRAM 予算（>0 でオフロード有効）。
+- `--vram-budget <GB>`: スロットプールに使う VRAM 予算（>0 でオフロード有効）。
+  単位は **GB**、小数も可（`13.5`）。`M`/`G` サフィックスを付ければ明示指定できる（`13500M`, `14G`）。
+  512 以上の裸の数値は MB として解釈するので、単位変更前に書いたコマンドはそのまま動く
+  （GB 表記を促す注意書きが出る）。
 - `--experts-ssd`: エキスパートをディスクからストリーミング（RAM に載らない巨大モデル向け）。
 - `--cache-profile <file>`: ホットエキスパートの頻度プロファイルを永続化。**同一/類似ワークロードで hit 率が ~100% になり、ストリーミングがほぼ消えて大幅高速化**。
 
@@ -173,7 +176,7 @@ qw-cli -m model-MTP.gguf -p "..." -n 128 --mtp --draft 2  # 2 トークン先読
 OpenAI 互換の `/v1/chat/completions`（SSE ストリーミング対応）と、ブラウザ・チャット UI を提供。
 
 ```bash
-qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15000
+qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15
 ```
 
 ブラウザで `http://<host>:<port>/` を開くとチャット UI（TTFT / tok/s / prefill tok/s / 出力トークン数を表示）。
@@ -184,7 +187,7 @@ qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15000
 | `--host <addr>` | バインドアドレス（既定 `127.0.0.1`; LAN 公開は `0.0.0.0`） |
 | `--port <N>` | ポート（既定 8080） |
 | `--n-ctx <N>` | コンテキスト長 |
-| `--vram-budget <MB>` / `--experts-ssd` | エキスパート・オフロード |
+| `--vram-budget <GB>` / `--experts-ssd` | エキスパート・オフロード（GB、小数可。`M`/`G` で明示指定） |
 | `--cache-profile <file>` | 常駐プロファイル（**サーバーは読み込みのみ**, 上書きしない） |
 | `--reasoning <on\|off>` | thinking モードの既定（UI のチェックにも反映） |
 | `--mtp` | MTP 自己推測デコード（nextn ブロックを持つモデル; 起動時に有効化） |
@@ -226,7 +229,7 @@ qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15000
 `model-00001-of-00003.gguf` のように分割されたモデルは、**先頭シャード**を `-m` に渡すだけで自動的に全シャードを探索・統合します（命名は 5 桁ゼロ詰め、00001 開始）。
 
 ```bash
-qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40000 --experts-ssd
+qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40 --experts-ssd
 ```
 
 ---
