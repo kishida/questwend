@@ -483,8 +483,13 @@ void Runtime::Impl::init() {
             ggml_set_name(conv_state[il], ("conv_" + std::to_string(il)).c_str());
             ggml_set_name(ssm_state[il],  ("ssm_"  + std::to_string(il)).c_str());
         } else {
-            k_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F32, n_embd_gqa, n_ctx);
-            v_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F32, n_embd_gqa, n_ctx);
+            // F16 halves the KV cache, which is what bounds the usable context
+            // (and on offload builds it competes with the expert pool). Writes
+            // convert from F32 via set_rows / cpy; flash attention takes F16
+            // K/V natively, and the fallback path feeds them to mul_mat, which
+            // handles an F16 src0 against F32 activations.
+            k_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_gqa, n_ctx);
+            v_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_gqa, n_ctx);
             ggml_set_name(k_cache[il], ("k_" + std::to_string(il)).c_str());
             ggml_set_name(v_cache[il], ("v_" + std::to_string(il)).c_str());
         }
@@ -601,7 +606,8 @@ void Runtime::Impl::zero_states() {
     auto zero = [&](ggml_tensor * t) {
         if (!t) return;
         const size_t n = ggml_nbytes(t);
-        if (zeros.size() * sizeof(float) < n) zeros.assign(n / sizeof(float), 0.0f);
+        if (zeros.size() * sizeof(float) < n)
+            zeros.assign((n + sizeof(float) - 1) / sizeof(float), 0.0f);   // round up: n need not be a multiple of 4 (F16 KV)
         ggml_backend_tensor_set(t, zeros.data(), 0, n);
     };
     for (auto * t : conv_state) zero(t);
@@ -3232,11 +3238,13 @@ void Runtime::set_progress_cb(std::function<void(int, int)> cb) { impl_->progres
 // or the full conv/ssm states (GDN layers).
 namespace {
 struct StateHeader {
-    uint32_t magic;      // 'QSS2'
+    uint32_t magic;      // 'QSS3'
     int32_t  n_layer, n_ctx, n_embd_gqa;
     int32_t  n_past, mtp_past, n_toks, n_hidden, mrope_next;
 };
-constexpr uint32_t STATE_MAGIC = 0x32535351;   // "QSS2" little-endian
+// Bumped to QSS3 when the KV cache became F16: the per-row byte count halved,
+// so a QSS2 slot file on disk would pass the header check and then be misread.
+constexpr uint32_t STATE_MAGIC = 0x33535351;   // "QSS3" little-endian
 }
 
 size_t Runtime::state_bytes() const {
