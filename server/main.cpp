@@ -475,7 +475,7 @@ static void set_knob(const char * env, const char * val) {
 int main(int argc, char ** argv) {
     std::string model_path;
     int  port  = 8080;
-    int  n_ctx = 4096;
+    int  n_ctx = 0;   // 0 = the model's trained context length (resolved after load)
     bool force_cpu = false;
     std::string host = "127.0.0.1";
     size_t vram_budget_mb = 0;
@@ -551,7 +551,7 @@ int main(int argc, char ** argv) {
             "usage: %s -m <model.gguf> [options]\n"
             "  --port <N>          listen port (default 8080)\n"
             "  --host <addr>       bind address (default 127.0.0.1)\n"
-            "  --n-ctx <N>         context length (default 4096)\n"
+            "  --n-ctx <N>         context length (default: the model's trained length)\n"
             "  --vram-budget <GB>  offload expert weights; keep non-expert on GPU\n"
             "                      GB, fractions ok (13.5); suffix M/G to be explicit (13500M)\n"
             "  --cache-profile <f> prefetch hot-expert profile (read-only on the server)\n"
@@ -592,6 +592,15 @@ int main(int argc, char ** argv) {
     try {
         model = Model::load(model_path);
         tok   = std::make_unique<Tokenizer>(model->vocab());
+
+        // Context length defaults to what the model was trained for. The KV
+        // cache is sized from it, so a very long context costs memory that the
+        // expert pool would otherwise use -- pass --n-ctx to cap it if the
+        // allocation does not fit.
+        if (n_ctx <= 0) {
+            n_ctx = (int) model->hparams().n_ctx_train;
+            fprintf(stderr, "context: %d tokens (model's trained length; --n-ctx to change)\n", n_ctx);
+        }
 
         // ---- vision tower (image input): explicit --mmproj or auto-discovery ----
         // Loaded BEFORE the runtime so its GPU footprint can be subtracted from

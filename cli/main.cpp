@@ -96,7 +96,7 @@ static void usage(const char * prog) {
     printf("  --mmproj <path> vision tower GGUF (default: mmproj-*.gguf next to the model)\n");
     printf("  --vision-test  encode --image with --mmproj and print embedding stats (no LLM)\n");
     printf("  -n <N>         max new tokens (default 128)\n");
-    printf("  --n-ctx <N>    context length (default 4096)\n");
+    printf("  --n-ctx <N>    context length (default: the model's trained length)\n");
     printf("  --temp <f>     temperature (0 = greedy, default 0)\n");
     printf("  --top-p <f>    nucleus top-p (default 0.95)\n");
     printf("  --repeat-penalty <f>  repetition penalty over the last N tokens (default 1 = off)\n");
@@ -126,7 +126,7 @@ static void usage(const char * prog) {
 int main(int argc, char ** argv) {
     std::string model_path, prompt, cache_profile, mmproj_path;
     std::vector<std::string> image_paths;
-    int  max_tokens = 128, n_ctx = 4096, n_draft = 1;
+    int  max_tokens = 128, n_ctx = 0, n_draft = 1;   // n_ctx 0 = model's trained length
     size_t vram_budget_mb = 0;
     bool interactive = false, info_only = false, chat = false, log_speed = false, force_cpu = false;
     bool experts_ssd = false, reasoning = true, use_mtp = false, embd_q8 = false, vision_test = false;
@@ -238,6 +238,13 @@ int main(int argc, char ** argv) {
             return 0;
         }
         fprintf(stderr, "%s", model->summary().c_str());
+
+        // Context length defaults to what the model was trained for. The KV
+        // cache is sized from it, so cap it with --n-ctx if it does not fit.
+        if (n_ctx <= 0) {
+            n_ctx = (int) model->hparams().n_ctx_train;
+            fprintf(stderr, "context: %d tokens (model's trained length; --n-ctx to change)\n", n_ctx);
+        }
 
         Tokenizer tok(model->vocab());
 

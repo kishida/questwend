@@ -117,7 +117,7 @@ qw-cli -m model.gguf --info                  # print model info and exit
 | `-i` | interactive chat |
 | `--chat` | wrap `-p` in ChatML |
 | `--reasoning <on\|off>` | thinking mode (default on; `off` terminates with `<think>\n\n</think>`) |
-| `--n-ctx <N>` | context length (default 4096) |
+| `--n-ctx <N>` | context length (default: the model's trained length; the KV cache is sized from it, so lower it if the allocation does not fit) |
 | `--temp <f>` / `--top-p <f>` / `--top-k <N>` / `--seed <N>` | sampling (default greedy: temp=0) |
 | `--embd-q8` | use Q8_0 instead of F16 for the embedding `get_rows` fallback (saves VRAM; slight quantization error) |
 | `--image <path>` | attach an image to the prompt (repeatable; needs a VL model + mmproj) |
