@@ -79,12 +79,26 @@ cmake --build build -j --target qw-cli qw-server
   architectures in one binary (`rocminfo | grep gfx` prints yours; RX 7900 series = `gfx1100`,
   MI300 = `gfx942`). The older `AMDGPU_TARGETS` spelling also works.
 - HIP graphs are on by default in ggml (`GGML_HIP_GRAPHS`), so unlike CUDA there is nothing to pass.
-- To avoid installing ROCm, Vulkan should also work: `-DGGML_VULKAN=ON` (there is no `QW_*` wrapper,
-  so pass ggml's option directly).
+- To avoid installing ROCm, use the Vulkan backend below instead.
 - **Untested**: backend selection is generic (it takes the first GPU device ggml reports, discrete
   before integrated), so it should work with no code changes, but the expert-offload paths have only
   been exercised on CUDA and Metal.
   Reports welcome.
+
+### Vulkan (AMD / Intel / integrated GPUs)
+
+```bash
+cmake -B build -DQW_VULKAN=ON
+cmake --build build -j --target qw-cli qw-server
+```
+
+- Vendor-neutral: AMD, Intel and NVIDIA all work through the same backend. This is the practical
+  way to use a Ryzen APU or an Intel integrated GPU, since it needs neither ROCm nor oneAPI.
+- Requires the [Vulkan SDK](https://vulkan.lunarg.com/) -- ggml compiles its compute shaders with
+  the `glslc` that ships with it, so a runtime-only driver install is not enough.
+- An integrated GPU is reported as an IGPU device and picked up automatically; a discrete GPU in the
+  same machine wins over it. Startup prints `backend: GPU [Vulkan0] ...` when it is active.
+- **Untested**, same caveat as HIP above.
 
 ### CPU only (any platform)
 

@@ -76,12 +76,26 @@ cmake --build build -j --target qw-cli qw-server
   （自分の値は `rocminfo | grep gfx` で確認。RX 7900 系 = `gfx1100`, MI300 = `gfx942` など）。
   旧名の `AMDGPU_TARGETS` も可。
 - HIP graph は ggml 側で既定 ON（`GGML_HIP_GRAPHS`）。CUDA と違い明示指定は不要。
-- ROCm を入れずに済ませたい場合は Vulkan でも動くはず: `-DGGML_VULKAN=ON`（`QW_*` の
-  ラッパーは無いので ggml のオプションを直接指定）。
+- ROCm を入れずに済ませたい場合は、下の Vulkan バックエンドを使う。
 - **未検証**: バックエンド選択は汎用（ggml が報告する最初の GPU デバイスを掴む。discrete を
   統合 GPU より優先）なのでコード変更なしに動く見込みだが、エキスパート・オフロード経路は
   CUDA と Metal でしか実機確認していない。
   動作報告歓迎。
+
+### Vulkan（AMD / Intel / 統合 GPU）
+
+```bash
+cmake -B build -DQW_VULKAN=ON
+cmake --build build -j --target qw-cli qw-server
+```
+
+- ベンダー非依存で AMD・Intel・NVIDIA が同じバックエンドで動く。ROCm も oneAPI も要らないので、
+  Ryzen APU や Intel 統合 GPU を使うときの現実的な選択肢。
+- [Vulkan SDK](https://vulkan.lunarg.com/) が必要。ggml は同梱の `glslc` でコンピュートシェーダを
+  コンパイルするため、ランタイム（ドライバ）だけでは足りない。
+- 統合 GPU は IGPU デバイスとして報告され、自動的に選ばれる（同じマシンに discrete GPU があれば
+  そちらが優先）。有効なら起動時に `backend: GPU [Vulkan0] ...` と出る。
+- **未検証**（HIP と同じ注意）。
 
 ### CPU のみ（任意プラットフォーム）
 

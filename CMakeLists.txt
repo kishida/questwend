@@ -10,9 +10,10 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ---- options ----
-option(QW_CUDA  "Enable CUDA backend"            OFF)
-option(QW_HIP   "Enable HIP (AMD ROCm) backend"  OFF)
-option(QW_METAL "Enable Metal backend"           OFF)
+option(QW_CUDA   "Enable CUDA backend"            OFF)
+option(QW_HIP    "Enable HIP (AMD ROCm) backend"  OFF)
+option(QW_METAL  "Enable Metal backend"           OFF)
+option(QW_VULKAN "Enable Vulkan backend"          OFF)
 
 if(QW_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
@@ -31,6 +32,13 @@ if(QW_HIP)
 endif()
 if(QW_METAL)
     set(GGML_METAL ON CACHE BOOL "" FORCE)
+endif()
+if(QW_VULKAN)
+    # Vendor-neutral GPU path (AMD, Intel, NVIDIA), and the way to use a Ryzen
+    # or Intel integrated GPU without installing ROCm or oneAPI. Needs the
+    # Vulkan SDK: ggml compiles its shaders with the glslc that ships with it.
+    # NOTE: untested on real hardware, same caveat as QW_HIP above.
+    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
 endif()
 
 # ---- vendored ggml (self-contained, see third_party/ggml/GGML_VERSION) ----
