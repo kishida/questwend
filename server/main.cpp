@@ -626,8 +626,8 @@ int main(int argc, char ** argv) {
             if (!mmproj_path.empty()) {
                 try {
                     if (!force_cpu)
-                        if (ggml_backend_dev_t d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))
-                            vis_backend = ggml_backend_dev_init(d, nullptr);
+                        for (ggml_backend_dev_t d : gpu_devices())
+                            if ((vis_backend = ggml_backend_dev_init(d, nullptr))) break;
                     if (!vis_backend) vis_backend = ggml_backend_cpu_init();
                     venc = VisionEncoder::load(mmproj_path, vis_backend);
                     if (venc->n_embd() != (int) model->hparams().n_embd) {

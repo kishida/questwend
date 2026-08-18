@@ -25,8 +25,8 @@ if(QW_HIP)
     # ggml forwards it to CMAKE_HIP_ARCHITECTURES. Unlike GGML_CUDA_GRAPHS,
     # ggml already defaults GGML_HIP_GRAPHS to ON, so there is nothing to force.
     # NOTE: untested on real hardware -- the engine itself is backend-agnostic
-    # (it just takes the first GGML_BACKEND_DEVICE_TYPE_GPU device), but the
-    # expert-offload paths have only ever been exercised on CUDA and Metal.
+    # (it takes the first GPU device ggml reports, discrete before integrated),
+    # but the expert-offload paths have only ever been exercised on CUDA and Metal.
     set(GGML_HIP ON CACHE BOOL "" FORCE)
 endif()
 if(QW_METAL)

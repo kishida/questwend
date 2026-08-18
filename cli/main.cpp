@@ -199,8 +199,8 @@ int main(int argc, char ** argv) {
         try {
             ggml_backend_t be = nullptr;
             if (!force_cpu)
-                if (ggml_backend_dev_t d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))
-                    be = ggml_backend_dev_init(d, nullptr);
+                for (ggml_backend_dev_t d : gpu_devices())
+                    if ((be = ggml_backend_dev_init(d, nullptr))) break;
             if (!be) be = ggml_backend_cpu_init();
             {
                 auto enc = VisionEncoder::load(mmproj_path, be);
@@ -274,8 +274,8 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "mmproj: using %s\n", mmproj_path.c_str());
             }
             if (!force_cpu)
-                if (ggml_backend_dev_t d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))
-                    vis_backend = ggml_backend_dev_init(d, nullptr);
+                for (ggml_backend_dev_t d : gpu_devices())
+                    if ((vis_backend = ggml_backend_dev_init(d, nullptr))) break;
             if (!vis_backend) vis_backend = ggml_backend_cpu_init();
             venc = VisionEncoder::load(mmproj_path, vis_backend);
             if (venc->n_embd() != (int) model->hparams().n_embd)

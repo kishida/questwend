@@ -78,8 +78,9 @@ cmake --build build -j --target qw-cli qw-server
 - HIP graph は ggml 側で既定 ON（`GGML_HIP_GRAPHS`）。CUDA と違い明示指定は不要。
 - ROCm を入れずに済ませたい場合は Vulkan でも動くはず: `-DGGML_VULKAN=ON`（`QW_*` の
   ラッパーは無いので ggml のオプションを直接指定）。
-- **未検証**: バックエンド選択は汎用（最初の GPU デバイスを掴む）なのでコード変更なしに
-  動く見込みだが、エキスパート・オフロード経路は CUDA と Metal でしか実機確認していない。
+- **未検証**: バックエンド選択は汎用（ggml が報告する最初の GPU デバイスを掴む。discrete を
+  統合 GPU より優先）なのでコード変更なしに動く見込みだが、エキスパート・オフロード経路は
+  CUDA と Metal でしか実機確認していない。
   動作報告歓迎。
 
 ### CPU のみ（任意プラットフォーム）

@@ -370,18 +370,28 @@ struct Runtime::Impl {
                              const Runtime::EmbdOverride * ovr = nullptr, int n_ovr = 0);
 };
 
+std::vector<ggml_backend_dev_t> gpu_devices() {
+    std::vector<ggml_backend_dev_t> devs;
+    // `auto`, not `ggml_backend_dev_type`: ggml gives the enum and the getter
+    // function the same name, and the function hides the type.
+    for (auto want : { GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU }) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == want) devs.push_back(dev);
+        }
+    }
+    return devs;
+}
+
 void Runtime::Impl::init() {
     // Prefer a GPU device (CUDA/Metal/etc.) when requested and available.
     if (cfg.use_cuda) {
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                backend = ggml_backend_dev_init(dev, nullptr);
-                if (backend) {
-                    fprintf(stderr, "backend: GPU [%s] %s\n",
-                            ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
-                    break;
-                }
+        for (ggml_backend_dev_t dev : gpu_devices()) {
+            backend = ggml_backend_dev_init(dev, nullptr);
+            if (backend) {
+                fprintf(stderr, "backend: GPU [%s] %s\n",
+                        ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+                break;
             }
         }
         if (!backend) fprintf(stderr, "backend: no GPU device found, falling back to CPU\n");

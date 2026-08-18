@@ -81,8 +81,9 @@ cmake --build build -j --target qw-cli qw-server
 - HIP graphs are on by default in ggml (`GGML_HIP_GRAPHS`), so unlike CUDA there is nothing to pass.
 - To avoid installing ROCm, Vulkan should also work: `-DGGML_VULKAN=ON` (there is no `QW_*` wrapper,
   so pass ggml's option directly).
-- **Untested**: backend selection is generic (it takes the first GPU device), so it should work with
-  no code changes, but the expert-offload paths have only been exercised on CUDA and Metal.
+- **Untested**: backend selection is generic (it takes the first GPU device ggml reports, discrete
+  before integrated), so it should work with no code changes, but the expert-offload paths have only
+  been exercised on CUDA and Metal.
   Reports welcome.
 
 ### CPU only (any platform)

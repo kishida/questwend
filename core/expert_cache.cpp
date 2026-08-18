@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <thread>

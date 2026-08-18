@@ -10,9 +10,18 @@
 #include <string>
 #include <vector>
 
+typedef struct ggml_backend_device * ggml_backend_dev_t;
+
 namespace questwend {
 
 class Model;
+
+// Devices that can run the model, most preferred first: discrete GPUs before
+// integrated ones. An integrated GPU is still a GPU worth using -- CUDA
+// reports unified-memory parts (Jetson, GB10) as IGPU rather than GPU, so
+// looking only for GGML_BACKEND_DEVICE_TYPE_GPU falls back to the CPU on
+// machines whose CUDA device was found and initialized just fine.
+std::vector<ggml_backend_dev_t> gpu_devices();
 
 struct RuntimeConfig {
     int    n_ctx          = 4096;
