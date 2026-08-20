@@ -123,16 +123,18 @@ public:
     // Expert weights are spread over several cpu buffers (each below the single
     // cudaHostAlloc cap) so the whole set can be page-locked. Enables running
     // large MoE models when GPU VRAM is limited.
+    // Both sides are lists because a backend can cap the size of one buffer
+    // (Vulkan does, at 1 GiB by default) well below the weights' total.
     void load_weights_split(ggml_backend_t gpu_backend,
                             ggml_backend_buffer_type_t cpu_buft,
-                            ggml_backend_buffer_t & out_gpu_buf,
+                            std::vector<ggml_backend_buffer_t> & out_gpu_bufs,
                             std::vector<ggml_backend_buffer_t> & out_cpu_bufs);
 
     // SSD-tier variant: routed expert weights are NOT loaded into memory at all
     // (they stay on disk and are streamed on demand by ExpertCache). Everything
     // else (incl. shared experts) goes to gpu_backend. Saves the experts' RAM.
     void load_weights_ssd(ggml_backend_t gpu_backend,
-                          ggml_backend_buffer_t & out_gpu_buf);
+                          std::vector<ggml_backend_buffer_t> & out_gpu_bufs);
 
     // Source file + absolute byte offset of a tensor's data (for pread).
     // For sharded models these vary per tensor (different shard files).

@@ -29,12 +29,13 @@ struct Runtime::Impl {
 
     // Primary compute backend (GPU or CPU).
     ggml_backend_t        backend     = nullptr;
-    ggml_backend_buffer_t weights_buf = nullptr;
+    // GPU weights, split across buffers when the backend caps a single one.
+    std::vector<ggml_backend_buffer_t> weights_bufs;
     bool weights_buf_owned = false;   // split/ssd: ours; single-backend: Model frees it
 
     // Phase B: CPU backend + sched for expert weight offloading.
-    // When active, expert tensors live in expert_cpu_buf (CPU pinned memory)
-    // and the rest of the weights are in weights_buf (GPU).
+    // When active, expert tensors live in expert_cpu_bufs (CPU pinned memory)
+    // and the rest of the weights are in weights_bufs (GPU).
     // ggml_backend_sched handles routing ops to the right backend.
     ggml_backend_t        cpu_backend    = nullptr;
     // Expert weights live in one or more pinned host buffers. Multiple buffers are
@@ -255,11 +256,12 @@ struct Runtime::Impl {
         if (dctx)           ggml_free(dctx);
         if (st_buf)         ggml_backend_buffer_free(st_buf);
         if (st_ctx)         ggml_free(st_ctx);
-        // expert_cpu_bufs and weights_buf are owned here (not by Model) in
-        // split/ssd mode; in single-backend mode Model owns and frees weights_buf.
+        // expert_cpu_bufs and weights_bufs are owned here (not by Model) in
+        // split/ssd mode; in single-backend mode Model owns and frees the weights.
         for (auto b : expert_cpu_bufs) if (b) ggml_backend_buffer_free(b);
         if (cpu_backend)    ggml_backend_free(cpu_backend);
-        if (weights_buf_owned && weights_buf) ggml_backend_buffer_free(weights_buf);
+        if (weights_buf_owned)
+            for (auto b : weights_bufs) if (b) ggml_backend_buffer_free(b);
         if (backend)        ggml_backend_free(backend);
     }
 
@@ -418,8 +420,8 @@ void Runtime::Impl::init() {
     if (use_expert_offload && cfg.experts_ssd) {
         // ---- SSD tier: experts stay on disk; non-expert weights -> GPU ----
         ssd_mode = true;
-        model.load_weights_ssd(backend, weights_buf);
-        weights_buf_owned = true;
+        weights_buf_owned = true;   // set first: a throw mid-load still frees what was allocated
+        model.load_weights_ssd(backend, weights_bufs);
         reuse_graph = false;   // every token goes through the per-token cache path
         fprintf(stderr, "expert offload: ON (SSD tier, decode via VRAM cache; prefill in batched chunks)\n");
     } else if (use_expert_offload) {
@@ -441,8 +443,8 @@ void Runtime::Impl::init() {
         }
 
         // Load weights: non-expert → GPU, expert → CPU (pinned).
-        model.load_weights_split(backend, cpu_buft, weights_buf, expert_cpu_bufs);
-        weights_buf_owned = true;
+        weights_buf_owned = true;   // set first: a throw mid-load still frees what was allocated
+        model.load_weights_split(backend, cpu_buft, weights_bufs, expert_cpu_bufs);
 
         // Create backend scheduler: GPU first (higher priority), CPU fallback.
         // The sched routes ops to GPU for GPU-backend tensors and CPU for CPU-backend tensors.
@@ -460,7 +462,7 @@ void Runtime::Impl::init() {
         fprintf(stderr, "expert offload: ON (experts stream into the VRAM cache;"
                         " QWEN_CPU_PREFILL=1 runs prefill experts on CPU instead)\n");
     } else {
-        weights_buf = model.load_weights(backend);
+        weights_bufs.push_back(model.load_weights(backend));
     }
 
     // fused flash attention on GPU (disable with QWEN_NO_FLASH)
@@ -537,7 +539,8 @@ void Runtime::Impl::init_cache() {
     // memory (paged over PCIe), uniformly slowing prefill and decode; sizing
     // the pool against the real KV bytes keeps everything VRAM-resident.
     const size_t budget   = cfg.vram_budget_mb * 1024ull * 1024ull;
-    const size_t gpu_w    = ggml_backend_buffer_get_size(weights_buf);
+    size_t gpu_w = 0;
+    for (auto b : weights_bufs) gpu_w += ggml_backend_buffer_get_size(b);
     const size_t kv_bytes = st_buf ? ggml_backend_buffer_get_size(st_buf) : 0;
     const size_t compute  = 1024ull * 1024ull * 1024ull;   // gallocr graph buffers
     const size_t reserve  = gpu_w + kv_bytes + compute;

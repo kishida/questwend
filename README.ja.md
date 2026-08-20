@@ -276,6 +276,7 @@ qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40 --expe
 | `QWEN_NO_DIRECT_FETCH=1` | ユニファイドメモリへのゼロコピー SSD 読みを無効化（staging 経路に戻す） |
 | `QWEN_SYNC_FETCH=1` | RAM 階層の H2D を同期コピーに（async DMA の A/B 用） |
 | `QWEN_PREFETCH_THREADS=N` | SSD 並列読みのワーカー数（既定 8, 1〜64） |
+| `QWEN_MAX_BUFFER_MB=N` | 重みバッファ 1 個を N MB に制限し、上限を報告しないバックエンドでも分割経路を通す（検証用） |
 | `QWEN_GGML_DEBUG=1` | ggml の生ログを全表示（既定は DEBUG/INFO 破棄、同一 WARN 連続は1回） |
 | `QWEN_CACHE_DEBUG=1` | サーバーのプレフィックスキャッシュがミスしたとき分岐位置とトークンを表示 |
 

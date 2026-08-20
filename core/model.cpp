@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -157,10 +158,56 @@ ggml_backend_buffer * Model::load_weights(ggml_backend_t backend) {
     return weights_buf_;
 }
 
+// Allocate `ts` into backend buffers, starting a new buffer whenever the next
+// tensor would push the current one past `cap`. A backend's single-buffer limit
+// is not always generous: CUDA reports none and Metal's runs to tens of GB, but
+// Vulkan caps one buffer at 1 GiB by default, and a driver that refuses a larger
+// allocation fails the load outright however much VRAM is free. Pinned host
+// memory has a cap of its own (see the call site). ggml_backend_alloc_ctx_tensors_from_buft
+// does the same walk for a whole context; it cannot be used here because the
+// offloaded experts share that context and must stay unallocated.
+static void alloc_tensors_chunked(ggml_backend_buffer_type_t buft,
+                                  const std::vector<ggml_tensor *> & ts,
+                                  size_t cap, const char * what,
+                                  std::vector<ggml_backend_buffer_t> & out_bufs) {
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    // Lets the split path be exercised on a backend that reports no limit
+    // (CUDA); a Vulkan driver already imposes one of its own.
+    if (const char * e = getenv("QWEN_MAX_BUFFER_MB")) {
+        const size_t mb = strtoull(e, nullptr, 10);
+        if (mb > 0) cap = std::min(cap, mb * 1024 * 1024);
+    }
+    size_t i = 0;
+    while (i < ts.size()) {
+        size_t group_sz = 0, j = i;
+        for (; j < ts.size(); ++j) {
+            const size_t sz = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, ts[j]), alignment);
+            if (j > i && group_sz + sz > cap) break;   // at least one tensor per buffer
+            group_sz += sz;
+        }
+        ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft, group_sz > 0 ? group_sz : 1);
+        if (!b) throw std::runtime_error(std::string("failed to allocate buffer for ") + what);
+        ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        out_bufs.push_back(b);
+        struct ggml_tallocr ta = ggml_tallocr_new(b);
+        for (size_t k = i; k < j; ++k)
+            if (ggml_tallocr_alloc(&ta, ts[k]) != GGML_STATUS_SUCCESS)
+                throw std::runtime_error(std::string("tallocr alloc failed for ") + what + ": "
+                                         + ggml_get_name(ts[k]));
+        i = j;
+    }
+    if (out_bufs.size() > 1) {
+        size_t total = 0;
+        for (auto b : out_bufs) total += ggml_backend_buffer_get_size(b);
+        fprintf(stderr, "%s: %zu MB split over %zu buffers (backend caps one at %zu MB)\n",
+                what, total / 1048576, out_bufs.size(), cap / 1048576);
+    }
+}
+
 void Model::load_weights_split(
     ggml_backend_t          gpu_backend,
     ggml_backend_buffer_type_t cpu_buft,
-    ggml_backend_buffer_t & out_gpu_buf,
+    std::vector<ggml_backend_buffer_t> & out_gpu_bufs,
     std::vector<ggml_backend_buffer_t> & out_cpu_bufs)
 {
     ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_backend);
@@ -184,56 +231,28 @@ void Model::load_weights_split(
         embd_ctx_ = ggml_init(ep);
         tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, dst_type, te->ne[0], te->ne[1]);
         ggml_set_name(tok_embd_rows_, embd_q8_ ? "token_embd.q8_0" : "token_embd.f16");
-        // will be allocated into out_gpu_buf below
+        // will be allocated into out_gpu_bufs below
     }
 
-    // ---- GPU (non-expert) buffer: size, allocate, assign ----
-    size_t gpu_size = 0;
+    // ---- GPU (non-expert) buffers: split by the backend's single-buffer limit ----
+    std::vector<ggml_tensor *> gpu_tensors;
     std::vector<ggml_tensor *> exp_tensors;     // offloaded experts (kept ordered)
     for (auto & kv : tensors_) {
         if (is_offloaded_expert(kv.first)) exp_tensors.push_back(kv.second);
-        else gpu_size += ggml_backend_buft_get_alloc_size(gpu_buft, kv.second);
+        else gpu_tensors.push_back(kv.second);
     }
-    if (need_f32_embd) gpu_size += ggml_backend_buft_get_alloc_size(gpu_buft, tok_embd_rows_);
+    // lives in out_gpu_bufs (caller-owned); embd_buf_ stays null here
+    if (need_f32_embd) gpu_tensors.push_back(tok_embd_rows_);
 
-    out_gpu_buf = ggml_backend_buft_alloc_buffer(gpu_buft, gpu_size);
-    if (!out_gpu_buf)
-        throw std::runtime_error("failed to allocate GPU weight buffer (split mode)");
-    ggml_backend_buffer_set_usage(out_gpu_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    struct ggml_tallocr gpu_talloc = ggml_tallocr_new(out_gpu_buf);
-    for (auto & kv : tensors_) {
-        if (is_offloaded_expert(kv.first)) continue;
-        if (ggml_tallocr_alloc(&gpu_talloc, kv.second) != GGML_STATUS_SUCCESS)
-            throw std::runtime_error("tallocr alloc failed (gpu): " + kv.first);
-    }
-    if (need_f32_embd) {
-        if (ggml_tallocr_alloc(&gpu_talloc, tok_embd_rows_) != GGML_STATUS_SUCCESS)
-            throw std::runtime_error("tallocr alloc failed (embd.f32)");
-        // lives inside out_gpu_buf (caller-owned); embd_buf_ stays null here
-    }
+    alloc_tensors_chunked(gpu_buft, gpu_tensors, ggml_backend_buft_get_max_size(gpu_buft),
+                          "gpu weights (split mode)", out_gpu_bufs);
 
     // ---- CPU (expert) buffers: chunked so each stays under the single
     // cudaHostAlloc cap (~15.5 GB on WDDM) and the whole set can be page-locked ----
     const size_t CHUNK = 8ull * 1024 * 1024 * 1024;   // 8 GB per pinned buffer
-    size_t i = 0;
-    while (i < exp_tensors.size()) {
-        size_t group_sz = 0, j = i;
-        for (; j < exp_tensors.size(); ++j) {
-            const size_t sz = ggml_backend_buft_get_alloc_size(cpu_buft, exp_tensors[j]);
-            if (j > i && group_sz + sz > CHUNK) break;   // at least one tensor per buffer
-            group_sz += sz;
-        }
-        ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(cpu_buft, group_sz > 0 ? group_sz : 1);
-        if (!b) throw std::runtime_error("failed to allocate CPU expert buffer (chunk)");
-        ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        struct ggml_tallocr ta = ggml_tallocr_new(b);
-        for (size_t k = i; k < j; ++k)
-            if (ggml_tallocr_alloc(&ta, exp_tensors[k]) != GGML_STATUS_SUCCESS)
-                throw std::runtime_error("tallocr alloc failed (cpu expert chunk)");
-        out_cpu_bufs.push_back(b);
-        i = j;
-    }
+    alloc_tensors_chunked(cpu_buft, exp_tensors,
+                          std::min(CHUNK, ggml_backend_buft_get_max_size(cpu_buft)),
+                          "cpu expert weights", out_cpu_bufs);
 
     // ---- Load tensor data (shard-aware) ----
     std::map<std::string, void *> files;
@@ -307,7 +326,7 @@ void Model::read_tensor_bytes(const std::string & name, void * dst, size_t nb,
 // (their meta tensors keep ne/nb but have no backing buffer — ExpertCache streams
 // them via pread). Mirrors load_weights for the non-expert subset.
 void Model::load_weights_ssd(ggml_backend_t gpu_backend,
-                             ggml_backend_buffer_t & out_gpu_buf) {
+                             std::vector<ggml_backend_buffer_t> & out_gpu_bufs) {
     ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_backend);
 
     // token-embedding fallback (same as load_weights)
@@ -331,28 +350,16 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
         ggml_set_name(tok_embd_rows_, embd_q8_ ? "token_embd.q8_0" : "token_embd.f16");
     }
 
-    size_t gpu_size = 0;
+    std::vector<ggml_tensor *> gpu_tensors;
     for (auto & kv : tensors_) {
         if (is_offloaded_expert(kv.first)) continue;   // stays on SSD
-        gpu_size += ggml_backend_buft_get_alloc_size(gpu_buft, kv.second);
+        gpu_tensors.push_back(kv.second);
     }
-    if (need_f32_embd) gpu_size += ggml_backend_buft_get_alloc_size(gpu_buft, tok_embd_rows_);
+    // lives in out_gpu_bufs (caller-owned); embd_buf_ stays null here
+    if (need_f32_embd) gpu_tensors.push_back(tok_embd_rows_);
 
-    out_gpu_buf = ggml_backend_buft_alloc_buffer(gpu_buft, gpu_size);
-    if (!out_gpu_buf) throw std::runtime_error("failed to allocate GPU weight buffer (ssd mode)");
-    ggml_backend_buffer_set_usage(out_gpu_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    struct ggml_tallocr talloc = ggml_tallocr_new(out_gpu_buf);
-    for (auto & kv : tensors_) {
-        if (is_offloaded_expert(kv.first)) continue;
-        if (ggml_tallocr_alloc(&talloc, kv.second) != GGML_STATUS_SUCCESS)
-            throw std::runtime_error("tallocr alloc failed (ssd gpu): " + kv.first);
-    }
-    if (need_f32_embd) {
-        if (ggml_tallocr_alloc(&talloc, tok_embd_rows_) != GGML_STATUS_SUCCESS)
-            throw std::runtime_error("tallocr alloc failed (ssd embd.f32)");
-        // lives inside out_gpu_buf (caller-owned); embd_buf_ stays null here
-    }
+    alloc_tensors_chunked(gpu_buft, gpu_tensors, ggml_backend_buft_get_max_size(gpu_buft),
+                          "gpu weights (ssd mode)", out_gpu_bufs);
 
     std::map<std::string, void *> files;
     std::vector<uint8_t> buf;

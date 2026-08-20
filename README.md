@@ -322,6 +322,7 @@ Not normally needed — for profiling, A/B checks and troubleshooting.
 | `QWEN_NO_DIRECT_FETCH=1` | disable zero-copy SSD reads into unified memory (use the staging path) |
 | `QWEN_SYNC_FETCH=1` | make RAM-tier H2D copies synchronous (to A/B the async DMA) |
 | `QWEN_PREFETCH_THREADS=N` | worker count for parallel SSD reads (default 8, 1-64) |
+| `QWEN_MAX_BUFFER_MB=N` | cap one weight buffer at N MB, forcing the split path on a backend that reports no limit (test aid) |
 | `QWEN_GGML_DEBUG=1` | show all raw ggml logs (by default DEBUG/INFO are dropped and repeated WARNs collapsed) |
 | `QWEN_CACHE_DEBUG=1` | on a server prefix-cache miss, print where it diverged and the tokens |
 
