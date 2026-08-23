@@ -208,6 +208,7 @@ struct Runtime::Impl {
     Impl(Model & m, const RuntimeConfig & c) : model(m), cfg(c) {}
     ~Impl() {
         if (ecache) {
+            if (getenv("QWEN_LAYER_STATS")) ecache->dump_layer_stats("decode");
             const auto & s = ecache->stats();
             const uint64_t acc = s.hits + s.misses;
             fprintf(stderr,
@@ -2992,6 +2993,20 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
                     ecache->touch(ExpertCache::UP,   il, e);
                     ecache->touch(ExpertCache::DOWN, il, e);
                 }
+            // Instrumentation: how often the layer's frozen palette failed to
+            // hold what the *unmasked* router wanted. This is the quality cost
+            // of the layer's slot share (masked decode never stalls on a miss).
+            static const bool lstats = getenv("QWEN_LAYER_STATS") != nullptr;
+            if (lstats) {
+                for (int il = 0; il < n_layer; ++il)
+                    for (int k = 0; k < n_used; ++k) {
+                        const int e = want_host[(size_t) il * n_used + k];
+                        const bool res = ecache->resident(ExpertCache::GATE, il, e) &&
+                                         ecache->resident(ExpertCache::UP,   il, e) &&
+                                         ecache->resident(ExpertCache::DOWN, il, e);
+                        ecache->note_want(il, !res);
+                    }
+            }
             int budget = refill_budget;
             for (int step = 0; step < n_layer && budget > 0; ++step) {
                 const int il = (refill_cursor + step) % n_layer;
@@ -3077,6 +3092,10 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
                                 ovr.empty() ? nullptr : ovr.data(), (int) ovr.size());
             i += t;
             if (progress_cb) progress_cb(i, n_tokens);
+        }
+        if (getenv("QWEN_LAYER_STATS")) {
+            ecache->dump_layer_stats("prefill");
+            ecache->reset_layer_stats();   // the destructor dump is decode-only
         }
         embd_ovr.clear();
         return logits;

@@ -95,6 +95,9 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
     backend_ = gpu_backend;
     if (getenv("QWEN_SYNC_FETCH")) async_fetch_ = false;   // A/B: force synchronous H2D
 
+    l_hits_.assign(n_layer, 0);  l_misses_.assign(n_layer, 0); l_evict_.assign(n_layer, 0);
+    l_want_.assign(n_layer, 0);  l_wmiss_.assign(n_layer, 0);
+
     // Pinned host staging buffer type (CUDA): makes the slab H2D a pinned-DMA copy.
     if (ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend))
         host_buft_ = ggml_backend_dev_host_buffer_type(dev);
@@ -378,6 +381,7 @@ int ExpertCache::install(Pool & pool, int key, int layer, int expert, Role role)
         if (pool.clk[s] < best) { best = pool.clk[s]; victim = s; }
     }
     if (pool.slot2key[victim] >= 0) {
+        l_evict_[pool.slot2key[victim] / n_expert_]++;
         pool.slot_of[pool.slot2key[victim]] = 0;   // evicted key -> sentinel
         pool.key2slot.erase(pool.slot2key[victim]);
         stats_.evictions++;
@@ -398,6 +402,7 @@ int ExpertCache::reserve_victim(Pool & pool, int key) {
         if (pool.clk[s] < best) { best = pool.clk[s]; victim = s; }
     }
     if (pool.slot2key[victim] >= 0) {
+        l_evict_[pool.slot2key[victim] / n_expert_]++;
         pool.slot_of[pool.slot2key[victim]] = 0;
         pool.key2slot.erase(pool.slot2key[victim]);
         stats_.evictions++;
@@ -704,6 +709,7 @@ void ExpertCache::touch(Role role, int layer, int expert) {
     pool.count[key]++;
     pool.clk[it->second] = ++clock_;
     stats_.hits++;
+    l_hits_[layer]++;
 }
 
 int ExpertCache::slot_for(Pool & pool, int layer, int expert, Role role) {
@@ -713,10 +719,12 @@ int ExpertCache::slot_for(Pool & pool, int layer, int expert, Role role) {
     auto it = pool.key2slot.find(key);
     if (it != pool.key2slot.end()) {
         stats_.hits++;
+        l_hits_[layer]++;
         pool.clk[it->second] = ++clock_;
         return it->second;
     }
     stats_.misses++;
+    l_misses_[layer]++;
     return install(pool, key, layer, expert, role);
 }
 
@@ -776,12 +784,80 @@ size_t ExpertCache::load_prefetch(const std::string & path) {
     return n_pref;
 }
 
+void ExpertCache::note_want(int layer, bool absent) {
+    l_want_[layer]++;
+    if (absent) l_wmiss_[layer]++;
+}
+
+void ExpertCache::reset_layer_stats() {
+    std::fill(l_hits_.begin(),   l_hits_.end(),   0);
+    std::fill(l_misses_.begin(), l_misses_.end(), 0);
+    std::fill(l_evict_.begin(),  l_evict_.end(),  0);
+    std::fill(l_want_.begin(),   l_want_.end(),   0);
+    std::fill(l_wmiss_.begin(),  l_wmiss_.end(),  0);
+}
+
+void ExpertCache::layer_stats(std::vector<LayerStat> & out) const {
+    out.assign(n_layer_, LayerStat{});
+    for (int il = 0; il < n_layer_; ++il) {
+        LayerStat & ls = out[il];
+        ls.hits      = l_hits_[il];
+        ls.misses    = l_misses_[il];
+        ls.evictions = l_evict_[il];
+        ls.want      = l_want_[il];
+        ls.want_miss = l_wmiss_[il];
+        // "resident" = usable by the router: present in all three role pools.
+        int n = 0;
+        for (int e = 0; e < n_expert_; ++e)
+            n += resident(GATE, il, e) && resident(UP, il, e) && resident(DOWN, il, e);
+        ls.resident = n;
+    }
+}
+
+// Per-layer view of the shared pools. `resident` is the layer's share of the
+// slots right now; hit/miss/evict are cumulative since the last reset.
+void ExpertCache::dump_layer_stats(const char * tag) const {
+    std::vector<LayerStat> ls;
+    layer_stats(ls);
+    int total_slots = 0;
+    for (const auto & p : pools_) total_slots += p.n_slots;
+    fprintf(stderr, "\n---- per-layer expert cache [%s] (%d layers x %d experts, "
+                    "%d slots over %zu pools) ----\n",
+            tag, n_layer_, n_expert_, total_slots, pools_.size());
+    fprintf(stderr, "layer  resident   share%%      acc     hit%%    misses   evict"
+                    "   want  wantmiss%%\n");
+    uint64_t th = 0, tm = 0, te = 0, tw = 0, twm = 0; int tr = 0;
+    for (int il = 0; il < n_layer_; ++il) {
+        const LayerStat & s = ls[il];
+        const uint64_t acc = s.hits + s.misses;
+        fprintf(stderr, "%5d  %8d  %6.2f  %9llu  %6.1f  %8llu  %6llu  %6llu  %8.1f\n",
+                il, s.resident,
+                100.0 * (double) s.resident / (double) n_expert_,
+                (unsigned long long) acc,
+                acc ? 100.0 * (double) s.hits / (double) acc : 0.0,
+                (unsigned long long) s.misses,
+                (unsigned long long) s.evictions,
+                (unsigned long long) s.want,
+                s.want ? 100.0 * (double) s.want_miss / (double) s.want : 0.0);
+        tr += s.resident; th += s.hits; tm += s.misses; te += s.evictions;
+        tw += s.want; twm += s.want_miss;
+    }
+    const uint64_t ta = th + tm;
+    fprintf(stderr, "  all  %8d  %6.2f  %9llu  %6.1f  %8llu  %6llu  %6llu  %8.1f\n",
+            tr, 100.0 * (double) tr / (double) (n_layer_ * n_expert_),
+            (unsigned long long) ta, ta ? 100.0 * (double) th / (double) ta : 0.0,
+            (unsigned long long) tm, (unsigned long long) te,
+            (unsigned long long) tw, tw ? 100.0 * (double) twm / (double) tw : 0.0);
+    fprintf(stderr, "----\n\n");
+}
+
 void ExpertCache::ensure_resident(int layer, int expert) {
     for (int r = 0; r < N_ROLE; ++r) {
         Pool & pool = pools_[layer_pool_[r][layer]];
         const int key = layer * n_expert_ + expert;
         if (pool.key2slot.find(key) == pool.key2slot.end()) {
             stats_.misses++;
+            l_misses_[layer]++;
             install(pool, key, layer, expert, (Role) r);
         }
     }
@@ -818,10 +894,12 @@ void ExpertCache::ensure(int layer, const int32_t * expert_ids, int n,
             auto it = pool.key2slot.find(key);
             if (it != pool.key2slot.end()) {
                 stats_.hits++;
+                l_hits_[layer]++;
                 pool.clk[it->second] = ++clock_;
                 outs[r][i] = it->second;
             } else {
                 stats_.misses++;
+                l_misses_[layer]++;
                 const int slot = reserve_victim(pool, key);
                 outs[r][i] = slot;
                 jobs.push_back({ &pool, r, e, slot });

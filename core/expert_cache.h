@@ -87,6 +87,24 @@ public:
                    double fetch_ms = 0; uint64_t fetch_bytes = 0; };
     const Stats & stats() const { return stats_; }
 
+    // ---- per-layer instrumentation (QWEN_LAYER_STATS) ----
+    // The slot pools are shared by every layer (one pool per role/type/shape),
+    // so the split of slots across layers is an emergent property of the global
+    // LRU, not a policy. These counters expose that split, plus (under
+    // resident-only decode) how often a layer's frozen palette failed to hold
+    // what the unmasked router actually wanted.
+    struct LayerStat {
+        uint64_t hits = 0, misses = 0, evictions = 0;
+        uint64_t want = 0, want_miss = 0;
+        int      resident = 0;   // experts resident in all three roles
+    };
+    void layer_stats(std::vector<LayerStat> & out) const;
+    void dump_layer_stats(const char * tag) const;
+    void reset_layer_stats();
+    // resident-decode: the unmasked router wanted (layer,expert); absent =
+    // it was not in the resident palette, so the mask routed elsewhere.
+    void note_want(int layer, bool absent);
+
     // Persist the access-frequency profile (hot experts) for warm restarts, and
     // pre-fill the VRAM slots from a saved profile before generation starts.
     bool   save_profile(const std::string & path) const;
@@ -163,6 +181,8 @@ private:
     void * stage_host(size_t nbytes);                 // ptr to >= nbytes pinned (or pageable) staging
 
     Stats stats_;
+    // per-layer counters (indexed by layer); see dump_layer_stats()
+    std::vector<uint64_t> l_hits_, l_misses_, l_evict_, l_want_, l_wmiss_;
 };
 
 } // namespace questwend
