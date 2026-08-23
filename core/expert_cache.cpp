@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -95,6 +97,7 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
     backend_ = gpu_backend;
     if (getenv("QWEN_SYNC_FETCH")) async_fetch_ = false;   // A/B: force synchronous H2D
 
+    n_used_ = n_used;
     l_hits_.assign(n_layer, 0);  l_misses_.assign(n_layer, 0); l_evict_.assign(n_layer, 0);
     l_want_.assign(n_layer, 0);  l_wmiss_.assign(n_layer, 0);
 
@@ -186,6 +189,8 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
         pools_[s].slot2key.assign(n_slots, -1);
         pools_[s].clk.assign(n_slots, 0);
         pools_[s].slot_of.assign((size_t) n_layer * n_expert, 0);
+        pools_[s].quota.assign(n_layer, -1);
+        pools_[s].occ.assign(n_layer, 0);
     }
 
     buf_ = ggml_backend_alloc_ctx_tensors(ctx_, gpu_backend);
@@ -289,10 +294,151 @@ int ExpertCache::min_slots() const {
 }
 
 int ExpertCache::capacity(int layer) const {
-    int m = pools_[layer_pool_[0][layer]].n_slots;
-    for (int r = 1; r < N_ROLE; ++r)
-        m = std::min(m, pools_[layer_pool_[r][layer]].n_slots);
+    int m = INT32_MAX;
+    for (int r = 0; r < N_ROLE; ++r) {
+        const Pool & p = pools_[layer_pool_[r][layer]];
+        // With quotas on, the layer can only hold its quota before it starts
+        // recycling its own slots -- that, not the pool size, is what an
+        // ensure() call must stay under.
+        const int c = quota_on_ && p.quota[layer] >= 0
+                          ? std::max(p.quota[layer], n_used_) : p.n_slots;
+        m = std::min(m, c);
+    }
     return m;
+}
+
+int ExpertCache::quota_of(int layer) const {
+    int m = INT32_MAX;
+    for (int r = 0; r < N_ROLE; ++r) {
+        const Pool & p = pools_[layer_pool_[r][layer]];
+        m = std::min(m, p.quota[layer] >= 0 ? p.quota[layer] : p.n_slots);
+    }
+    return m;
+}
+
+// Rank a pool's observed (layer,expert) pairs by access count, keep the top
+// n_slots, and turn the per-layer counts of that ideal set into quotas. This is
+// the miss-minimising static split: a slot is worth the number of accesses it
+// would serve, so a layer whose router concentrates on a handful of experts
+// keeps only those, while a diffuse layer -- whose experts are individually
+// lukewarm but numerous -- takes the slack.
+void ExpertCache::compute_quota(std::vector<int> & quota) const {
+    // Access counts are role-independent (ensure() touches all three roles for
+    // the same selection), but the roles can live in pools of different sizes.
+    // A resident expert is only usable when all three roles are present, so the
+    // quota must be ONE number per layer that every one of its pools can honour
+    // -- computing it per pool hands the same layer three different quotas and
+    // the intersection collapses.
+    quota.assign(n_layer_, 0);
+    std::unordered_map<int, uint64_t> cnt;
+    for (const auto & pool : pools_)
+        for (const auto & kv : pool.count) cnt[kv.first] += kv.second;
+    if (cnt.empty()) return;
+
+    std::vector<std::pair<uint64_t, int>> ents;   // (count, key)
+    ents.reserve(cnt.size());
+    for (const auto & kv : cnt) ents.emplace_back(kv.second, kv.first);
+    std::sort(ents.begin(), ents.end(), std::greater<std::pair<uint64_t, int>>());
+
+    // A layer consumes one slot in each of its three pools per expert it holds.
+    std::vector<int> rem(pools_.size());
+    for (size_t i = 0; i < pools_.size(); ++i) rem[i] = pools_[i].n_slots;
+    auto take = [&](int il) {
+        int pi[N_ROLE];
+        for (int r = 0; r < N_ROLE; ++r) {
+            pi[r] = layer_pool_[r][il];
+            if (rem[pi[r]] <= 0) return false;
+        }
+        for (int r = 0; r < N_ROLE; ++r) rem[pi[r]]--;
+        return true;
+    };
+
+    // Correctness floor first: every layer must be able to hold one token's
+    // selection, or a single ensure() evicts its own slots.
+    for (int il = 0; il < n_layer_; ++il)
+        while (quota[il] < n_used_ && take(il)) quota[il]++;
+
+    // Then the miss-minimising greedy: a slot is worth the accesses it serves,
+    // so the layers whose routing spreads over many lukewarm experts keep
+    // winning slots after the concentrated layers have run out of hot ones.
+    std::vector<int> seen(n_layer_, 0);
+    for (const auto & e : ents) {
+        const int il = e.second / n_expert_;
+        if (seen[il]++ < n_used_) continue;        // already paid for by the floor
+        if (quota[il] >= n_expert_) continue;
+        if (!take(il)) continue;
+        quota[il]++;
+    }
+}
+
+void ExpertCache::clear_counts() {
+    for (auto & pool : pools_) pool.count.clear();
+}
+
+void ExpertCache::dump_quota_plan(const char * tag) const {
+    std::vector<int> q;
+    compute_quota(q);
+    fprintf(stderr, "quota-plan[%s]:", tag);
+    for (int il = 0; il < n_layer_; ++il) fprintf(stderr, " %d", q[il]);
+    fprintf(stderr, "\n");
+}
+
+void ExpertCache::rebalance(size_t fill_budget) {
+    std::vector<int> quota;
+    compute_quota(quota);
+    if (quota.empty()) return;
+
+    // ents is needed again below to drive the reshape in count order.
+    std::unordered_map<int, uint64_t> cnt;
+    for (const auto & pool : pools_)
+        for (const auto & kv : pool.count) cnt[kv.first] += kv.second;
+    std::vector<std::pair<uint64_t, int>> ents;
+    ents.reserve(cnt.size());
+    for (const auto & kv : cnt) ents.emplace_back(kv.second, kv.first);
+    std::sort(ents.begin(), ents.end(), std::greater<std::pair<uint64_t, int>>());
+    std::vector<int> seen(n_layer_, 0);
+
+    size_t moved = 0;
+    for (int il = 0; il < n_layer_; ++il)
+        for (int r = 0; r < N_ROLE; ++r) {
+            Pool & pool = pools_[layer_pool_[r][il]];
+            if (pool.quota[il] != quota[il]) { pool.quota[il] = quota[il]; ++moved; }
+        }
+
+    // Reshape residency towards the ideal set. The quota alone only steers
+    // future evictions, and after a layer-major prefill the under-quota layers
+    // hold nothing at all -- they would need thousands of decode tokens to
+    // claim what is already theirs. All three roles are installed together so
+    // the expert is actually usable.
+    quota_on_ = true;
+    size_t filled = 0;
+    std::fill(seen.begin(), seen.end(), 0);
+    for (const auto & e : ents) {
+        if (filled >= fill_budget) break;
+        const int key = e.second, il = key / n_expert_, ex = key % n_expert_;
+        if (seen[il] >= quota[il]) continue;
+        seen[il]++;
+        bool all = true;
+        for (int r = 0; r < N_ROLE; ++r)
+            all = all && pools_[layer_pool_[r][il]].key2slot.count(key);
+        if (all) continue;
+        for (int r = 0; r < N_ROLE; ++r) {
+            Pool & pool = pools_[layer_pool_[r][il]];
+            if (!pool.key2slot.count(key)) install(pool, key, il, ex, (Role) r);
+        }
+        ++filled;
+    }
+
+    ggml_backend_synchronize(backend_);
+    int qmin = n_expert_, qmax = 0;
+    for (int il = 0; il < n_layer_; ++il) { qmin = std::min(qmin, quota[il]); qmax = std::max(qmax, quota[il]); }
+    fprintf(stderr, "expert cache: per-layer quotas on (%zu role-quotas set, range %d..%d experts), "
+                    "%zu experts prefetched into the new shape\n", moved, qmin, qmax, filled);
+    if (getenv("QWEN_LAYER_QUOTA_DUMP")) {
+        fprintf(stderr, "quota:");
+        for (int il = 0; il < n_layer_; ++il) fprintf(stderr, " %d", quota[il]);
+        fprintf(stderr, "\n");
+    }
 }
 
 // Copy one expert's slab from the slower tier into a VRAM slot.
@@ -373,21 +519,50 @@ void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst
     stats_.fetch_bytes += nb2;
 }
 
-// Fetch (layer,expert) into a free (or LRU-evicted) slot; updates residency maps.
-int ExpertCache::install(Pool & pool, int key, int layer, int expert, Role role) {
-    int victim = 0;
-    uint64_t best = pool.clk[0];
-    for (int s = 1; s < pool.n_slots; ++s) {
+// Release a slot's current occupant (no-op if already empty).
+void ExpertCache::drop_slot(Pool & pool, int slot) {
+    const int k = pool.slot2key[slot];
+    if (k < 0) return;
+    l_evict_[k / n_expert_]++;
+    pool.occ[k / n_expert_]--;
+    pool.slot_of[k] = 0;             // evicted key -> sentinel
+    pool.key2slot.erase(k);
+    pool.slot2key[slot] = -1;
+    stats_.evictions++;
+}
+
+// Which slot should `layer` take? Free slots first, then LRU. With quotas on,
+// a layer that has reached its quota recycles one of its own slots; a layer
+// below quota takes the LRU slot of some *over*-quota layer. If no layer is
+// over quota (cold pool, or quotas just widened) it degrades to global LRU.
+int ExpertCache::pick_victim(Pool & pool, int layer) {
+    const bool self = quota_on_ && pool.quota[layer] >= 0 &&
+                      pool.occ[layer] >= pool.quota[layer];
+    int victim = -1;
+    uint64_t best = UINT64_MAX;
+    for (int s = 0; s < pool.n_slots; ++s) {
+        const int k = pool.slot2key[s];
+        if (k < 0) return s;                     // free slot
+        if (quota_on_) {
+            const int kl = k / n_expert_;
+            if (self) { if (kl != layer) continue; }        // recycle own slot
+            else if (pool.occ[kl] <= pool.quota[kl]) continue;  // donor must be over quota
+        }
         if (pool.clk[s] < best) { best = pool.clk[s]; victim = s; }
     }
-    if (pool.slot2key[victim] >= 0) {
-        l_evict_[pool.slot2key[victim] / n_expert_]++;
-        pool.slot_of[pool.slot2key[victim]] = 0;   // evicted key -> sentinel
-        pool.key2slot.erase(pool.slot2key[victim]);
-        stats_.evictions++;
-    }
+    if (victim >= 0) return victim;
+    for (int s = 0; s < pool.n_slots; ++s)       // no eligible victim: global LRU
+        if (pool.clk[s] < best) { best = pool.clk[s]; victim = s; }
+    return victim;
+}
+
+// Fetch (layer,expert) into a free (or LRU-evicted) slot; updates residency maps.
+int ExpertCache::install(Pool & pool, int key, int layer, int expert, Role role) {
+    const int victim = pick_victim(pool, layer);
+    drop_slot(pool, victim);
     fetch_slab(role, layer, expert, pool.t, victim);
     pool.slot2key[victim] = key;
+    pool.occ[layer]++;
     pool.clk[victim] = ++clock_;
     pool.key2slot[key] = victim;
     pool.slot_of[key] = victim;
@@ -396,17 +571,9 @@ int ExpertCache::install(Pool & pool, int key, int layer, int expert, Role role)
 
 // Claim a slot for `key` (evicting the LRU occupant) without loading data yet.
 int ExpertCache::reserve_victim(Pool & pool, int key) {
-    int victim = 0;
-    uint64_t best = pool.clk[0];
-    for (int s = 1; s < pool.n_slots; ++s) {
-        if (pool.clk[s] < best) { best = pool.clk[s]; victim = s; }
-    }
-    if (pool.slot2key[victim] >= 0) {
-        l_evict_[pool.slot2key[victim] / n_expert_]++;
-        pool.slot_of[pool.slot2key[victim]] = 0;
-        pool.key2slot.erase(pool.slot2key[victim]);
-        stats_.evictions++;
-    }
+    const int victim = pick_victim(pool, key / n_expert_);
+    drop_slot(pool, victim);
+    pool.occ[key / n_expert_]++;
     pool.slot2key[victim] = key;
     pool.clk[victim] = ++clock_;
     pool.key2slot[key] = victim;

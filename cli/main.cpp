@@ -114,6 +114,10 @@ static void usage(const char * prog) {
     printf("  --resident-decode   resident-only routing decode: fused graph, no per-token miss\n");
     printf("                      (lossy; auto-warmup + background refill keep quality)\n");
     printf("  --resident-refill <N>  refilled experts per token while masked, all layers combined (default 8; 0 = frozen)\n");
+    printf("  --expert-alloc <m>  how decode splits the VRAM expert pool across layers:\n");
+    printf("                      lru | quota (per-layer, from the prompt's routing) |\n");
+    printf("                      auto = quota with --resident-decode, lru without (default)\n");
+    printf("                      (prefill always uses the whole pool as one LRU stream)\n");
     printf("  --resident-warmup <N>  decode tokens before the mask locks in (default 32)\n");
     printf("  --prefill-prune <eps>  skip fetching low-router-mass experts in prefill (lossy; e.g. 0.05)\n");
     printf("  --batch-chunk <N>   prefill chunk length in tokens (default 4096)\n");
@@ -173,6 +177,14 @@ int main(int argc, char ** argv) {
         else if (a == "--log-tokens-per-sec")    log_speed = true;
         else if (a == "--cpu")              force_cpu = true;
         else if (a == "--resident-decode")  set_knob("QWEN_RESIDENT_DECODE", "1");
+        else if (a == "--expert-alloc" && i + 1 < argc) {
+            const std::string v = next();
+            if (v != "lru" && v != "quota" && v != "auto") {
+                fprintf(stderr, "error: bad --expert-alloc value: %s (expected lru, quota or auto)\n", v.c_str());
+                return 1;
+            }
+            set_knob("QWEN_EXPERT_ALLOC", v.c_str());
+        }
         else if (a == "--resident-refill" && i + 1 < argc) set_knob("QWEN_RESIDENT_REFILL", next().c_str());
         else if (a == "--resident-warmup" && i + 1 < argc) set_knob("QWEN_RESIDENT_WARMUP", next().c_str());
         else if (a == "--prefill-prune" && i + 1 < argc)   set_knob("QWEN_PREFILL_PRUNE", next().c_str());

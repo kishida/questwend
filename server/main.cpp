@@ -528,6 +528,14 @@ int main(int argc, char ** argv) {
         else if (a == "--repeat-penalty" && i + 1 < argc) repeat_penalty_default = std::stof(argv[++i]);
         else if (a == "--cpu")              force_cpu = true;
         else if (a == "--resident-decode")  set_knob("QWEN_RESIDENT_DECODE", "1");
+        else if (a == "--expert-alloc" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v != "lru" && v != "quota" && v != "auto") {
+                fprintf(stderr, "error: bad --expert-alloc value: %s (expected lru, quota or auto)\n", v.c_str());
+                return 1;
+            }
+            set_knob("QWEN_EXPERT_ALLOC", v.c_str());
+        }
         else if (a == "--resident-refill" && i + 1 < argc) set_knob("QWEN_RESIDENT_REFILL", argv[++i]);
         else if (a == "--resident-warmup" && i + 1 < argc) set_knob("QWEN_RESIDENT_WARMUP", argv[++i]);
         else if (a == "--prefill-prune" && i + 1 < argc)   set_knob("QWEN_PREFILL_PRUNE", argv[++i]);
@@ -574,6 +582,10 @@ int main(int argc, char ** argv) {
             "  --resident-decode   resident-only routing decode: fused graph, no per-token miss\n"
             "                      (lossy; auto-warmup + background refill keep quality)\n"
             "  --resident-refill <N>  refilled experts per token while masked, all layers combined (default 8; 0 = frozen)\n"
+            "  --expert-alloc <m>  how decode splits the VRAM expert pool across layers:\n"
+            "                      lru | quota (per-layer, from the prompt's routing) |\n"
+            "                      auto = quota with --resident-decode, lru without (default)\n"
+            "                      (prefill always uses the whole pool as one LRU stream)\n"
             "  --resident-warmup <N>  decode tokens before the mask locks in (default 32)\n"
             "  --prefill-prune <eps>  skip fetching low-router-mass experts in prefill (lossy; e.g. 0.05)\n"
             "  --batch-chunk <N>   prefill chunk length in tokens (default 4096)\n"

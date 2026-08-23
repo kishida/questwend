@@ -209,6 +209,8 @@ struct Runtime::Impl {
     ~Impl() {
         if (ecache) {
             if (getenv("QWEN_LAYER_STATS")) ecache->dump_layer_stats("decode");
+            // What quota would the generation's own routing have asked for?
+            if (getenv("QWEN_LAYER_QUOTA_DRIFT")) ecache->dump_quota_plan("decode-fit");
             const auto & s = ecache->stats();
             const uint64_t acc = s.hits + s.misses;
             fprintf(stderr,
@@ -2121,6 +2123,14 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
 
     // QWEN_PREFILL_STATS=1 logs, per (chunk,layer), the distinct-expert union and
     // the fetch cost of ensure() — diagnoses "traffic = n_chunks x full sweep".
+    // plan_slices() below flips quota enforcement per layer; restore whatever
+    // the caller had on the way out so a batch cannot leave the mode changed.
+    struct QuotaScope {
+        ExpertCache * c; bool prev;
+        explicit QuotaScope(ExpertCache * cc) : c(cc), prev(cc->quotas_active()) {}
+        ~QuotaScope() { c->set_quotas(prev); }
+    } quota_scope(ecache.get());
+
     static const bool pf_stats = getenv("QWEN_PREFILL_STATS") != nullptr;
     static int      pf_chunk_id = 0;
     const int       pf_chunk    = pf_chunk_id++;
@@ -2143,19 +2153,37 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     static const int max_slice = []{ const char * c = getenv("QWEN_SEGB_SLICE");
                                      int v = c ? atoi(c) : 1024; return v < 1 ? 1024 : v; }();
     auto plan_slices = [&](int il) {
+        // Pass 1: the layer's expert union over the whole chunk.
+        plan_union = 0;
+        plan_list.clear();
+        std::vector<uint8_t> useen((size_t) n_exp, 0);
+        for (int t = 0; t < T; ++t)
+            for (int j = 0; j < n_used; ++j) {
+                const int e = sel[(size_t) t * n_used + j];
+                if (!useen[e]) { useen[e] = 1; ++plan_union; plan_list.push_back(e); }
+            }
+
+        // Per-layer slot quotas are a decode-time policy. A batch whose union
+        // does not fit the layer's quota is a prefill-like sweep: enforcing the
+        // quota there is still correct (the slicing below honours capacity())
+        // but pointless -- it would cut seg B into far more slices and re-fetch
+        // the same experts. Such a batch gets the whole pool as one LRU stream.
+        // A batch that does fit (MTP verify, T=2) keeps its quota, so it cannot
+        // evict the decode palette. Deciding here rather than at the call site
+        // makes prefill and verify come out right without either knowing.
+        ecache->set_quotas(plan_union <= ecache->quota_of(il) - 8);
+
+        // Pass 2: cut the chunk so no single ensure() references more distinct
+        // experts than the capacity now in force (it would evict its own slots).
         slices.clear();
         const int cap = std::max(n_used, ecache->capacity(il) - 8);
         std::fill(seen.begin(), seen.end(), 0);
         int distinct = 0, t0 = 0;
-        plan_union = 0;
-        plan_list.clear();
-        std::vector<uint8_t> useen((size_t) n_exp, 0);
         for (int t = 0; t < T; ++t) {
             int nnew = 0;
             for (int j = 0; j < n_used; ++j) {
                 const int e = sel[(size_t) t * n_used + j];
-                if (!useen[e]) { useen[e] = 1; ++plan_union; plan_list.push_back(e); }
-                if (!seen[e])  { seen[e] = 1; ++nnew; }
+                if (!seen[e]) { seen[e] = 1; ++nnew; }
             }
             if ((distinct + nnew > cap || t - t0 >= max_slice) && t > t0) {
                 slices.push_back({ t0, t - t0 });
@@ -3096,6 +3124,38 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
         if (getenv("QWEN_LAYER_STATS")) {
             ecache->dump_layer_stats("prefill");
             ecache->reset_layer_stats();   // the destructor dump is decode-only
+        }
+        // How the pool's slots are split across layers. "quota" re-shapes it
+        // from the prompt's own routing (the prefill sweep otherwise leaves the
+        // pool holding only the last layers it touched, which is the worst
+        // possible split); "lru" leaves the split to the global LRU.
+        //
+        // auto (the default) = quota iff resident-only decode. Measured on
+        // Qwen3.6-35B-A3B at 54% residency: under the resident mask the reshape
+        // takes the share of router picks that miss the palette from 18% to 10%
+        // and decode from 33.5 to 40.4 tok/s, while on the miss-driven decode
+        // path it buys nothing (+0.9%, and -1.6% at 25% residency) and still
+        // costs ~0.7 s of prefill.
+        static const int alloc_mode = []{
+            const char * c = getenv("QWEN_EXPERT_ALLOC");
+            if (!c || !strcmp(c, "auto")) return 0;
+            if (!strcmp(c, "lru"))        return 1;
+            if (!strcmp(c, "quota"))      return 2;
+            fprintf(stderr, "warning: QWEN_EXPERT_ALLOC=%s not understood "
+                            "(expected lru, quota or auto); using auto\n", c);
+            return 0;
+        }();
+        if (alloc_mode == 2 || (alloc_mode == 0 && resident_decode)) {
+            const char * c = getenv("QWEN_QUOTA_PREFETCH");
+            const long long v = c ? atoll(c) : 0;
+            ecache->rebalance(v > 0 ? (size_t) v : (size_t) -1);
+            // Forget the prompt's history so the exit dump measures how far the
+            // ideal shape drifts once generation takes over.
+            if (getenv("QWEN_LAYER_QUOTA_DRIFT")) ecache->clear_counts();
+            if (getenv("QWEN_LAYER_STATS")) {
+                ecache->dump_layer_stats("rebalanced");
+                ecache->reset_layer_stats();
+            }
         }
         embd_ovr.clear();
         return logits;

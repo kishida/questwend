@@ -105,6 +105,32 @@ public:
     // it was not in the resident palette, so the mask routed elsewhere.
     void note_want(int layer, bool absent);
 
+    // ---- per-layer slot quotas (QWEN_LAYER_QUOTA) ----
+    // A pool's slots are shared by every layer it serves, and plain global LRU
+    // hands them to whichever layer was swept last -- which after a layer-major
+    // prefill is the tail of the model. rebalance() instead ranks every observed
+    // (layer,expert) in a pool by access count and keeps the top n_slots; the
+    // resulting per-layer counts become quotas that eviction then respects. A
+    // layer whose routing saturates on a few experts keeps only those, and the
+    // slack goes to the diffuse layers that can still convert slots into hits.
+    // `fill_budget` bounds how many experts are fetched to reach the new shape.
+    void rebalance(size_t fill_budget);
+    // Experiment support (QWEN_LAYER_QUOTA_DRIFT): forget the access history,
+    // then later ask what quota the *new* history alone would produce. Comparing
+    // that to the shape rebalance() actually installed says whether a static
+    // quota is enough or the shape has to track the generation.
+    void clear_counts();
+    void dump_quota_plan(const char * tag) const;
+    bool quotas_active() const { return quota_on_; }
+    // The layer's quota (min over its role pools), or the pool size when no
+    // quota has been computed. Lets a caller ask "does this batch fit the
+    // quota?" without having to toggle enforcement to find out.
+    int  quota_of(int layer) const;
+    // Quotas must be off during batched prefill: one ensure() there references
+    // far more distinct experts than any quota, and a quota-bound layer would
+    // evict its own slots mid-call (silent corruption).
+    void set_quotas(bool on) { quota_on_ = on; }
+
     // Persist the access-frequency profile (hot experts) for warm restarts, and
     // pre-fill the VRAM slots from a saved profile before generation starts.
     bool   save_profile(const std::string & path) const;
@@ -122,6 +148,8 @@ private:
         std::vector<uint64_t> clk;              // LRU timestamps
         std::unordered_map<int, uint64_t> count;  // access frequency per key
         std::vector<int32_t>  slot_of;          // key -> slot (0 sentinel if absent)
+        std::vector<int>      quota;            // per layer: max slots here (-1 = not served)
+        std::vector<int>      occ;              // per layer: slots currently held
     };
 
     // A reserved-but-not-yet-loaded slot fetch (used for parallel SSD reads).
@@ -130,6 +158,9 @@ private:
     int  install(Pool & pool, int key, int layer, int expert, Role role); // fetch into a free/LRU slot
     int  slot_for(Pool & pool, int layer, int expert, Role role);
     int  reserve_victim(Pool & pool, int key);   // evict + claim a slot, no fetch
+    int  pick_victim(Pool & pool, int layer);    // quota-aware LRU slot choice
+    void compute_quota(std::vector<int> & q) const;  // the greedy, without applying it
+    void drop_slot(Pool & pool, int slot);       // release a slot's key (occ/maps/stats)
     void fetch_slab(Role role, int layer, int expert, ggml_tensor * dst, int slot);
     void fetch_parallel(int layer, std::vector<FetchJob> & jobs);  // SSD: parallel pread + serial H2D
     uint8_t * host_of(const ggml_tensor * t) const;  // pool host ptr for a slot tensor (or null)
@@ -153,6 +184,8 @@ private:
 
     int n_layer_  = 0;
     int n_expert_ = 0;
+    int n_used_   = 0;   // experts per token: the per-layer quota floor
+    bool quota_on_ = false;
 
     std::vector<Pool> pools_;
     // pool index for each (role, layer)
