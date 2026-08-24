@@ -1,0 +1,3 @@
+prompt: The capital of France is
+n_tokens: 6
+token ids: 0, 671, 6102, 294, 8760, 344

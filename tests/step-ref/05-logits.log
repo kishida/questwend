@@ -1,0 +1,12 @@
+0.02.344.932 I 
+0.02.344.962 I system_info: n_threads = 24 (n_threads_batch = 24) / 32 | MTL : EMBED_LIBRARY = 1 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | MATMUL_INT8 = 1 | DOTPROD = 1 | ACCELERATE = 1 | REPACK = 1 | 
+0.02.344.964 I 
+Model add_bos: true
+Input prompt: "The capital of France is"
+Token ids (6):
+<｜begin▁of▁sentence｜>(0) The(671)  capital(6102)  of(294)  France(8760)  is(344) 
+Data saved to ./05-logits/llamacpp-Step-3.7-Flash-UD-IQ1_M-00001-of-00003.bin
+Data saved to ./05-logits/llamacpp-Step-3.7-Flash-UD-IQ1_M-00001-of-00003.txt
+Prompt saved to ./05-logits/llamacpp-Step-3.7-Flash-UD-IQ1_M-00001-of-00003-prompt.txt
+Tokens saved to ./05-logits/llamacpp-Step-3.7-Flash-UD-IQ1_M-00001-of-00003-tokens.bin
+

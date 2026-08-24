@@ -1,0 +1,12 @@
+1234567890 and 42 and 3.14159
+日本語のテキストです。漢字とひらがなとカタカナ。
+!important @user #tag $100 (test) [x]=y;
+don't I'll we've can't
+Qwen3.5-122B-A10B / step-3.7-flash
+a  b		c
+multiple
+
+
+newlines
+trailing spaces   
+<|im_start|>user

@@ -1,0 +1,13 @@
+0.00.034.503 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.034.753 W srv  llama_server: -----------------
+0.00.034.756 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.034.756 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.034.756 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.034.756 W srv  llama_server: -----------------
+0.00.036.181 I srv    load_model: loading model '/Users/kishida/Desktop/hf_cache/unsloth/Step-3.7-Flash-GGUF/UD-IQ1_M/Step-3.7-Flash-UD-IQ1_M-00001-of-00003.gguf'
+0.02.325.739 I common_speculative_init_result: loading draft model '/Users/kishida/Desktop/hf_cache/unsloth/Step-3.7-Flash-GGUF/Step3.7-flash-mtp-Q8_0.gguf'
+0.02.559.671 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 4096, kv_unified = 'true'
+0.02.576.051 I srv  llama_server: model loaded
+0.02.576.054 I srv  llama_server: listening on http://127.0.0.1:8080
+0.02.576.054 W srv  llama_server: NOTICE: server default port will be changed to :9931 in a future release
+0.02.576.054 W srv  llama_server:         ref: https://github.com/ggml-org/llama.cpp/pull/26508

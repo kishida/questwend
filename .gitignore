@@ -37,3 +37,7 @@ Thumbs.db
 
 # AI instruction logs (local only)
 /memory/
+# superseded / redundant captures (kept locally, see tests/step-ref/README.md)
+tests/step-ref/04-tensors-old.log
+tests/step-ref/05-logits/*.txt
+!tests/step-ref/05-logits/*-prompt.txt
