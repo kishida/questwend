@@ -16,6 +16,7 @@
 #include "httplib.h"
 #include "json.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -31,6 +32,11 @@
 
 using json = nlohmann::json;
 using namespace questwend;
+
+// A trained context of 256k (Step-3.7 and friends) would size the KV cache far
+// past what any machine has, and the whole allocation is charged to the same
+// budget as the expert pool. Cap the *automatic* default; --n-ctx overrides it.
+static const int N_CTX_AUTO_MAX = 32768;
 
 // FIFO mutex with a waiter count: lets a generating request detect that
 // someone is queued (time-slice handoff) and guarantees the waiter actually
@@ -610,8 +616,14 @@ int main(int argc, char ** argv) {
         // expert pool would otherwise use -- pass --n-ctx to cap it if the
         // allocation does not fit.
         if (n_ctx <= 0) {
-            n_ctx = (int) model->hparams().n_ctx_train;
-            fprintf(stderr, "context: %d tokens (model's trained length; --n-ctx to change)\n", n_ctx);
+            const int trained = (int) model->hparams().n_ctx_train;
+            n_ctx = std::min(trained, N_CTX_AUTO_MAX);
+            if (n_ctx < trained) {
+                fprintf(stderr, "context: %d tokens (capped; model trained for %d -- --n-ctx to raise)\n",
+                        n_ctx, trained);
+            } else {
+                fprintf(stderr, "context: %d tokens (model's trained length; --n-ctx to change)\n", n_ctx);
+            }
         }
 
         // ---- vision tower (image input): explicit --mmproj or auto-discovery ----

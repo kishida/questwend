@@ -16,6 +16,7 @@ std::string  gguf_str (const gguf_context * ctx, const std::string & key, const 
 uint32_t     gguf_u32 (const gguf_context * ctx, const std::string & key, uint32_t def = 0);
 int32_t      gguf_i32 (const gguf_context * ctx, const std::string & key, int32_t  def = 0);
 float        gguf_f32 (const gguf_context * ctx, const std::string & key, float    def = 0.0f);
+bool         gguf_bool(const gguf_context * ctx, const std::string & key, bool     def = false);
 bool         gguf_has (const gguf_context * ctx, const std::string & key);
 
 // Read a string array (e.g. tokenizer.ggml.tokens).
@@ -26,5 +27,12 @@ std::vector<float> gguf_f32_array(const gguf_context * ctx, const std::string & 
 
 // Read an int32 array (e.g. tokenizer.ggml.token_type).
 std::vector<int32_t> gguf_i32_array(const gguf_context * ctx, const std::string & key);
+
+// Read an unsigned array (e.g. step35.attention.head_count, which is per-layer).
+// Accepts either signed or unsigned element types; negative entries clamp to 0.
+std::vector<uint32_t> gguf_u32_array(const gguf_context * ctx, const std::string & key);
+
+// Read a bool array (e.g. step35.attention.sliding_window_pattern).
+std::vector<bool> gguf_bool_array(const gguf_context * ctx, const std::string & key);
 
 } // namespace questwend

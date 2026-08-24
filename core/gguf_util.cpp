@@ -51,6 +51,18 @@ float gguf_f32(const gguf_context * ctx, const std::string & key, float def) {
     }
 }
 
+bool gguf_bool(const gguf_context * ctx, const std::string & key, bool def) {
+    const int64_t id = gguf_find_key(ctx, key.c_str());
+    if (id < 0) return def;
+    switch (gguf_get_kv_type(ctx, id)) {
+        case GGUF_TYPE_BOOL:   return gguf_get_val_bool(ctx, id);
+        case GGUF_TYPE_UINT32: return gguf_get_val_u32(ctx, id) != 0;
+        case GGUF_TYPE_INT32:  return gguf_get_val_i32(ctx, id) != 0;
+        case GGUF_TYPE_UINT8:  return gguf_get_val_u8(ctx, id) != 0;
+        default:               return def;
+    }
+}
+
 std::vector<std::string> gguf_str_array(const gguf_context * ctx, const std::string & key) {
     std::vector<std::string> out;
     const int64_t id = gguf_find_key(ctx, key.c_str());
@@ -72,6 +84,36 @@ std::vector<float> gguf_f32_array(const gguf_context * ctx, const std::string & 
     const size_t n = gguf_get_arr_n(ctx, id);
     out.resize(n);
     std::memcpy(out.data(), gguf_get_arr_data(ctx, id), n * sizeof(float));
+    return out;
+}
+
+std::vector<uint32_t> gguf_u32_array(const gguf_context * ctx, const std::string & key) {
+    std::vector<uint32_t> out;
+    const int64_t id = gguf_find_key(ctx, key.c_str());
+    if (id < 0 || gguf_get_kv_type(ctx, id) != GGUF_TYPE_ARRAY) return out;
+    const enum gguf_type at = gguf_get_arr_type(ctx, id);
+    if (at != GGUF_TYPE_INT32 && at != GGUF_TYPE_UINT32) return out;
+    const size_t n = gguf_get_arr_n(ctx, id);
+    out.resize(n);
+    if (at == GGUF_TYPE_UINT32) {
+        std::memcpy(out.data(), gguf_get_arr_data(ctx, id), n * sizeof(uint32_t));
+    } else {
+        const int32_t * src = (const int32_t *) gguf_get_arr_data(ctx, id);
+        for (size_t i = 0; i < n; ++i) out[i] = src[i] < 0 ? 0u : (uint32_t) src[i];
+    }
+    return out;
+}
+
+std::vector<bool> gguf_bool_array(const gguf_context * ctx, const std::string & key) {
+    std::vector<bool> out;
+    const int64_t id = gguf_find_key(ctx, key.c_str());
+    if (id < 0 || gguf_get_kv_type(ctx, id) != GGUF_TYPE_ARRAY) return out;
+    if (gguf_get_arr_type(ctx, id) != GGUF_TYPE_BOOL) return out;
+    const size_t n = gguf_get_arr_n(ctx, id);
+    // gguf stores a bool array as one int8 per element.
+    const int8_t * src = (const int8_t *) gguf_get_arr_data(ctx, id);
+    out.resize(n);
+    for (size_t i = 0; i < n; ++i) out[i] = src[i] != 0;
     return out;
 }
 

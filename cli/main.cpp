@@ -83,6 +83,11 @@ static void set_knob(const char * env, const char * val) {
 #endif
 }
 
+// A trained context of 256k (Step-3.7 and friends) would size the KV cache far
+// past what any machine has, and the whole allocation is charged to the same
+// budget as the expert pool. Cap the *automatic* default; --n-ctx overrides it.
+static const int N_CTX_AUTO_MAX = 32768;
+
 static void usage(const char * prog) {
     printf("usage: %s -m <model.gguf> [options]\n", prog);
     printf("  -p <text>      prompt (one-shot)\n");
@@ -254,8 +259,14 @@ int main(int argc, char ** argv) {
         // Context length defaults to what the model was trained for. The KV
         // cache is sized from it, so cap it with --n-ctx if it does not fit.
         if (n_ctx <= 0) {
-            n_ctx = (int) model->hparams().n_ctx_train;
-            fprintf(stderr, "context: %d tokens (model's trained length; --n-ctx to change)\n", n_ctx);
+            const int trained = (int) model->hparams().n_ctx_train;
+            n_ctx = std::min(trained, N_CTX_AUTO_MAX);
+            if (n_ctx < trained) {
+                fprintf(stderr, "context: %d tokens (capped; model trained for %d -- --n-ctx to raise)\n",
+                        n_ctx, trained);
+            } else {
+                fprintf(stderr, "context: %d tokens (model's trained length; --n-ctx to change)\n", n_ctx);
+            }
         }
 
         Tokenizer tok(model->vocab());

@@ -27,6 +27,7 @@ enum class Arch {
     QWEN35,       // dense + Gated DeltaNet hybrid
     QWEN35MOE,    // MoE  + Gated DeltaNet hybrid
     QWEN3NEXT,    // GDN + MoE hybrid
+    STEP35,       // sliding-window attention + sigmoid-routed MoE (Step-3.x Flash)
 };
 
 const char * arch_name(Arch a);
@@ -36,8 +37,8 @@ struct HParams {
     uint32_t n_layer        = 0;
     uint32_t n_embd         = 0;
     uint32_t n_ff           = 0;     // dense FFN hidden size
-    uint32_t n_head         = 0;
-    uint32_t n_head_kv      = 0;
+    uint32_t n_head         = 0;     // max over layers when the count varies
+    uint32_t n_head_kv      = 0;     // max over layers when the count varies
     uint32_t n_embd_head    = 0;     // head dim (qkv)
     uint32_t n_rot          = 0;     // rotary dims (may be < n_embd_head: partial rope)
     uint32_t n_ctx_train    = 0;
@@ -50,7 +51,27 @@ struct HParams {
     int      rope_sections[4] = {0, 0, 0, 0};
     bool     use_mrope        = false;
 
-    // MoE (qwen3moe / qwen35moe / qwen3next)
+    // ---- step35: per-layer attention shape + sliding-window attention ----
+    // Step-3.x Flash alternates one full-attention layer with three sliding
+    // ones, and the two kinds have different head counts (64 vs 96), rotary
+    // widths (half vs whole head) and RoPE bases. These vectors are empty on
+    // architectures with a uniform shape; always go through the accessors.
+    std::vector<uint32_t> n_head_l;      // per layer; empty = uniform n_head
+    std::vector<uint32_t> n_head_kv_l;   // per layer; empty = uniform n_head_kv
+    std::vector<bool>     swa_pattern;   // per layer; true = sliding window
+    uint32_t n_swa          = 0;         // sliding window length (0 = none)
+    float    rope_freq_base_swa = 0.0f;  // sliding layers use their own theta
+
+    // step35 MoE shape: leading dense blocks, one shared expert, sigmoid
+    // routing with a selection bias, and a per-layer SwiGLU clamp.
+    uint32_t n_dense_lead   = 0;     // layers before the first MoE block
+    uint32_t n_ff_shexp     = 0;     // shared-expert FFN size (0 = none)
+    uint32_t expert_gating_func = 0; // 1 = softmax, 2 = sigmoid
+    bool     expert_weights_norm = false;
+    std::vector<float> swiglu_clamp_exp;    // per layer; 0 = no clamp
+    std::vector<float> swiglu_clamp_shexp;  // per layer; 0 = no clamp
+
+    // MoE (qwen3moe / qwen35moe / qwen3next / step35)
     uint32_t n_expert       = 0;     // total experts (0 = dense)
     uint32_t n_expert_used  = 0;     // top-k
     uint32_t n_ff_exp       = 0;     // per-expert FFN size
@@ -71,6 +92,23 @@ struct HParams {
     uint32_t     file_type = 0; // general.file_type (ggml_ftype enum value)
 
     bool is_moe() const { return n_expert > 0; }
+
+    // ---- per-layer shape accessors (uniform architectures fall back to the
+    //      scalar, so these are safe to call unconditionally) ----
+    uint32_t head_count   (uint32_t il) const { return il < n_head_l.size()    ? n_head_l[il]    : n_head; }
+    uint32_t head_count_kv(uint32_t il) const { return il < n_head_kv_l.size() ? n_head_kv_l[il] : n_head_kv; }
+    bool     is_swa       (uint32_t il) const { return n_swa > 0 && il < swa_pattern.size() && swa_pattern[il]; }
+    float    rope_base    (uint32_t il) const { return is_swa(il) ? rope_freq_base_swa : rope_freq_base; }
+    // step35 rotates only half the head on full-attention layers (partial rope)
+    // and the whole head on sliding ones. Derived, not stored in the GGUF.
+    uint32_t rot_dims(uint32_t il) const {
+        if (arch != Arch::STEP35) return n_rot;
+        return is_swa(il) ? n_embd_head : n_embd_head / 2;
+    }
+    // MoE starts after the leading dense blocks (step35: 3).
+    bool  is_moe_layer(uint32_t il) const { return is_moe() && il >= n_dense_lead; }
+    float swiglu_limit_exp  (uint32_t il) const { return il < swiglu_clamp_exp.size()   ? swiglu_clamp_exp[il]   : 0.0f; }
+    float swiglu_limit_shexp(uint32_t il) const { return il < swiglu_clamp_shexp.size() ? swiglu_clamp_shexp[il] : 0.0f; }
     // Main transformer stack excludes the trailing MTP (next-token-prediction) blocks.
     uint32_t n_main()  const { return n_layer - nextn_predict_layers; }
     bool     has_mtp() const { return nextn_predict_layers > 0; }

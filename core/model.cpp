@@ -23,6 +23,7 @@ const char * arch_name(Arch a) {
         case Arch::QWEN35:    return "qwen35";
         case Arch::QWEN35MOE: return "qwen35moe";
         case Arch::QWEN3NEXT: return "qwen3next";
+        case Arch::STEP35:    return "step35";
         default:              return "unknown";
     }
 }
@@ -33,6 +34,7 @@ static Arch arch_from_string(const std::string & s) {
     if (s == "qwen35")    return Arch::QWEN35;
     if (s == "qwen35moe") return Arch::QWEN35MOE;
     if (s == "qwen3next") return Arch::QWEN3NEXT;
+    if (s == "step35")    return Arch::STEP35;
     return Arch::UNKNOWN;
 }
 
@@ -516,8 +518,18 @@ void Model::load_hparams() {
     hp_.n_layer     = gguf_u32(gguf_, k("block_count"));
     hp_.n_embd      = gguf_u32(gguf_, k("embedding_length"));
     hp_.n_ff        = gguf_u32(gguf_, k("feed_forward_length"));
-    hp_.n_head      = gguf_u32(gguf_, k("attention.head_count"));
-    hp_.n_head_kv   = gguf_u32(gguf_, k("attention.head_count_kv"), hp_.n_head);
+    // head_count / head_count_kv are scalars on every Qwen arch but per-layer
+    // arrays on step35 (64 heads on full-attention layers, 96 on sliding ones).
+    // gguf_u32() cannot see an array and would silently yield 0, so read the
+    // array first. The scalar keeps the max, which is what buffer sizing wants.
+    hp_.n_head_l = gguf_u32_array(gguf_, k("attention.head_count"));
+    hp_.n_head   = hp_.n_head_l.empty()
+                     ? gguf_u32(gguf_, k("attention.head_count"))
+                     : *std::max_element(hp_.n_head_l.begin(), hp_.n_head_l.end());
+    hp_.n_head_kv_l = gguf_u32_array(gguf_, k("attention.head_count_kv"));
+    hp_.n_head_kv   = hp_.n_head_kv_l.empty()
+                        ? gguf_u32(gguf_, k("attention.head_count_kv"), hp_.n_head)
+                        : *std::max_element(hp_.n_head_kv_l.begin(), hp_.n_head_kv_l.end());
     hp_.n_ctx_train = gguf_u32(gguf_, k("context_length"), 32768);
     hp_.rope_freq_base = gguf_f32(gguf_, k("rope.freq_base"), 1000000.0f);
     hp_.rms_eps        = gguf_f32(gguf_, k("attention.layer_norm_rms_epsilon"), 1e-6f);
@@ -558,6 +570,30 @@ void Model::load_hparams() {
     hp_.has_gdn = (hp_.arch == Arch::QWEN35 || hp_.arch == Arch::QWEN35MOE ||
                    hp_.arch == Arch::QWEN3NEXT) && hp_.ssm_d_inner > 0;
 
+    // ---- step35 (Step-3.x Flash) ----
+    // Sliding-window attention on 3 of every 4 layers, a head-wise attention
+    // gate, sigmoid expert routing with a selection bias, one shared expert,
+    // and a SwiGLU clamp on the last couple of layers.
+    if (hp_.arch == Arch::STEP35) {
+        hp_.n_swa              = gguf_u32(gguf_, k("attention.sliding_window"), 0);
+        hp_.swa_pattern        = gguf_bool_array(gguf_, k("attention.sliding_window_pattern"));
+        hp_.rope_freq_base_swa = gguf_f32(gguf_, k("rope.freq_base_swa"), hp_.rope_freq_base);
+        hp_.n_dense_lead       = gguf_u32(gguf_, k("leading_dense_block_count"), 0);
+        hp_.n_ff_shexp         = gguf_u32(gguf_, k("expert_shared_feed_forward_length"), 0);
+        hp_.expert_gating_func = gguf_u32(gguf_, k("expert_gating_func"), 2);   // 2 = sigmoid
+        hp_.expert_weights_norm = gguf_bool(gguf_, k("expert_weights_norm"), true);
+        hp_.swiglu_clamp_exp   = gguf_f32_array(gguf_, k("swiglu_clamp_exp"));
+        hp_.swiglu_clamp_shexp = gguf_f32_array(gguf_, k("swiglu_clamp_shexp"));
+
+        // Only the every-other-layer MoE layout is implemented; a GGUF that
+        // says otherwise would silently route dense layers through build_moe.
+        const uint32_t every_n = gguf_u32(gguf_, k("moe_every_n_layers"), 1);
+        if (every_n != 1) {
+            throw std::runtime_error("step35: unsupported moe_every_n_layers = " +
+                                     std::to_string(every_n));
+        }
+    }
+
     // vocab size: prefer output.weight rows, else token_embd
     if (auto * t = tensor("output.weight")) {
         hp_.n_vocab = (uint32_t) t->ne[1];
@@ -597,6 +633,21 @@ std::string Model::debug_dump() const {
     os << "]\n";
     os << "full_attention_interval = " << gguf_u32(gguf_, arch + ".full_attention_interval", 0) << "\n";
     os << "nextn_predict_layers = " << gguf_u32(gguf_, arch + ".nextn_predict_layers", 0) << "\n";
+    // step35: the per-layer shape the graph has to follow (head count, window,
+    // rotary width, MoE vs dense, SwiGLU clamp). Compare against llama.cpp.
+    if (hp_.arch == Arch::STEP35) {
+        os << "per-layer (il: heads/kv rope swa rot ffn clamp_exp/shexp)\n";
+        for (uint32_t il = 0; il < hp_.n_layer; ++il) {
+            os << "  " << il << ": " << hp_.head_count(il) << "/" << hp_.head_count_kv(il)
+               << " rope=" << hp_.rope_base(il)
+               << (hp_.is_swa(il) ? " swa" : " full")
+               << " rot=" << hp_.rot_dims(il)
+               << (hp_.is_moe_layer(il) ? " moe" : " dense");
+            const float ce = hp_.swiglu_limit_exp(il), cs = hp_.swiglu_limit_shexp(il);
+            if (ce > 0.0f || cs > 0.0f) os << " clamp=" << ce << "/" << cs;
+            os << "\n";
+        }
+    }
     // tensors for blk.0 (GDN) and blk.3 (attn)
     for (int il : {0, 3}) {
         os << "--- blk." << il << " ---\n";
@@ -619,7 +670,7 @@ std::string Model::summary() const {
        << "n_layer       = " << hp_.n_layer << "\n"
        << "n_embd        = " << hp_.n_embd << "\n"
        << "n_ff          = " << hp_.n_ff << "\n"
-       << "n_head        = " << hp_.n_head << " (kv=" << hp_.n_head_kv << ")\n"
+       << "n_head        = " << hp_.n_head << " (kv=" << hp_.n_head_kv << (hp_.n_head_l.empty() ? "" : ", per-layer") << ")\n"
        << "n_embd_head   = " << hp_.n_embd_head << "\n"
        << "n_ctx_train   = " << hp_.n_ctx_train << "\n"
        << "n_vocab       = " << hp_.n_vocab << "\n"
@@ -628,6 +679,21 @@ std::string Model::summary() const {
     if (hp_.is_moe()) {
         os << "n_expert      = " << hp_.n_expert << " (used=" << hp_.n_expert_used
            << ", ff_exp=" << hp_.n_ff_exp << ")\n";
+    }
+    if (hp_.n_swa > 0) {
+        size_t n_sliding = 0;
+        for (size_t i = 0; i < hp_.swa_pattern.size(); ++i) n_sliding += hp_.swa_pattern[i] ? 1 : 0;
+        os << "SWA           = " << hp_.n_swa << " (" << n_sliding << "/"
+           << hp_.swa_pattern.size() << " layers, rope_base_swa="
+           << hp_.rope_freq_base_swa << ")\n";
+    }
+    if (hp_.arch == Arch::STEP35) {
+        os << "n_rot         = " << hp_.rot_dims(0) << " full / " << hp_.n_embd_head << " swa\n"
+           << "dense_lead    = " << hp_.n_dense_lead
+           << " (ff_shexp=" << hp_.n_ff_shexp
+           << ", gating=" << (hp_.expert_gating_func == 2 ? "sigmoid" : "softmax")
+           << ", norm=" << (hp_.expert_weights_norm ? "yes" : "no")
+           << ", scale=" << hp_.expert_weights_scale << ")\n";
     }
     if (hp_.has_gdn) {
         os << "GDN: d_inner=" << hp_.ssm_d_inner << " n_group=" << hp_.ssm_n_group
