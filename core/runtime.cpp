@@ -3281,25 +3281,23 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     // graph inputs
     ggml_tensor * inp_tokens = ggml_graph_get_tensor(f_gf, "inp_tokens");
     ggml_tensor * inp_pos    = ggml_graph_get_tensor(f_gf, "inp_pos");
-    ggml_tensor * inp_mask   = ggml_graph_get_tensor(f_gf, "inp_mask");
     ggml_tensor * inp_kvidx  = ggml_graph_get_tensor(f_gf, "inp_kvidx");
     ggml_backend_tensor_set(inp_tokens, &token, 0, sizeof(int32_t));
     std::vector<int32_t> posv;
     fill_rope_pos(posv, 1, mrope_next);   // generation token: text, sequential
     ggml_backend_tensor_set(inp_pos, posv.data(), 0, posv.size() * sizeof(int32_t));
     int64_t kvidx = n_past; ggml_backend_tensor_set(inp_kvidx, &kvidx, 0, sizeof(int64_t));
-    std::vector<ggml_fp16_t> mask(f_nkv);
-    const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
-    for (int j = 0; j < f_nkv; ++j) mask[j] = (j <= n_past) ? z : ninf;
-    ggml_backend_tensor_set(inp_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    fill_masks(f_gf, 1, f_nkv, n_past);   // causal, sliding-window and ring inputs
 
     // refresh the in-graph remap table from current residency
     auto fill_g2s = [&]() {
-        for (int il = 0; il < n_layer; ++il)
+        for (int il = 0; il < n_layer; ++il) {
+            if (!hp.is_moe_layer(il)) continue;   // dense block: no expert pools
             for (int r = 0; r < 3; ++r) {
                 const int32_t * row = ecache->slot_of_row((ExpertCache::Role) r, il);
                 memcpy(&g2s_host[(size_t) (il * 3 + r) * n_exp], row, n_exp * sizeof(int32_t));
             }
+        }
         ggml_backend_tensor_set(g2s_all, g2s_host.data(), 0, g2s_host.size() * sizeof(int32_t));
     };
     // Refresh the router residency mask; true iff every layer is masked. A
@@ -3320,6 +3318,7 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     auto fill_resmask = [&]() {
         bool complete = true;
         for (int il = 0; il < n_layer; ++il) {
+            if (!hp.is_moe_layer(il)) continue;
             float * row = &resmask_host[(size_t) il * n_exp];
             int n_res = 0;
             for (int e = 0; e < n_exp; ++e) {
@@ -3342,13 +3341,15 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     auto verify = [&]() {
         ggml_backend_tensor_get(sel_all, sel_host.data(), 0, sel_host.size() * sizeof(int32_t));
         bool ok = true;
-        for (int il = 0; il < n_layer; ++il)
+        for (int il = 0; il < n_layer; ++il) {
+            if (!hp.is_moe_layer(il)) continue;
             for (int k = 0; k < n_used; ++k) {
                 const int e = sel_host[(size_t) il * n_used + k];
                 if (!ecache->resident(ExpertCache::GATE, il, e) ||
                     !ecache->resident(ExpertCache::UP,   il, e) ||
                     !ecache->resident(ExpertCache::DOWN, il, e)) ok = false;
             }
+        }
         return ok;
     };
 
@@ -3405,19 +3406,22 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
         if (refill_budget > 0) {
             ggml_backend_tensor_get(sel_all,  sel_host.data(),  0, sel_host.size()  * sizeof(int32_t));
             ggml_backend_tensor_get(want_all, want_host.data(), 0, want_host.size() * sizeof(int32_t));
-            for (int il = 0; il < n_layer; ++il)
+            for (int il = 0; il < n_layer; ++il) {
+                if (!hp.is_moe_layer(il)) continue;
                 for (int k = 0; k < n_used; ++k) {
                     const int e = sel_host[(size_t) il * n_used + k];
                     ecache->touch(ExpertCache::GATE, il, e);
                     ecache->touch(ExpertCache::UP,   il, e);
                     ecache->touch(ExpertCache::DOWN, il, e);
                 }
+            }
             // Instrumentation: how often the layer's frozen palette failed to
             // hold what the *unmasked* router wanted. This is the quality cost
             // of the layer's slot share (masked decode never stalls on a miss).
             static const bool lstats = getenv("QWEN_LAYER_STATS") != nullptr;
             if (lstats) {
-                for (int il = 0; il < n_layer; ++il)
+                for (int il = 0; il < n_layer; ++il) {
+                    if (!hp.is_moe_layer(il)) continue;
                     for (int k = 0; k < n_used; ++k) {
                         const int e = want_host[(size_t) il * n_used + k];
                         const bool res = ecache->resident(ExpertCache::GATE, il, e) &&
@@ -3425,10 +3429,12 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
                                          ecache->resident(ExpertCache::DOWN, il, e);
                         ecache->note_want(il, !res);
                     }
+                }
             }
             int budget = refill_budget;
             for (int step = 0; step < n_layer && budget > 0; ++step) {
                 const int il = (refill_cursor + step) % n_layer;
+                if (!hp.is_moe_layer(il)) continue;
                 for (int k = 0; k < n_used && budget > 0; ++k) {
                     const int e = want_host[(size_t) il * n_used + k];
                     if (ecache->resident(ExpertCache::GATE, il, e) &&
