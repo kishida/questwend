@@ -67,8 +67,9 @@ static void build_byte_unicode(std::unordered_map<uint8_t, uint32_t> & b2u,
 }
 
 Tokenizer::Tokenizer(const Vocab & vocab) {
-    bos_ = vocab.bos_id;
-    eos_ = vocab.eos_id;
+    bos_     = vocab.bos_id;
+    eos_     = vocab.eos_id;
+    add_bos_ = vocab.add_bos;
 
     id_to_token_ = vocab.tokens;
     token_ids_.reserve(vocab.tokens.size());

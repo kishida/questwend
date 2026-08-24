@@ -339,7 +339,7 @@ int main(int argc, char ** argv) {
             std::string tp = prompt.empty()
                 ? "The quick brown fox jumps over the lazy dog near the river bank."
                 : prompt;
-            auto ids = tok.encode(tp, false);
+            auto ids = tok.encode(tp, tok.wants_bos());
             auto argmax = [](const std::vector<float> & v) {
                 int b = 0; for (int i = 1; i < (int) v.size(); ++i) if (v[i] > v[b]) b = i; return b;
             };
@@ -366,7 +366,7 @@ int main(int argc, char ** argv) {
             std::string tp = prompt.empty()
                 ? "The quick brown fox jumps over the lazy dog near the river bank at sunset."
                 : prompt;
-            auto ids = tok.encode(tp, false);
+            auto ids = tok.encode(tp, tok.wants_bos());
             const int n_gen = max_tokens > 0 ? max_tokens : 64;
             auto argmax = [](const std::vector<float> & v) {
                 int b = 0; for (int i = 1; i < (int) v.size(); ++i) if (v[i] > v[b]) b = i; return b;
@@ -492,7 +492,7 @@ int main(int argc, char ** argv) {
             } else {
                 if (prompt.empty()) prompt = "Hello";
                 std::cout << prompt;
-                ids = tok.encode(prompt, false);
+                ids = tok.encode(prompt, tok.wants_bos());
             }
             run(ids);
         }

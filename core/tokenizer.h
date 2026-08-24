@@ -20,6 +20,8 @@ public:
     std::string          decode(const std::vector<int32_t> & tokens) const;
 
     int32_t bos() const { return bos_; }
+    // Does the model want a BOS in front of a raw prompt? (tokenizer.ggml.add_bos_token)
+    bool    wants_bos() const { return add_bos_; }
     int32_t eos() const { return eos_; }
     int32_t token_to_id(const std::string & tok) const;
 
@@ -28,6 +30,7 @@ private:
     std::vector<std::string>                 id_to_token_;
     std::unordered_map<std::string, int>     merge_rank_;    // "A B" -> rank
     int32_t bos_ = -1, eos_ = -1;
+    bool    add_bos_ = false;
 
     // byte <-> unicode (GPT-2 mapping)
     std::unordered_map<uint8_t, uint32_t> byte_to_uni_;

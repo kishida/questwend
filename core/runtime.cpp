@@ -297,7 +297,11 @@ struct Runtime::Impl {
     int rope_dim(int n_tokens) const {
         return model.hparams().use_mrope ? 4 * n_tokens : n_tokens;
     }
-    ggml_tensor * apply_rope(ggml_context * ctx, ggml_tensor * x, ggml_tensor * pos) {
+    // `il` picks the layer's rotary width, base and frequency factors. Every
+    // Qwen layer is identical so any il gives the same rope there; step35
+    // alternates -- full-attention layers rotate half the head with the baked
+    // llama3 factors, sliding layers rotate the whole head without them.
+    ggml_tensor * apply_rope(ggml_context * ctx, ggml_tensor * x, ggml_tensor * pos, int il) {
         const auto & hp = model.hparams();
         if (hp.use_mrope) {
             int sec[4] = { hp.rope_sections[0], hp.rope_sections[1],
@@ -306,8 +310,12 @@ struct Runtime::Impl {
                                    GGML_ROPE_TYPE_MROPE, 0, hp.rope_freq_base,
                                    1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         }
-        return ggml_rope_ext(ctx, x, pos, nullptr, hp.n_rot, GGML_ROPE_TYPE_NEOX,
-                             0, hp.rope_freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        // rope_freqs.weight carries the llama3 frequency factors, already baked
+        // by the converter. step35 stores one shared tensor and applies it to
+        // full-attention layers only; other architectures do not have it.
+        ggml_tensor * freqs = hp.is_swa(il) ? nullptr : model.tensor("rope_freqs.weight");
+        return ggml_rope_ext(ctx, x, pos, freqs, (int) hp.rot_dims(il), GGML_ROPE_TYPE_NEOX,
+                             0, hp.rope_base(il), 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     }
     int fill_rope_pos(std::vector<int32_t> & dst, int n_tokens, int rope_start);
     int fill_rope_pos_spans(std::vector<int32_t> & dst, int n_tokens, int rope_start,
@@ -317,6 +325,36 @@ struct Runtime::Impl {
     ggml_tensor * build_attn(ggml_context * ctx, ggml_cgraph * gf, int il,
                              ggml_tensor * Q, ggml_tensor * K, ggml_tensor * V,
                              ggml_tensor * mask, int n_tokens, int n_kv, int kv_pos = -1);
+    // ---- graph tensor dump (QWEN_DUMP_LAYERS) ----
+    // Pins named intermediates as graph outputs so they survive gallocr reuse,
+    // then prints one whole-tensor sum each after the run. The names match
+    // llama.cpp's cb() labels so a capture from llama-debug can be diffed
+    // line for line (see tests/step-ref/README.md).
+    std::vector<int>                                   dump_layers;   // -1 = all
+    std::vector<std::pair<std::string, ggml_tensor *>> dump_list;
+    bool dump_wants(int il) const {
+        if (dump_layers.empty()) return false;
+        if (il < 0 || dump_layers[0] < 0) return true;   // il < 0 = the final result_* tensors
+        return std::find(dump_layers.begin(), dump_layers.end(), il) != dump_layers.end();
+    }
+    ggml_tensor * dbg(ggml_tensor * t, const char * name, int il) {
+        if (!dump_wants(il)) return t;
+        char buf[128];
+        if (il >= 0) snprintf(buf, sizeof(buf), "%s-%d", name, il);
+        else         snprintf(buf, sizeof(buf), "%s", name);
+        ggml_set_name(t, buf);
+        ggml_set_output(t);
+        dump_list.emplace_back(buf, t);
+        return t;
+    }
+    void dump_flush(const char * tag);
+
+    // Upload the causal (and, on step35, the sliding-window) attention masks for
+    // a batch of n_tokens whose first token sits at absolute position pos0.
+    void fill_masks(ggml_cgraph * gf, int n_tokens, int n_kv, int pos0);
+    // step35 head-wise attention gate (a no-op elsewhere).
+    ggml_tensor * apply_attn_gate(ggml_context * ctx, int il, ggml_tensor * att,
+                                  ggml_tensor * x, int n_head_l, int n_tokens);
     ggml_tensor * build_gdn(ggml_context * ctx, ggml_cgraph * gf, int il,
                             ggml_tensor * x, int n_tokens);
     ggml_tensor * build_moe(ggml_context * ctx, ggml_cgraph * gf, int il,
@@ -395,6 +433,18 @@ std::vector<ggml_backend_dev_t> gpu_devices() {
 }
 
 void Runtime::Impl::init() {
+    if (const char * d = getenv("QWEN_DUMP_LAYERS")) {
+        if (!strcmp(d, "all")) {
+            dump_layers.push_back(-1);
+        } else {
+            for (const char * p = d; *p; ) {
+                if (*p == ',') { ++p; continue; }
+                dump_layers.push_back(atoi(p));
+                while (*p && *p != ',') ++p;
+            }
+        }
+    }
+
     // Prefer a GPU device (CUDA/Metal/etc.) when requested and available.
     if (cfg.use_cuda) {
         for (ggml_backend_dev_t dev : gpu_devices()) {
@@ -687,13 +737,59 @@ int Runtime::Impl::fill_rope_pos_spans(std::vector<int32_t> & dst, int n_tokens,
 }
 
 // ---- gated attention (shared by qwen3 plain and qwen35 gated paths) ----
+void Runtime::Impl::dump_flush(const char * tag) {
+    if (dump_list.empty()) return;
+    std::vector<float> buf;
+    for (auto & e : dump_list) {
+        ggml_tensor * t = e.second;
+        if (!t->buffer || t->type != GGML_TYPE_F32) continue;
+        const size_t n = ggml_nelements(t);
+        buf.resize(n);
+        ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+        double sum = 0.0;
+        for (size_t i = 0; i < n; ++i) sum += buf[i];
+        fprintf(stderr, "qw_dump[%s]: %28s = {%lld, %lld, %lld, %lld} sum = %f\n",
+                tag, e.first.c_str(),
+                (long long) t->ne[0], (long long) t->ne[1],
+                (long long) t->ne[2], (long long) t->ne[3], sum);
+    }
+    dump_list.clear();
+}
+
+void Runtime::Impl::fill_masks(ggml_cgraph * gf, int n_tokens, int n_kv, int pos0) {
+    const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+    std::vector<ggml_fp16_t> mask((size_t) n_kv * n_tokens);
+
+    for (int i = 0; i < n_tokens; ++i) {
+        const int abs_i = pos0 + i;
+        for (int j = 0; j < n_kv; ++j)
+            mask[(size_t) i * n_kv + j] = (j <= abs_i) ? z : ninf;
+    }
+    if (ggml_tensor * t = ggml_graph_get_tensor(gf, "inp_mask"))
+        ggml_backend_tensor_set(t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+
+    ggml_tensor * t_swa = ggml_graph_get_tensor(gf, "inp_mask_swa");
+    if (!t_swa) return;
+
+    // A sliding layer's query at position p sees keys in (p - n_swa, p]: the
+    // window spans n_swa positions, the query's own included.
+    const int n_swa = (int) model.hparams().n_swa;
+    for (int i = 0; i < n_tokens; ++i) {
+        const int abs_i = pos0 + i;
+        const int lo    = abs_i - n_swa + 1;
+        for (int j = 0; j < n_kv; ++j)
+            mask[(size_t) i * n_kv + j] = (j <= abs_i && j >= lo) ? z : ninf;
+    }
+    ggml_backend_tensor_set(t_swa, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+}
+
 ggml_tensor * Runtime::Impl::build_attn(ggml_context * ctx, ggml_cgraph * gf, int il,
         ggml_tensor * Q, ggml_tensor * K, ggml_tensor * V,
         ggml_tensor * mask, int n_tokens, int n_kv, int kv_pos) {
     if (kv_pos < 0) kv_pos = n_past;
     const auto & hp = model.hparams();
-    const int n_head      = hp.n_head;
-    const int n_head_kv   = hp.n_head_kv;
+    const int n_head      = (int) hp.head_count(il);      // per-layer on step35
+    const int n_head_kv   = (int) hp.head_count_kv(il);
     const int n_embd_head = hp.n_embd_head;
     const int n_embd_gqa  = n_head_kv * n_embd_head;
     const float kq_scale  = 1.0f / sqrtf((float) n_embd_head);
@@ -740,6 +836,22 @@ ggml_tensor * Runtime::Impl::build_attn(ggml_context * ctx, ggml_cgraph * gf, in
     kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);
     kqv = ggml_cont_2d(ctx, kqv, n_embd_head * n_head, n_tokens);
     return kqv;  // [n_embd_head*n_head, n_tokens]
+}
+
+// step35 head-wise attention gate: sigmoid(g_proj . x) scales each head's slice
+// of the attention output. `x` is the post-attn_norm input -- the same tensor
+// Q/K/V are projected from -- not the attention output. This is a separate
+// weight, unlike qwen35's gate, which is packed into attn_q. Returns `att`
+// unchanged on models without blk.N.attn_gate.weight.
+ggml_tensor * Runtime::Impl::apply_attn_gate(ggml_context * ctx, int il, ggml_tensor * att,
+                                             ggml_tensor * x, int n_head_l, int n_tokens) {
+    ggml_tensor * w = Wopt("blk.%d.attn_gate.weight", il);
+    if (!w) return att;
+    const int n_embd_head = model.hparams().n_embd_head;
+    ggml_tensor * g = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w, x));   // [n_head_l, n_tokens]
+    g = ggml_reshape_3d(ctx, g, 1, n_head_l, n_tokens);             // broadcast over the head dim
+    ggml_tensor * a = ggml_reshape_3d(ctx, att, n_embd_head, n_head_l, n_tokens);
+    return ggml_reshape_2d(ctx, ggml_mul(ctx, a, g), n_embd_head * n_head_l, n_tokens);
 }
 
 // ---- Gated DeltaNet layer (qwen35 / qwen3next) ----
@@ -868,6 +980,17 @@ ggml_tensor * Runtime::Impl::build_gdn(ggml_context * ctx, ggml_cgraph * gf, int
 }
 
 // ---- MoE FFN (qwen3moe / qwen35moe): softmax gating, top-k, normalized weights ----
+// SwiGLU with step35's per-layer clamp: silu(gate) is clipped from above and up
+// from both sides before the product. limit <= 0 means no clamp, which is every
+// layer of every other architecture (and all but the last two of step35).
+static ggml_tensor * swiglu_limited(ggml_context * ctx, ggml_tensor * gate,
+                                    ggml_tensor * up, float limit) {
+    if (limit <= 0.0f) return ggml_swiglu_split(ctx, gate, up);
+    ggml_tensor * u = ggml_clamp(ctx, up, -limit, limit);
+    ggml_tensor * g = ggml_clamp(ctx, ggml_silu(ctx, gate), -INFINITY, limit);
+    return ggml_mul(ctx, g, u);
+}
+
 ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int il,
         ggml_tensor * x, int n_tokens) {
     const auto & hp = model.hparams();
@@ -876,6 +999,7 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
     const int n_used  = hp.n_expert_used;
 
     ggml_tensor * logits = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp.weight", il), x); // [n_exp, n_tokens]
+    ggml_tensor * rm = nullptr;   // resident-only routing mask, when in force
     if (cache_fast_build && resident_decode) {
         // record the unmasked router preference (top-k of the raw logits) so
         // the host can refill wanted-but-absent experts in the background
@@ -885,25 +1009,45 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
         ggml_build_forward_expand(gf, ggml_cpy(ctx, want, want_col));
         // resident-only routing: bias non-resident experts to -inf before the
         // softmax/top-k so the fused graph can never select a cache miss
-        ggml_tensor * rm = ggml_view_2d(ctx, resmask_all, n_exp, 1,
-                                        resmask_all->nb[1], (size_t) il * resmask_all->nb[1]);
+        rm = ggml_view_2d(ctx, resmask_all, n_exp, 1,
+                          resmask_all->nb[1], (size_t) il * resmask_all->nb[1]);
         logits = ggml_add(ctx, logits, rm);
     }
-    ggml_tensor * probs  = ggml_soft_max(ctx, logits);
 
-    ggml_tensor * selected = ggml_argsort_top_k(ctx, probs, n_used);   // [n_used, n_tokens] i32
+    // Routing shape. Qwen normalises the logits with a softmax and ranks on the
+    // result; step35 squashes each logit independently with a sigmoid and ranks
+    // on probs + a per-expert selection bias, while the mixing weights come from
+    // the *unbiased* probs (the bias only decides who gets picked).
+    const bool sigmoid_gate = hp.expert_gating_func == 2;
+    ggml_tensor * probs = sigmoid_gate ? ggml_sigmoid(ctx, logits) : ggml_soft_max(ctx, logits);
+    dbg(logits, "ffn_moe_logits", il);
+    dbg(probs,  "ffn_moe_probs",  il);
+
+    ggml_tensor * rank = probs;
+    if (ggml_tensor * bias = Wopt("blk.%d.exp_probs_b.bias", il)) {
+        rank = dbg(ggml_add(ctx, probs, bias), "ffn_moe_probs_biased", il);
+        // The residency mask drives the logits to -inf, which zeroes probs but
+        // leaves the bias free to rank a non-resident expert first. Re-apply it
+        // after the bias so a masked expert can never win a slot.
+        if (rm) rank = ggml_add(ctx, rank, rm);
+    }
+
+    ggml_tensor * selected = ggml_argsort_top_k(ctx, rank, n_used);    // [n_used, n_tokens] i32
 
     ggml_tensor * probs3 = ggml_reshape_3d(ctx, probs, 1, n_exp, n_tokens);
     ggml_tensor * weights = ggml_get_rows(ctx, probs3, selected);      // [1, n_used, n_tokens]
 
-    // normalize weights over selected experts
-    weights = ggml_reshape_2d(ctx, weights, n_used, n_tokens);
-    ggml_tensor * wsum = ggml_sum_rows(ctx, weights);                  // [1, n_tokens]
-    wsum = ggml_clamp(ctx, wsum, 6.103515625e-5f, INFINITY);
-    weights = ggml_div(ctx, weights, wsum);
-    weights = ggml_reshape_3d(ctx, weights, 1, n_used, n_tokens);
+    // normalize weights over selected experts (step35 can turn this off)
+    if (hp.arch != Arch::STEP35 || hp.expert_weights_norm) {
+        weights = ggml_reshape_2d(ctx, weights, n_used, n_tokens);
+        ggml_tensor * wsum = ggml_sum_rows(ctx, weights);              // [1, n_tokens]
+        wsum = ggml_clamp(ctx, wsum, 6.103515625e-5f, INFINITY);
+        weights = ggml_div(ctx, weights, wsum);
+        weights = ggml_reshape_3d(ctx, weights, 1, n_used, n_tokens);
+    }
     if (hp.expert_weights_scale != 0.0f && hp.expert_weights_scale != 1.0f)
         weights = ggml_scale(ctx, weights, hp.expert_weights_scale);
+    dbg(weights, "ffn_moe_weights_scaled", il);
 
     // expand early so the CUDA top-k-moe path matches (mirrors llama.cpp)
     ggml_build_forward_expand(gf, weights);
@@ -933,7 +1077,7 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
         ggml_tensor * x3   = ggml_reshape_3d(ctx, x, n_embd, 1, 1);
         ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3,  slot_u);
         ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3,  slot_g);
-        ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * act  = swiglu_limited(ctx, gate, up, hp.swiglu_limit_exp(il));
         ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, slot_d);
         ggml_tensor * et = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, experts, n_embd, n_used)));
         ggml_tensor * w  = ggml_reshape_2d(ctx, weights, n_used, 1);
@@ -943,7 +1087,7 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
 
         ggml_tensor * up   = ggml_mul_mat_id(ctx, W("blk.%d.ffn_up_exps.weight",   il), x3, selected);
         ggml_tensor * gate = ggml_mul_mat_id(ctx, W("blk.%d.ffn_gate_exps.weight", il), x3, selected);
-        ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);            // silu(gate)*up [ff_exp, n_used, n_tokens]
+        ggml_tensor * act  = swiglu_limited(ctx, gate, up, hp.swiglu_limit_exp(il));  // silu(gate)*up [ff_exp, n_used, n_tokens]
         ggml_tensor * experts = ggml_mul_mat_id(ctx, W("blk.%d.ffn_down_exps.weight", il), act, selected); // [n_embd, n_used, n_tokens]
 
         if (n_tokens == 1) {
@@ -974,11 +1118,15 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
         ggml_tensor * g  = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), x);
         ggml_tensor * u  = ggml_mul_mat(ctx, up_sh, x);
         ggml_tensor * sh = ggml_mul_mat(ctx, W("blk.%d.ffn_down_shexp.weight", il),
-                                        ggml_mul(ctx, ggml_silu(ctx, g), u));
-        ggml_tensor * sg = ggml_sigmoid(ctx, ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp_shexp.weight", il), x));
-        sh = ggml_mul(ctx, sh, sg);
+                                        swiglu_limited(ctx, g, u, hp.swiglu_limit_shexp(il)));
+        // qwen35moe / qwen3next gate the shared expert with their own sigmoid;
+        // step35 has no such weight and adds it unconditionally.
+        if (ggml_tensor * gw = Wopt("blk.%d.ffn_gate_inp_shexp.weight", il))
+            sh = ggml_mul(ctx, sh, ggml_sigmoid(ctx, ggml_mul_mat(ctx, gw, x)));
+        dbg(sh, "ffn_shared_out", il);
         moe_out = ggml_add(ctx, moe_out, sh);
     }
+    dbg(moe_out, "ffn_moe_out", il);
     return moe_out;
 }
 
@@ -994,6 +1142,7 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
     const char * post_norm_name = "blk.%d.post_attention_norm.weight";
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+    dump_list.clear();
 
     ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp_tokens); ggml_set_name(inp_tokens, "inp_tokens");
@@ -1001,6 +1150,15 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
     ggml_set_input(inp_pos); ggml_set_name(inp_pos, "inp_pos");
     ggml_tensor * inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_tokens);
     ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
+
+    // Sliding-window layers need a second mask (causal AND inside the window).
+    // Only step35 has them; every other architecture keeps the single causal
+    // mask and never allocates this one.
+    ggml_tensor * inp_mask_swa = nullptr;
+    if (hp.n_swa > 0) {
+        inp_mask_swa = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_tokens);
+        ggml_set_input(inp_mask_swa); ggml_set_name(inp_mask_swa, "inp_mask_swa");
+    }
 
     if (persistent) {
         d_kvidx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
@@ -1025,8 +1183,14 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
     for (int il = 0; il < (int) hp.n_main(); ++il) {
         ggml_tensor * inpSA = inpL;
 
+        // step35 gives full-attention and sliding layers different head counts
+        // (64 vs 96); everywhere else these equal the scalars.
+        const int n_head_l    = (int) hp.head_count(il);
+        const int n_head_kv_l = (int) hp.head_count_kv(il);
+
+        dbg(inpL, "attn_norm_in", il);
         cur = ggml_rms_norm(ctx, inpL, eps);
-        cur = ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il));
+        cur = dbg(ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il)), "attn_norm", il);
 
         if (hp.is_recurrent(il)) {
             cur = build_gdn(ctx, gf, il, cur, n_tokens);
@@ -1036,36 +1200,39 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
             if (gated) {
                 ggml_tensor * Qf = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur); // [2*hd*nh, T]
                 const size_t es = ggml_element_size(Qf);
-                Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head, n_tokens,
-                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head, 0);
-                gate = ggml_view_3d(ctx, Qf, n_embd_head, n_head, n_tokens,
-                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head, es * n_embd_head);
-                gate = ggml_cont_2d(ctx, gate, n_embd_head * n_head, n_tokens);
+                Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head_l, n_tokens,
+                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head_l, 0);
+                gate = ggml_view_3d(ctx, Qf, n_embd_head, n_head_l, n_tokens,
+                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head_l, es * n_embd_head);
+                gate = ggml_cont_2d(ctx, gate, n_embd_head * n_head_l, n_tokens);
                 K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
                 V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
-                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, n_tokens);
-                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, n_tokens);
+                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv_l, n_tokens);
+                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv_l, n_tokens);
             } else {
-                Q = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur);
-                K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
-                V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
-                Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head,    n_tokens);
-                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, n_tokens);
-                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, n_tokens);
+                Q = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur), "Qcur", il);
+                K = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur), "Kcur", il);
+                V = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur), "Vcur", il);
+                Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head_l,    n_tokens);
+                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv_l, n_tokens);
+                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv_l, n_tokens);
             }
 
-            Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il));
-            K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il));
+            Q = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il)), "Qcur_normed", il);
+            K = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il)), "Kcur_normed", il);
 
-            Q = apply_rope(ctx, Q, inp_pos);
-            K = apply_rope(ctx, K, inp_pos);
+            Q = dbg(apply_rope(ctx, Q, inp_pos, il), "Qcur_pos", il);
+            K = dbg(apply_rope(ctx, K, inp_pos, il), "Kcur_pos", il);
 
-            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, n_tokens, n_kv);
+            ggml_tensor * att = build_attn(ctx, gf, il,
+                    Q, K, V, hp.is_swa(il) ? inp_mask_swa : inp_mask, n_tokens, n_kv);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate));
-            cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
+            dbg(att, "attn_out", il);
+            att = dbg(apply_attn_gate(ctx, il, att, cur, n_head_l, n_tokens), "attn_gated", il);
+            cur = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att), "attn_proj", il);
         }
 
-        cur = ggml_add(ctx, cur, inpSA);
+        cur = dbg(ggml_add(ctx, cur, inpSA), "ffn_inp", il);
 
         // FFN with (qwen35) post-attention norm placement
         ggml_tensor * ffn_res = cur;
@@ -1073,12 +1240,12 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
         if (gated) {
             ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W(post_norm_name, il));
         } else {
-            ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W("blk.%d.ffn_norm.weight", il));
+            ffn_in = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W("blk.%d.ffn_norm.weight", il)), "ffn_norm", il);
             ffn_res = cur;  // same residual for qwen3 (norm of cur, add cur)
         }
 
         ggml_tensor * ff;
-        if (hp.is_moe()) {
+        if (hp.is_moe_layer(il)) {
             ff = build_moe(ctx, gf, il, ffn_in, n_tokens);
         } else {
             ggml_tensor * gt = ggml_mul_mat(ctx, W("blk.%d.ffn_gate.weight", il), ffn_in);
@@ -1086,7 +1253,8 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
             ff = ggml_mul_mat(ctx, W("blk.%d.ffn_down.weight", il), ggml_mul(ctx, ggml_silu(ctx, gt), up));
         }
 
-        cur = ggml_add(ctx, ff, ffn_res);
+        dbg(ff, "ffn_out", il);
+        cur = dbg(ggml_add(ctx, ff, ffn_res), "l_out", il);
         inpL = cur;
     }
 
@@ -1106,7 +1274,7 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
     }
 
     cur = ggml_rms_norm(ctx, head_in, eps);
-    cur = ggml_mul(ctx, cur, model.tensor("output_norm.weight"));
+    cur = dbg(ggml_mul(ctx, cur, model.tensor("output_norm.weight")), "result_norm", -1);
 
     ggml_tensor * output_w = model.tensor("output.weight");
     if (!output_w) output_w = model.tensor("token_embd.weight");
@@ -1556,13 +1724,7 @@ void Runtime::Impl::decode_verify(const std::vector<int32_t> & toks) {
     for (int i = 0; i < n_tokens; ++i) kvi[i] = n_past + i;
     ggml_backend_tensor_set(inp_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
     ggml_backend_tensor_set(inp_kvidx, kvi.data(), 0, n_tokens * sizeof(int64_t));
-    std::vector<ggml_fp16_t> mask((size_t) v_nkv * n_tokens);
-    const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
-    for (int i = 0; i < n_tokens; ++i) {
-        const int abs_i = n_past + i;
-        for (int j = 0; j < v_nkv; ++j) mask[(size_t) i * v_nkv + j] = (j <= abs_i) ? z : ninf;
-    }
-    ggml_backend_tensor_set(inp_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    fill_masks(v_gf, n_tokens, v_nkv, n_past);
 
     if (ggml_backend_graph_compute(backend, v_gf) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("decode_verify: compute failed");
@@ -1820,10 +1982,7 @@ const std::vector<float> & Runtime::Impl::decode_reuse(int32_t token) {
     int64_t kvidx = n_past;
     ggml_backend_tensor_set(inp_kvidx, &kvidx, 0, sizeof(int64_t));
 
-    std::vector<ggml_fp16_t> mask(d_nkv);
-    const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
-    for (int j = 0; j < d_nkv; ++j) mask[j] = (j <= n_past) ? z : ninf;
-    ggml_backend_tensor_set(inp_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    fill_masks(dgf, 1, d_nkv, n_past);
     auto pt_input = pnow();
 
     if (ggml_backend_graph_compute(backend, dgf) != GGML_STATUS_SUCCESS)
@@ -2035,8 +2194,8 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             }
             Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il));
             K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il));
-            Q = apply_rope(ctx, Q, inp_pos);
-            K = apply_rope(ctx, K, inp_pos);
+            Q = apply_rope(ctx, Q, inp_pos, il);
+            K = apply_rope(ctx, K, inp_pos, il);
             ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, tlen, n_kv_c, n_past + tc0);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
@@ -2595,8 +2754,8 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             }
             Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il));
             K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il));
-            Q = apply_rope(ctx, Q, inp_pos);
-            K = apply_rope(ctx, K, inp_pos);
+            Q = apply_rope(ctx, Q, inp_pos, il);
+            K = apply_rope(ctx, K, inp_pos, il);
             ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, 1, n_kv);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
@@ -3236,7 +3395,6 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
 
     ggml_tensor * inp_tokens_t = ggml_graph_get_tensor(gf, "inp_tokens");
     ggml_tensor * inp_pos_t    = ggml_graph_get_tensor(gf, "inp_pos");
-    ggml_tensor * inp_mask_t   = ggml_graph_get_tensor(gf, "inp_mask");
 
     ggml_backend_tensor_set(inp_tokens_t, tokens.data(), 0, n_tokens * sizeof(int32_t));
 
@@ -3244,14 +3402,7 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     const int new_mrope = fill_rope_pos(pos, n_tokens, mrope_next);
     ggml_backend_tensor_set(inp_pos_t, pos.data(), 0, pos.size() * sizeof(int32_t));
 
-    std::vector<ggml_fp16_t> mask((size_t) n_kv * n_tokens);
-    const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
-    for (int i = 0; i < n_tokens; ++i) {
-        const int abs_i = n_past + i;
-        for (int j = 0; j < n_kv; ++j)
-            mask[(size_t) i * n_kv + j] = (j <= abs_i) ? z : ninf;
-    }
-    ggml_backend_tensor_set(inp_mask_t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    fill_masks(gf, n_tokens, n_kv, n_past);
 
     // vision: upload the image embeddings for each override span
     for (size_t k = 0; k < embd_ovr.size(); ++k) {
@@ -3272,6 +3423,9 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     }
 
     ggml_tensor * logits_t = ggml_graph_get_tensor(gf, "logits");
+    dbg(logits_t, "result_output", -1);   // renames it, so resolve the name first
+    dump_flush("decode");
+
     const int n_vocab = (int) logits_t->ne[0];
     logits.resize(n_vocab);
     // one row when the head was narrowed, n_tokens rows otherwise

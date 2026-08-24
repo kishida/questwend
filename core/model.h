@@ -130,6 +130,8 @@ struct Vocab {
     std::vector<std::string> merges;
     std::string              model;          // "gpt2" for Qwen
     int32_t bos_id = -1, eos_id = -1, pad_id = -1;
+    // tokenizer.ggml.add_bos_token: the Qwen models say false, step35 says true.
+    bool                     add_bos = false;
     std::string              chat_template;
 };
 
