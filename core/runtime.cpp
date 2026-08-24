@@ -23,6 +23,22 @@ namespace questwend {
 
 static const int GRAPH_SIZE = 16384;
 
+// Longest token batch any single graph attends over. The SWA ring must hold the
+// window plus one of these, so the sizing and the chunking have to read the same
+// number -- deriving it twice is how the ring ends up a few rows short and the
+// only symptom is an assert deep in a long prefill.
+static int env_chunk(const char * key, int def) {
+    const char * c = getenv(key);
+    const int v = c ? atoi(c) : def;
+    return v < 1 ? def : v;
+}
+// plain (resident / RAM-tier) prefill chunk
+static int pf_chunk_len()   { static const int v = env_chunk("QWEN_PREFILL_CHUNK", 512); return v; }
+// seg A sub-chunk of the batched offload prefill
+static int sega_chunk_len() { static const int v = env_chunk("QWEN_SEGA_CHUNK",    256); return v; }
+// the bound the ring has to respect
+static int max_attn_batch() { return std::max(pf_chunk_len(), sega_chunk_len()); }
+
 struct Runtime::Impl {
     Model & model;
     RuntimeConfig cfg;
@@ -203,6 +219,20 @@ struct Runtime::Impl {
     bool                  use_flash = false;       // fused flash-attention (GPU)
     static const int      KV_BUCKET = 32;          // rebuild decode graph only when crossing a bucket
 
+    // ---- sliding-window KV ring ----
+    // A sliding layer only ever attends the last n_swa positions, so its cache
+    // does not need n_ctx rows -- it needs the window plus the batch in flight.
+    // swa_ring is that row count (0 = no ring: the model has no sliding layers,
+    // or n_ctx is already small enough that wrapping would never happen). On
+    // step35 at n_ctx 32k this takes the KV from 6.0 GB to 1.8 GB, and on an
+    // offload build every byte saved goes straight to the expert pool.
+    int                   swa_ring = 0;
+    ggml_tensor *         ring_idx = nullptr;   // per-graph ring write positions
+    int  kv_rows(int il) const {
+        return (swa_ring > 0 && model.hparams().is_swa(il)) ? swa_ring : n_ctx;
+    }
+    bool kv_is_ring(int il) const { return kv_rows(il) < n_ctx; }
+
     std::vector<float> logits;
 
     Impl(Model & m, const RuntimeConfig & c) : model(m), cfg(c) {}
@@ -352,6 +382,9 @@ struct Runtime::Impl {
     // Upload the causal (and, on step35, the sliding-window) attention masks for
     // a batch of n_tokens whose first token sits at absolute position pos0.
     void fill_masks(ggml_cgraph * gf, int n_tokens, int n_kv, int pos0);
+    // Create a graph's sliding-layer inputs: the mask, and (when the cache
+    // wraps) the ring write index build_attn scatters through. Sets ring_idx.
+    ggml_tensor * new_swa_inputs(ggml_context * ctx, int n_tokens, int n_kv);
     // step35 head-wise attention gate (a no-op elsewhere).
     ggml_tensor * apply_attn_gate(ggml_context * ctx, int il, ggml_tensor * att,
                                   ggml_tensor * x, int n_head_l, int n_tokens);
@@ -533,6 +566,30 @@ void Runtime::Impl::init() {
     const int n_layer    = hp.n_layer;
     const int n_embd_gqa = hp.n_head_kv * hp.n_embd_head;
 
+    // Size the sliding-window ring: the window itself plus the largest batch any
+    // graph will attend over at once, since those queries need keys reaching
+    // n_swa back from the batch's *first* token. Both chunk sizes are env knobs,
+    // so read them the same way their owners do. QWEN_SWA_RING=0 turns the ring
+    // off (the A/B that proves it changes no output).
+    if (hp.n_swa > 0 && getenv("QWEN_SWA_RING") != nullptr
+                     && atoi(getenv("QWEN_SWA_RING")) == 0) {
+        swa_ring = 0;
+    } else if (hp.n_swa > 0) {
+        const int r = ((int) hp.n_swa + max_attn_batch() + KV_BUCKET - 1) / KV_BUCKET * KV_BUCKET;
+        // Only worth it when it actually saves rows.
+        swa_ring = r < n_ctx ? r : 0;
+        if (swa_ring > 0) {
+            size_t full = 0, ring = 0;
+            for (int il = 0; il < (int) hp.n_layer; ++il)
+                (hp.is_swa(il) ? ring : full) += 1;
+            fprintf(stderr, "SWA KV ring: %d rows on %zu sliding layers (%zu full at %d)"
+                            " = %.2f GB instead of %.2f GB\n",
+                    swa_ring, ring, full, n_ctx,
+                    (double) (ring * swa_ring + full * n_ctx) * n_embd_gqa * 2 * 2 / 1e9,
+                    (double) (ring + full) * n_ctx * n_embd_gqa * 2 * 2 / 1e9);
+        }
+    }
+
     const int conv_ch = hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state;
     const int S       = hp.ssm_d_state;
     const int H_v     = hp.ssm_dt_rank;
@@ -559,8 +616,9 @@ void Runtime::Impl::init() {
             // convert from F32 via set_rows / cpy; flash attention takes F16
             // K/V natively, and the fallback path feeds them to mul_mat, which
             // handles an F16 src0 against F32 activations.
-            k_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_gqa, n_ctx);
-            v_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_gqa, n_ctx);
+            const int rows = kv_rows(il);
+            k_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_gqa, rows);
+            v_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_gqa, rows);
             ggml_set_name(k_cache[il], ("k_" + std::to_string(il)).c_str());
             ggml_set_name(v_cache[il], ("v_" + std::to_string(il)).c_str());
         }
@@ -756,6 +814,25 @@ void Runtime::Impl::dump_flush(const char * tag) {
     dump_list.clear();
 }
 
+ggml_tensor * Runtime::Impl::new_swa_inputs(ggml_context * ctx, int n_tokens, int n_kv) {
+    const int rows = swa_ring > 0 ? swa_ring : n_kv;
+    ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, rows, n_tokens);
+    ggml_set_input(m); ggml_set_name(m, "inp_mask_swa");
+    ring_idx = nullptr;
+    if (swa_ring > 0) {
+        if (swa_ring < (int) model.hparams().n_swa + n_tokens) {
+            throw std::runtime_error(
+                "SWA ring holds " + std::to_string(swa_ring) + " rows but this batch of " +
+                std::to_string(n_tokens) + " needs " +
+                std::to_string((int) model.hparams().n_swa + n_tokens) +
+                " -- raise QWEN_PREFILL_CHUNK/QWEN_SEGA_CHUNK before load, or QWEN_SWA_RING=0");
+        }
+        ring_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+        ggml_set_input(ring_idx); ggml_set_name(ring_idx, "inp_kvidx_swa");
+    }
+    return m;
+}
+
 void Runtime::Impl::fill_masks(ggml_cgraph * gf, int n_tokens, int n_kv, int pos0) {
     const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
     std::vector<ggml_fp16_t> mask((size_t) n_kv * n_tokens);
@@ -776,11 +853,41 @@ void Runtime::Impl::fill_masks(ggml_cgraph * gf, int n_tokens, int n_kv, int pos
     // A sliding layer's query at position p sees keys in (p - n_swa, p]: the
     // window spans n_swa positions, the query's own included.
     const int n_swa = (int) model.hparams().n_swa;
-    for (int i = 0; i < n_tokens; ++i) {
-        const int abs_i = pos0 + i;
-        const int lo    = abs_i - n_swa + 1;
-        for (int j = 0; j < n_kv; ++j)
-            mask[(size_t) i * n_kv + j] = (j <= abs_i && j >= lo) ? z : ninf;
+    const int rows  = swa_ring > 0 ? swa_ring : n_kv;
+    mask.assign((size_t) rows * n_tokens, ninf);
+
+    if (swa_ring <= 0) {
+        for (int i = 0; i < n_tokens; ++i) {
+            const int abs_i = pos0 + i;
+            const int lo    = abs_i - n_swa + 1;
+            for (int j = 0; j < rows; ++j)
+                mask[(size_t) i * rows + j] = (j <= abs_i && j >= lo) ? z : ninf;
+        }
+    } else {
+        // Ring: a row's absolute position is only known modulo the ring size, so
+        // recover it as the newest position <= the last one this batch writes
+        // that lands on that row. Rows outside every query's window keep -inf,
+        // which is also what an as-yet-unwritten row gets.
+        const int last = pos0 + n_tokens - 1;
+        std::vector<int> row_pos(rows);
+        for (int r = 0; r < rows; ++r) {
+            const int back = ((last - r) % rows + rows) % rows;
+            row_pos[r] = last - back;                 // < 0 => never written
+        }
+        for (int i = 0; i < n_tokens; ++i) {
+            const int abs_i = pos0 + i;
+            for (int r = 0; r < rows; ++r) {
+                const int p = row_pos[r];
+                if (p >= 0 && p <= abs_i && abs_i - p < n_swa)
+                    mask[(size_t) i * rows + r] = z;
+            }
+        }
+
+        if (ggml_tensor * ki = ggml_graph_get_tensor(gf, "inp_kvidx_swa")) {
+            std::vector<int64_t> idx(n_tokens);
+            for (int i = 0; i < n_tokens; ++i) idx[i] = (pos0 + i) % rows;
+            ggml_backend_tensor_set(ki, idx.data(), 0, idx.size() * sizeof(int64_t));
+        }
     }
     ggml_backend_tensor_set(t_swa, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
 }
@@ -796,10 +903,23 @@ ggml_tensor * Runtime::Impl::build_attn(ggml_context * ctx, ggml_cgraph * gf, in
     const int n_embd_gqa  = n_head_kv * n_embd_head;
     const float kq_scale  = 1.0f / sqrtf((float) n_embd_head);
 
+    // Rows this layer's cache actually has, and how many the attention reads.
+    // A ring layer always reads the whole ring: which rows are live for a given
+    // query is the mask's job, because a row's absolute position is only
+    // recoverable modulo the ring size.
+    const int rows = kv_rows(il);
+    const bool ring = kv_is_ring(il);
+    if (ring) n_kv = rows;
+
     // store K, V into cache
     ggml_tensor * Kflat = ggml_reshape_2d(ctx, K, n_embd_gqa, n_tokens);
     ggml_tensor * Vflat = ggml_reshape_2d(ctx, V, n_embd_gqa, n_tokens);
-    if (persistent) {
+    if (ring) {
+        // A batch can straddle the wrap, so scatter rather than copy a span.
+        GGML_ASSERT(ring_idx && "ring layer without inp_kvidx_swa");
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_cache[il], Kflat, ring_idx));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_cache[il], Vflat, ring_idx));
+    } else if (persistent) {
         // dynamic write position via index input -> graph stays identical each step
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_cache[il], Kflat, d_kvidx));
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_cache[il], Vflat, d_kvidx));
@@ -1148,6 +1268,7 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
     dump_list.clear();
+    ring_idx = nullptr;
 
     ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp_tokens); ggml_set_name(inp_tokens, "inp_tokens");
@@ -1160,10 +1281,7 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
     // Only step35 has them; every other architecture keeps the single causal
     // mask and never allocates this one.
     ggml_tensor * inp_mask_swa = nullptr;
-    if (hp.n_swa > 0) {
-        inp_mask_swa = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_tokens);
-        ggml_set_input(inp_mask_swa); ggml_set_name(inp_mask_swa, "inp_mask_swa");
-    }
+    if (hp.n_swa > 0) inp_mask_swa = new_swa_inputs(ctx, n_tokens, n_kv);
 
     if (persistent) {
         d_kvidx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
@@ -2178,11 +2296,15 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         if (!recurrent) {
             inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rope_dim(tlen));
             ggml_set_input(inp_pos);  ggml_set_name(inp_pos, "inp_pos");
-            inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv_c, tlen);
-            ggml_set_input(inp_mask);
             // One graph per layer here, so the layer's attention type picks the
             // input name and fill_masks() then uploads the matching mask.
-            ggml_set_name(inp_mask, hp.is_swa(il) ? "inp_mask_swa" : "inp_mask");
+            if (hp.is_swa(il)) {
+                inp_mask = new_swa_inputs(ctx, tlen, n_kv_c);
+            } else {
+                inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv_c, tlen);
+                ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
+                ring_idx = nullptr;
+            }
         }
 
         ggml_tensor * h_c = tslice(h_b);
@@ -2453,8 +2575,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     };
 
     // Seg-A sub-chunk length for the layer-major path (bounds attention scores).
-    static const int sega_chunk = []{ const char * c = getenv("QWEN_SEGA_CHUNK");
-                                      int v = c ? atoi(c) : 256; return v < 1 ? 256 : v; }();
+    const int sega_chunk = sega_chunk_len();
 
     // ---- optional prefill expert pruning (QWEN_PREFILL_PRUNE=<eps>) ----
     // Skip fetching non-resident experts whose aggregate router mass over the
@@ -2801,9 +2922,13 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         if (!recurrent) {
             inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rope_dim(1));
             ggml_set_input(inp_pos);  ggml_set_name(inp_pos, "inp_pos");
-            inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, 1);
-            ggml_set_input(inp_mask);
-            ggml_set_name(inp_mask, hp.is_swa(il) ? "inp_mask_swa" : "inp_mask");
+            if (hp.is_swa(il)) {
+                inp_mask = new_swa_inputs(ctx, 1, n_kv);
+            } else {
+                inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, 1);
+                ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
+                ring_idx = nullptr;
+            }
         }
         ggml_tensor * cur = ggml_rms_norm(ctx, p_h, eps);
         cur = ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il));
@@ -3091,6 +3216,11 @@ int Runtime::Impl::pk_best(int n) const {
 int Runtime::Impl::pk_rewind(int n) {
     const auto & hp = model.hparams();
     if (n >= (int) kv_toks.size()) return (int) kv_toks.size();   // nothing to rewind
+    // A sliding layer's ring keeps only the last swa_ring positions, so once
+    // generation has run far enough past `n` the window it would need has been
+    // written over. Bail out and let the caller reset rather than attend to rows
+    // holding positions from the future.
+    if (swa_ring > 0 && n_past - n > swa_ring - (int) hp.n_swa) return -1;
     if (!hp.has_gdn) {
         if (mrope_next != n_past) return -1;   // image lineage: positions ambiguous
         n_past = n;
@@ -3429,8 +3559,7 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     // time-slicing. Split it into chunks (bounded buffers, progress reporting,
     // preemptible). The SSD-tier path (ecache && !sched) already chunks via the
     // decode_cached_batch loop above, so it is excluded here.
-    static const int PF_CHUNK = []{ const char * c = getenv("QWEN_PREFILL_CHUNK");
-                                    int v = c ? atoi(c) : 512; return v < 1 ? 512 : v; }();
+    const int PF_CHUNK = pf_chunk_len();
     if (n_tokens > PF_CHUNK && (sched || !ecache)) {
         const int n_embd = model.hparams().n_embd;
         const std::vector<Runtime::EmbdOverride> all = embd_ovr;   // member is consumed per call
@@ -3605,7 +3734,8 @@ size_t Runtime::state_bytes() const {
     n += impl_->mtp_hidden.size() * sizeof(float);
     for (int il = 0; il < (int) hp.n_layer; ++il) {
         if (impl_->k_cache[il]) {
-            const int rows = il >= (int) hp.n_main() ? impl_->mtp_past : impl_->n_past;
+            int rows = il >= (int) hp.n_main() ? impl_->mtp_past : impl_->n_past;
+            rows = std::min(rows, impl_->kv_rows(il));   // ring layers hold only a window
             n += 2 * (size_t) rows * impl_->k_cache[il]->nb[1];
         } else {
             n += ggml_nbytes(impl_->conv_state[il]) + ggml_nbytes(impl_->ssm_state[il]);
@@ -3639,7 +3769,8 @@ void Runtime::save_state(const std::function<void(const void *, size_t)> & sink)
     };
     for (int il = 0; il < h.n_layer; ++il) {
         if (impl_->k_cache[il]) {
-            const int rows = il >= (int) hp.n_main() ? h.mtp_past : h.n_past;
+            int rows = il >= (int) hp.n_main() ? h.mtp_past : h.n_past;
+            rows = std::min(rows, impl_->kv_rows(il));
             dump(impl_->k_cache[il], (size_t) rows * impl_->k_cache[il]->nb[1]);
             dump(impl_->v_cache[il], (size_t) rows * impl_->v_cache[il]->nb[1]);
         } else {
@@ -3674,7 +3805,8 @@ void Runtime::load_state(const std::function<void(void *, size_t)> & src) {
     };
     for (int il = 0; il < h.n_layer; ++il) {
         if (impl_->k_cache[il]) {
-            const int rows = il >= (int) hp.n_main() ? h.mtp_past : h.n_past;
+            int rows = il >= (int) hp.n_main() ? h.mtp_past : h.n_past;
+            rows = std::min(rows, impl_->kv_rows(il));
             fill(impl_->k_cache[il], (size_t) rows * impl_->k_cache[il]->nb[1]);
             fill(impl_->v_cache[il], (size_t) rows * impl_->v_cache[il]->nb[1]);
         } else {

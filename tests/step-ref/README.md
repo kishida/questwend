@@ -53,6 +53,33 @@ backend) against the same GGUF. Two facts worth keeping:
   backends running the *same* qwencpp code, so they are kernel noise rather than
   a fault in the offload graphs. Layer 0 agrees to 8e-7.
 
+## SWA ring A/B
+
+`QWEN_SWA_RING=0` turns the sliding-window KV ring off, which is how the ring is
+checked: same prompt, ring on and off, all tensor sums compared.
+
+```
+QWEN_SEGA_CHUNK=64 QWEN_PREFILL_CHUNK=64 QWEN_SWA_RING=1 QWEN_DUMP_LAYERS=0,3 qw-cli -m <step35> -p "$(cat wrap-prompt.txt)" -n 1   --n-ctx 2048 --vram-budget 20 --experts-ssd | grep qw_dump > wrap-1.log
+```
+
+**Confirm the ring size in the log before trusting a run.** It is
+`n_swa + max(QWEN_PREFILL_CHUNK, QWEN_SEGA_CHUNK)`, so both knobs have to be set
+to shrink it, and the prompt has to be longer than the result or the ring never
+wraps and the run proves nothing:
+
+```
+SWA KV ring: 576 rows on 33 sliding layers (12 full at 2048) = 0.18 GB instead of 0.38 GB
+```
+
+`wrap-prompt.txt` is 640 tokens, which wraps a 576-row ring.
+
+The two runs are not bit-identical and cannot be: a ring layer's attention reads
+the whole ring while a full one reads n_kv columns, so the softmax and the KQ
+matmul accumulate in a different order. What must hold is that the ring keeps the
+same *key positions*, and `ring_mask_check.py` proves that directly against the
+same formulas the runtime uses -- including that an undersized ring fails, which
+is what the runtime's own size check exists to prevent.
+
 ## Caveats
 
 - **`07-bench.log` is a cold-cache artifact** (tg 17.64 t/s). The identical

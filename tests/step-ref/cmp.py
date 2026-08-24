@@ -60,8 +60,19 @@ def main():
         r = parse_ref(path)
         return r if r else parse_qw(path)
 
-    ref = load(a.ref)
-    qw = dict(load(a.qw))
+    # A name repeats when the prefill runs in sub-chunks (one seg A graph each),
+    # so tag each occurrence with its index and compare k-th against k-th. Doing
+    # it by name alone silently lines up chunk 1 against chunk 4.
+    def enumerate_dups(pairs):
+        seen, out = {}, []
+        for name, v in pairs:
+            k = seen.get(name, 0)
+            seen[name] = k + 1
+            out.append((name if k == 0 else "%s#%d" % (name, k), v))
+        return out
+
+    ref = enumerate_dups(load(a.ref))
+    qw = dict(enumerate_dups(load(a.qw)))
     if not ref:
         sys.exit("no reference tensors parsed from " + a.ref)
     if not qw:
