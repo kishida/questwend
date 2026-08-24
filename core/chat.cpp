@@ -62,9 +62,17 @@ ChatPrompt build_qwen_prompt(const Tokenizer & tok,
     const int32_t im_end      = tok.token_to_id("<|im_end|>");
     const int32_t think_open  = tok.token_to_id("<think>");
     const int32_t think_close = tok.token_to_id("</think>");
-    const int32_t vis_start   = tok.token_to_id("<|vision_start|>");
-    const int32_t vis_end     = tok.token_to_id("<|vision_end|>");
-    const int32_t image_pad   = tok.token_to_id("<|image_pad|>");
+    // Image placeholders: Qwen wraps the run in <|vision_start|>/<|vision_end|>,
+    // step35 in <im_start>/<im_end> with <im_patch> as the repeated token. The
+    // emission below is the same shape either way, so only the ids differ.
+    int32_t vis_start = tok.token_to_id("<|vision_start|>");
+    int32_t vis_end   = tok.token_to_id("<|vision_end|>");
+    int32_t image_pad = tok.token_to_id("<|image_pad|>");
+    if (image_pad < 0) {
+        vis_start = tok.token_to_id("<im_start>");
+        vis_end   = tok.token_to_id("<im_end>");
+        image_pad = tok.token_to_id("<im_patch>");
+    }
 
     ChatPrompt out;
     auto & ids = out.ids;

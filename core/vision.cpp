@@ -22,9 +22,15 @@
 
 namespace questwend {
 
-static const int VIS_GRAPH_SIZE = 4096;
+static const int VIS_GRAPH_SIZE = 16384;   // step3vl: 47 blocks, ~30 nodes each
 
 struct VisionEncoder::Impl {
+    // Which mmproj this is. The two towers share the block loop and the fused
+    // QKV attention; they differ in how position is encoded, where the norms
+    // sit, and what the projector is. See docs/step3vl_vision.md.
+    enum class Proj { QWEN3VL, STEP3VL };
+    Proj proj = Proj::QWEN3VL;
+
     // hyper-parameters (clip.* metadata)
     int   n_layer  = 0;     // ViT blocks
     int   dim      = 0;     // ViT embedding dim
@@ -39,6 +45,10 @@ struct VisionEncoder::Impl {
     int   n_side   = 0;     // img_size / patch (48)
     int   n_patch  = 0;     // n_side^2 (2304)
     int   n_tokens = 0;     // (n_side/merge)^2 (576)
+
+    float rope_theta = 10000.0f;   // step3vl 2D rope base (not in the GGUF)
+    float img_mean[3] = { 0.5f, 0.5f, 0.5f };   // step3vl: from the GGUF
+    float img_std [3] = { 0.5f, 0.5f, 0.5f };
 
     ggml_backend_t        backend = nullptr;
     ggml_context *        wctx    = nullptr;   // weight tensors (backend buffer)
@@ -72,7 +82,9 @@ struct VisionEncoder::Impl {
     }
 
     void load_weights(const std::string & path);
+    void load_weights_step3vl(gguf_context * g, ggml_context * cpu_ctx);
     void build_graph();
+    void build_graph_step3vl();
     std::vector<float> forward(const std::vector<float> & patches);
 };
 
@@ -93,6 +105,13 @@ void VisionEncoder::Impl::load_weights(const std::string & path) {
         throw std::runtime_error("mmproj: unexpected architecture '" + arch + "' (want clip)");
     }
     const std::string ptype = gguf_str(g, "clip.projector_type");
+    if (ptype == "step3vl") {
+        proj = Proj::STEP3VL;
+        load_weights_step3vl(g, cpu_ctx);
+        gguf_free(g);
+        ggml_free(cpu_ctx);
+        return;
+    }
     if (ptype != "qwen3vl_merger")
         fprintf(stderr, "mmproj: warning: projector_type '%s' (expected qwen3vl_merger)\n", ptype.c_str());
 
@@ -238,6 +257,8 @@ void VisionEncoder::Impl::load_weights(const std::string & path) {
 // ---- forward graph --------------------------------------------------------
 
 void VisionEncoder::Impl::build_graph() {
+    if (proj == Proj::STEP3VL) { build_graph_step3vl(); return; }
+
     ggml_init_params gp{};
     gp.mem_size = ggml_tensor_overhead() * VIS_GRAPH_SIZE
                 + ggml_graph_overhead_custom(VIS_GRAPH_SIZE, false);
@@ -344,6 +365,263 @@ std::vector<float> VisionEncoder::Impl::forward(const std::vector<float> & patch
     return out;
 }
 
+// ---- step3vl: Step-3.7-Flash perception encoder ---------------------------
+// Differences from the Qwen3-VL tower above (docs/step3vl_vision.md): a learned
+// position embedding *and* a per-layer 2D rope, pre_ln instead of post_ln,
+// LayerScale on both residual branches, plain row-major token order, and a
+// projector of two stride-2 convolutions followed by a linear.
+
+void VisionEncoder::Impl::load_weights_step3vl(gguf_context * g, ggml_context * cpu_ctx) {
+    n_layer  = (int) gguf_u32(g, "clip.vision.block_count");
+    dim      = (int) gguf_u32(g, "clip.vision.embedding_length");
+    ffn      = (int) gguf_u32(g, "clip.vision.feed_forward_length");
+    n_head   = (int) gguf_u32(g, "clip.vision.attention.head_count");
+    proj_dim = (int) gguf_u32(g, "clip.vision.projection_dim");
+    patch    = (int) gguf_u32(g, "clip.vision.patch_size");
+    img_size = (int) gguf_u32(g, "clip.vision.image_size");
+    // total downsample of the two stride-2 convolutions, not a 2x2 token merge
+    merge    = (int) gguf_u32(g, "clip.vision.projector.scale_factor", 4);
+    ln_eps   = gguf_f32(g, "clip.vision.attention.layer_norm_epsilon", 1e-6f);
+    if (!n_layer || !dim || !n_head || !proj_dim || !patch || !img_size)
+        throw std::runtime_error("mmproj: missing clip.vision.* metadata");
+    d_head   = dim / n_head;
+    n_side   = img_size / patch;
+    n_patch  = n_side * n_side;
+    n_tokens = (n_side / merge) * (n_side / merge);
+
+    // CLIP normalisation constants travel in the file for this tower
+    {
+        auto arr = gguf_f32_array(g, "clip.vision.image_mean");
+        for (int i = 0; i < 3 && i < (int) arr.size(); ++i) img_mean[i] = arr[i];
+        arr = gguf_f32_array(g, "clip.vision.image_std");
+        for (int i = 0; i < 3 && i < (int) arr.size(); ++i) img_std[i] = arr[i];
+    }
+
+    ggml_init_params wp{};
+    wp.mem_size = ggml_tensor_overhead() * (16 + n_layer * 16) + 1024;
+    wp.no_alloc = true;
+    wctx = ggml_init(wp);
+
+    // The tower is ~2B parameters. Converting it to f32 the way the Qwen path
+    // does would cost 7.9 GB of backend memory instead of 4.0, so the large
+    // matrices keep the type they have in the file and are uploaded verbatim.
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> raw;
+    auto mk_raw = [&](const std::string & name, const std::string & src_name,
+                      bool required = true) -> ggml_tensor * {
+        ggml_tensor * src = ggml_get_tensor(cpu_ctx, src_name.c_str());
+        if (!src) {
+            if (required) throw std::runtime_error("mmproj: missing tensor " + src_name);
+            return nullptr;
+        }
+        ggml_tensor * t = ggml_new_tensor(wctx, src->type, ggml_n_dims(src), src->ne);
+        ggml_set_name(t, name.c_str());
+        raw.push_back({ t, src });
+        w[name] = t;
+        return t;
+    };
+    std::vector<std::vector<float>> keep;
+    std::vector<std::pair<ggml_tensor *, const float *>> uploads;
+    auto mk_f32 = [&](const std::string & name, std::vector<float> && data,
+                      int64_t ne0, int64_t ne1) {
+        ggml_tensor * t = ggml_new_tensor_2d(wctx, GGML_TYPE_F32, ne0, ne1);
+        ggml_set_name(t, name.c_str());
+        keep.emplace_back(std::move(data));
+        uploads.push_back({ t, keep.back().data() });
+        w[name] = t;
+    };
+
+    // Patch embedding: the conv kernel is [kw, kh, ic, oc] in memory, which is
+    // exactly the [K, dim] matrix the im2col columns expect, so this is only a
+    // reinterpretation of the same bytes.
+    {
+        ggml_tensor * pw = ggml_get_tensor(cpu_ctx, "v.patch_embd.weight");
+        if (!pw) throw std::runtime_error("mmproj: missing v.patch_embd.weight");
+        const int K = patch * patch * 3;
+        ggml_tensor * t = ggml_new_tensor_2d(wctx, pw->type, K, dim);
+        ggml_set_name(t, "patch_w");
+        raw.push_back({ t, pw });
+        w["patch_w"] = t;
+    }
+    mk_raw("patch_b", "v.patch_embd.bias", false);
+    mk_raw("pre_ln.w", "v.pre_ln.weight");
+    mk_raw("pre_ln.b", "v.pre_ln.bias");
+    mk_raw("pos", "v.position_embd.weight");   // [dim, n_patch], row-major
+
+    for (int il = 0; il < n_layer; ++il) {
+        const std::string p = "v.blk." + std::to_string(il) + ".";
+        mk_raw(p + "ln1.w",      p + "ln1.weight");
+        mk_raw(p + "ln1.b",      p + "ln1.bias");
+        mk_raw(p + "qkv.w",      p + "attn_qkv.weight");
+        mk_raw(p + "qkv.b",      p + "attn_qkv.bias");
+        mk_raw(p + "attn_out.w", p + "attn_out.weight");
+        mk_raw(p + "attn_out.b", p + "attn_out.bias");
+        mk_raw(p + "ls1",        p + "ls1.weight");
+        mk_raw(p + "ln2.w",      p + "ln2.weight");
+        mk_raw(p + "ln2.b",      p + "ln2.bias");
+        mk_raw(p + "up.w",       p + "ffn_up.weight");
+        mk_raw(p + "up.b",       p + "ffn_up.bias");
+        mk_raw(p + "down.w",     p + "ffn_down.weight");
+        mk_raw(p + "down.b",     p + "ffn_down.bias");
+        mk_raw(p + "ls2",        p + "ls2.weight");
+    }
+
+    mk_raw("mm0.w", "mm.0.weight");     // [3, 3, dim, 3072] conv kernel
+    mk_raw("mm0.b", "mm.0.bias", false);
+    mk_raw("mm1.w", "mm.1.weight");     // [3, 3, 3072, 6144]
+    mk_raw("mm1.b", "mm.1.bias", false);
+    mk_raw("mmfc.w", "mm.model.fc.weight");
+
+    // 2D rope tables. Head dims [0, d_head/2) rotate with the patch x index,
+    // the upper half with y; both halves share one inverse-frequency set and
+    // the rotation pairs adjacent dims (normal ordering, not NeoX).
+    {
+        const int half = d_head / 2;
+        const float theta_scale = std::pow(rope_theta, -2.0f / (float) half);
+        std::vector<float> C((size_t) d_head * n_patch), Sn((size_t) d_head * n_patch);
+        for (int py = 0; py < n_side; ++py)
+            for (int px = 0; px < n_side; ++px) {
+                const size_t o = (size_t) (py * n_side + px) * d_head;
+                float inv = 1.0f;
+                for (int d = 0; d < half; d += 2) {
+                    const float ax = (float) px * inv, ay = (float) py * inv;
+                    C[o + d] = C[o + d + 1] = std::cos(ax);
+                    Sn[o + d] = Sn[o + d + 1] = std::sin(ax);
+                    C[o + half + d] = C[o + half + d + 1] = std::cos(ay);
+                    Sn[o + half + d] = Sn[o + half + d + 1] = std::sin(ay);
+                    inv *= theta_scale;
+                }
+            }
+        mk_f32("rope_cos", std::move(C),  d_head, n_patch);
+        mk_f32("rope_sin", std::move(Sn), d_head, n_patch);
+    }
+
+    wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
+    if (!wbuf) throw std::runtime_error("mmproj: failed to alloc weight buffer");
+    for (auto & r : raw)
+        ggml_backend_tensor_set(r.first, r.second->data, 0, ggml_nbytes(r.second));
+    for (auto & u : uploads)
+        ggml_backend_tensor_set(u.first, u.second, 0, ggml_nbytes(u.first));
+
+    fprintf(stderr, "mmproj: step3vl | ViT %d layers dim=%d heads=%d, %dx%d patches"
+                    " -> %d tokens x %d (LLM dim)\n",
+            n_layer, dim, n_head, n_side, n_side, n_tokens, proj_dim);
+}
+
+void VisionEncoder::Impl::build_graph_step3vl() {
+    ggml_init_params gp{};
+    gp.mem_size = ggml_tensor_overhead() * VIS_GRAPH_SIZE
+                + ggml_graph_overhead_custom(VIS_GRAPH_SIZE, false);
+    gp.no_alloc = true;
+    gctx = ggml_init(gp);
+    gf = ggml_new_graph_custom(gctx, VIS_GRAPH_SIZE, false);
+
+    const int K = patch * patch * 3;
+    const float kq_scale = 1.0f / std::sqrt((float) d_head);
+
+    ggml_tensor * inp = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, K, n_patch);
+    ggml_set_input(inp); ggml_set_name(inp, "vis_inp");
+
+    auto layer_norm = [&](ggml_tensor * x, ggml_tensor * lw, ggml_tensor * lb) {
+        x = ggml_norm(gctx, x, ln_eps);
+        x = ggml_mul(gctx, x, lw);
+        return lb ? ggml_add(gctx, x, lb) : x;
+    };
+
+    ggml_tensor * cur = ggml_mul_mat(gctx, W("patch_w"), inp);       // [dim, n_patch]
+    if (w.count("patch_b")) cur = ggml_add(gctx, cur, W("patch_b"));
+    cur = ggml_add(gctx, cur, W("pos"));
+    cur = layer_norm(cur, W("pre_ln.w"), W("pre_ln.b"));
+
+    // 2D rope over adjacent pairs: out = x*cos + rot(x)*sin, where rot swaps
+    // each pair and negates what becomes its first element.
+    ggml_tensor * rc3 = ggml_reshape_3d(gctx, W("rope_cos"), d_head, 1, n_patch);
+    ggml_tensor * rs3 = ggml_reshape_3d(gctx, W("rope_sin"), d_head, 1, n_patch);
+    auto rope2d = [&](ggml_tensor * x) {              // [d_head, n_head, n_patch]
+        x = ggml_cont(gctx, x);
+        const size_t es = ggml_element_size(x);
+        const int64_t N = (int64_t) n_head * n_patch;
+        ggml_tensor * x2 = ggml_reshape_3d(gctx, x, 2, d_head / 2, N);
+        ggml_tensor * ev = ggml_cont(gctx, ggml_view_3d(gctx, x2, 1, d_head / 2, N,
+                                                        x2->nb[1], x2->nb[2], 0));
+        ggml_tensor * od = ggml_cont(gctx, ggml_view_3d(gctx, x2, 1, d_head / 2, N,
+                                                        x2->nb[1], x2->nb[2], es));
+        ggml_tensor * rot = ggml_concat(gctx, ggml_scale(gctx, od, -1.0f), ev, 0);
+        rot = ggml_reshape_3d(gctx, rot, d_head, n_head, n_patch);
+        return ggml_add(gctx, ggml_mul(gctx, x, rc3), ggml_mul(gctx, rot, rs3));
+    };
+
+    for (int il = 0; il < n_layer; ++il) {
+        const std::string p = "v.blk." + std::to_string(il) + ".";
+        ggml_tensor * resid = cur;
+
+        ggml_tensor * x = layer_norm(cur, W(p + "ln1.w"), W(p + "ln1.b"));
+        ggml_tensor * qkv = ggml_add(gctx, ggml_mul_mat(gctx, W(p + "qkv.w"), x),
+                                     W(p + "qkv.b"));                // [3*dim, n_patch]
+        const size_t es = ggml_element_size(qkv);
+        auto head_view = [&](size_t off) {
+            return ggml_view_3d(gctx, qkv, d_head, n_head, n_patch,
+                                (size_t) d_head * es, qkv->nb[1], off * es);
+        };
+        ggml_tensor * q = rope2d(head_view(0));
+        ggml_tensor * k = rope2d(head_view((size_t) dim));
+        ggml_tensor * v = head_view((size_t) 2 * dim);
+
+        q = ggml_cont(gctx, ggml_permute(gctx, q, 0, 2, 1, 3));      // [dh, np, nh]
+        k = ggml_cont(gctx, ggml_permute(gctx, k, 0, 2, 1, 3));
+        ggml_tensor * kq = ggml_mul_mat(gctx, k, q);
+        kq = ggml_soft_max(gctx, ggml_scale(gctx, kq, kq_scale));
+        ggml_tensor * vt = ggml_cont(gctx, ggml_permute(gctx, v, 1, 2, 0, 3));
+        ggml_tensor * kqv = ggml_mul_mat(gctx, vt, kq);
+        kqv = ggml_cont(gctx, ggml_permute(gctx, kqv, 0, 2, 1, 3));
+        ggml_tensor * att = ggml_reshape_2d(gctx, kqv, dim, n_patch);
+
+        att = ggml_add(gctx, ggml_mul_mat(gctx, W(p + "attn_out.w"), att),
+                       W(p + "attn_out.b"));
+        att = ggml_mul(gctx, att, W(p + "ls1"));                     // LayerScale
+        cur = ggml_add(gctx, att, resid);
+
+        resid = cur;
+        x = layer_norm(cur, W(p + "ln2.w"), W(p + "ln2.b"));
+        x = ggml_add(gctx, ggml_mul_mat(gctx, W(p + "up.w"), x), W(p + "up.b"));
+        x = ggml_gelu(gctx, x);
+        x = ggml_add(gctx, ggml_mul_mat(gctx, W(p + "down.w"), x), W(p + "down.b"));
+        x = ggml_mul(gctx, x, W(p + "ls2"));                         // LayerScale
+        cur = ggml_add(gctx, x, resid);
+    }
+    // this tower has no post-layernorm
+
+    // ---- projector: two stride-2 convolutions, then a linear ----
+    auto spatial_bias = [&](ggml_tensor * c, const std::string & name) {
+        if (!w.count(name)) return c;
+        const int64_t cw = c->ne[0], ch = c->ne[1], cc = c->ne[2];
+        c = ggml_reshape_2d(gctx, c, cw * ch, cc);
+        c = ggml_cont(gctx, ggml_transpose(gctx, c));                // [cc, cw*ch]
+        c = ggml_add(gctx, c, W(name));
+        c = ggml_cont(gctx, ggml_transpose(gctx, c));                // [cw*ch, cc]
+        return ggml_reshape_3d(gctx, c, cw, ch, cc);
+    };
+
+    ggml_tensor * t = ggml_cont(gctx, ggml_transpose(gctx, cur));    // [n_patch, dim]
+    t = ggml_reshape_4d(gctx, t, n_side, n_side, dim, 1);
+    t = ggml_conv_2d(gctx, W("mm0.w"), t, 2, 2, 1, 1, 1, 1);         // 52 -> 26
+    t = spatial_bias(t, "mm0.b");
+    t = ggml_reshape_4d(gctx, t, t->ne[0], t->ne[1], t->ne[2], 1);
+    t = ggml_conv_2d(gctx, W("mm1.w"), t, 2, 2, 1, 1, 1, 1);         // 26 -> 13
+    t = spatial_bias(t, "mm1.b");
+
+    const int64_t side = t->ne[0], chn = t->ne[2];
+    t = ggml_reshape_2d(gctx, t, side * side, chn);
+    t = ggml_cont(gctx, ggml_transpose(gctx, t));                    // [chn, n_tokens]
+    cur = ggml_mul_mat(gctx, W("mmfc.w"), t);                        // [proj_dim, n_tokens]
+
+    ggml_set_output(cur); ggml_set_name(cur, "vis_out");
+    ggml_build_forward_expand(gf, cur);
+
+    galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(galloc, gf))
+        throw std::runtime_error("mmproj: graph alloc failed");
+}
+
 // ---- public API -----------------------------------------------------------
 
 VisionEncoder::VisionEncoder() : impl_(new Impl()) {}
@@ -381,18 +659,25 @@ std::vector<float> VisionEncoder::encode_rgb(const uint8_t * rgb, int w_px, int 
             throw std::runtime_error("vision: image resize failed");
     }
 
-    // normalize to (x/255 - 0.5) / 0.5 and im2col into 2x2-block-contiguous
-    // patch order, (ic, ky, kx) within each column
+    // im2col with (ic, ky, kx) within each column. Qwen3-VL wants the patches
+    // in 2x2-block order because its merge is a reshape; step3vl merges with
+    // convolutions and wants them row-major. Normalisation constants likewise
+    // differ: step3vl carries CLIP's in the mmproj, Qwen3-VL uses +-0.5.
+    const bool step3 = im.proj == Impl::Proj::STEP3VL;
     std::vector<float> patches((size_t) K * im.n_patch);
     for (int py = 0; py < N; ++py)
         for (int px = 0; px < N; ++px) {
-            float * col = &patches[(size_t) im.reorder_index(py, px) * K];
+            const int tok = step3 ? (py * N + px) : im.reorder_index(py, px);
+            float * col = &patches[(size_t) tok * K];
             for (int ic = 0; ic < 3; ++ic)
                 for (int ky = 0; ky < P; ++ky)
                     for (int kx = 0; kx < P; ++kx) {
                         const int y = py * P + ky, x = px * P + kx;
                         const uint8_t u = resized[((size_t) y * IS + x) * 3 + ic];
-                        col[ic * P * P + ky * P + kx] = ((float) u / 255.0f - 0.5f) / 0.5f;
+                        const float f = (float) u / 255.0f;
+                        col[ic * P * P + ky * P + kx] = step3
+                            ? (f - im.img_mean[ic]) / im.img_std[ic]
+                            : (f - 0.5f) / 0.5f;
                     }
         }
     return im.forward(patches);
