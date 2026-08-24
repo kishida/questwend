@@ -283,7 +283,13 @@ struct Runtime::Impl {
 
     void init();
     void zero_states();
-    ggml_cgraph * build_graph(ggml_context * ctx, int n_tokens, int n_kv);
+    // logits_all=false computes the output head for the LAST token only. The
+    // head is [n_embd, n_vocab] -- on a large vocabulary it is the single most
+    // expensive matmul in the graph -- and a prefill batch throws away every row
+    // but the last, so paying for all of them is pure waste. MTP verify is the
+    // one caller that really needs every row.
+    ggml_cgraph * build_graph(ggml_context * ctx, int n_tokens, int n_kv,
+                              bool logits_all = true);
     // M-RoPE helpers (no-op when !hp.use_mrope): rope_dim returns the inp_pos
     // length for a graph, apply_rope picks ggml_rope_multi vs ggml_rope_ext,
     // fill_rope_pos computes the per-token (sequential or 2D-grid) positions
@@ -976,7 +982,8 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
     return moe_out;
 }
 
-ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n_kv) {
+ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n_kv,
+                                         bool logits_all) {
     const auto & hp = model.hparams();
     const int n_embd      = hp.n_embd;
     const int n_head      = hp.n_head;
@@ -1090,7 +1097,15 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
         ggml_build_forward_expand(gf, inpL);
     }
 
-    cur = ggml_rms_norm(ctx, inpL, eps);
+    // Narrow to the last token before the output norm when the caller only wants
+    // that row: everything downstream then runs once instead of n_tokens times.
+    ggml_tensor * head_in = inpL;
+    if (!logits_all && n_tokens > 1) {
+        head_in = ggml_cont(ctx, ggml_view_2d(ctx, inpL, n_embd, 1, inpL->nb[1],
+                                              (size_t) (n_tokens - 1) * inpL->nb[1]));
+    }
+
+    cur = ggml_rms_norm(ctx, head_in, eps);
     cur = ggml_mul(ctx, cur, model.tensor("output_norm.weight"));
 
     ggml_tensor * output_w = model.tensor("output.weight");
@@ -3201,7 +3216,8 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     gp.no_alloc = true;
     ggml_context * ctx = ggml_init(gp);
 
-    ggml_cgraph * gf = build_graph(ctx, n_tokens, n_kv);
+    // Prefill/decode only ever reads the last row of the logits.
+    ggml_cgraph * gf = build_graph(ctx, n_tokens, n_kv, /*logits_all=*/false);
 
     if (sched) {
         // Expert offload path: use backend scheduler.
@@ -3258,7 +3274,9 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     ggml_tensor * logits_t = ggml_graph_get_tensor(gf, "logits");
     const int n_vocab = (int) logits_t->ne[0];
     logits.resize(n_vocab);
-    const size_t off = (size_t) (n_tokens - 1) * logits_t->nb[1];
+    // one row when the head was narrowed, n_tokens rows otherwise
+    const int row = logits_t->ne[1] == 1 ? 0 : n_tokens - 1;
+    const size_t off = (size_t) row * logits_t->nb[1];
     ggml_backend_tensor_get(logits_t, logits.data(), off, n_vocab * sizeof(float));
     capture_main_hidden(gf, n_tokens - 1);
 
