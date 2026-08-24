@@ -70,10 +70,14 @@ ChatPrompt build_qwen_prompt(const Tokenizer & tok,
     auto & ids = out.ids;
     auto emit_text = [&](const std::string & s) {
         if (s.empty()) return;
-        const auto v = tok.encode(s, false);
+        const auto v = tok.encode(s, /*add_bos=*/false, /*parse_special=*/false);
         ids.insert(ids.end(), v.begin(), v.end());
     };
     auto emit_tok = [&](int32_t t) { ids.push_back(t); };
+
+    // Models whose GGUF sets tokenizer.ggml.add_bos_token (step35 does; the Qwen
+    // ones do not) want it in front of the whole conversation, not per message.
+    if (tok.wants_bos() && tok.bos() >= 0) emit_tok(tok.bos());
 
     // ---- fallback: base model without ChatML specials (text only) ----
     if (im_start < 0 || im_end < 0) {

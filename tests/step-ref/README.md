@@ -80,6 +80,18 @@ same *key positions*, and `ring_mask_check.py` proves that directly against the
 same formulas the runtime uses -- including that an undersized ring fails, which
 is what the runtime's own size check exists to prevent.
 
+## Tokenizer and chat
+
+Both have exact references here, so they are checked without a second machine:
+
+```
+qw-tokenize -m <step35> -f tok-test.txt      # vs the ids in 03-tokens.txt (97)
+qw-tokenize -m <step35> -c "1たす2は？"       # vs the ids in 02-chat.log  (18)
+```
+
+`03-tokens.txt` was captured with `--no-bos` off, so its first id is the BOS that
+`qw-tokenize -f` does not add; `-c` goes through the chat template and does.
+
 ## Caveats
 
 - **`07-bench.log` is a cold-cache artifact** (tg 17.64 t/s). The identical

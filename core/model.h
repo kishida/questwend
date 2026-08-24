@@ -132,6 +132,7 @@ struct Vocab {
     int32_t bos_id = -1, eos_id = -1, pad_id = -1;
     // tokenizer.ggml.add_bos_token: the Qwen models say false, step35 says true.
     bool                     add_bos = false;
+    std::string              pre;            // tokenizer.ggml.pre ("deepseek-v3", ...)
     std::string              chat_template;
 };
 

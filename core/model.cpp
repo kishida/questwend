@@ -611,6 +611,7 @@ void Model::load_vocab() {
     vocab_.eos_id        = gguf_i32(gguf_, "tokenizer.ggml.eos_token_id", 151645);
     vocab_.pad_id        = gguf_i32(gguf_, "tokenizer.ggml.padding_token_id", -1);
     vocab_.add_bos       = gguf_bool(gguf_, "tokenizer.ggml.add_bos_token", false);
+    vocab_.pre           = gguf_str(gguf_, "tokenizer.ggml.pre", "");
     vocab_.chat_template = gguf_str(gguf_, "tokenizer.chat_template", "");
     if (hp_.n_vocab == 0) hp_.n_vocab = (uint32_t) vocab_.tokens.size();
 }

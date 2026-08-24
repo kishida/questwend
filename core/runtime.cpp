@@ -3383,13 +3383,15 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
         }
 
         // accept: bump LRU/frequency for the resident accesses, then read logits
-        for (int il = 0; il < n_layer; ++il)
-            for (int k = 0; k < n_used; ++k) {
+        for (int il = 0; il < n_layer; ++il) {
+            if (!hp.is_moe_layer(il)) continue;   // dense block: no pools, and
+            for (int k = 0; k < n_used; ++k) {    // sel_all has no row for it
                 const int e = sel_host[(size_t) il * n_used + k];
                 ecache->touch(ExpertCache::GATE, il, e);
                 ecache->touch(ExpertCache::UP,   il, e);
                 ecache->touch(ExpertCache::DOWN, il, e);
             }
+        }
     } else {
         // ---- background refill: keep the frozen palette tracking the input ----
         // The graph recorded what the unmasked router wanted (want_all). Fetch
