@@ -768,6 +768,8 @@ void Runtime::Impl::fill_masks(ggml_cgraph * gf, int n_tokens, int n_kv, int pos
     if (ggml_tensor * t = ggml_graph_get_tensor(gf, "inp_mask"))
         ggml_backend_tensor_set(t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
 
+    // The offload path builds one graph per layer and names its single mask
+    // after that layer's attention type, so a graph may carry only this one.
     ggml_tensor * t_swa = ggml_graph_get_tensor(gf, "inp_mask_swa");
     if (!t_swa) return;
 
@@ -2016,15 +2018,25 @@ ggml_tensor * Runtime::Impl::build_router(ggml_context * ctx, ggml_cgraph * gf, 
     const int n_used = hp.n_expert_used;
 
     ggml_tensor * logits   = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp.weight", il), ffn_in); // [n_exp,1]
-    ggml_tensor * probs    = ggml_soft_max(ctx, logits);
-    ggml_tensor * selected = ggml_argsort_top_k(ctx, probs, n_used);     // [n_used,1] i32
+    // Must mirror build_moe's routing exactly: step35 squashes each logit with a
+    // sigmoid and ranks on probs + a per-expert selection bias, mixing with the
+    // unbiased probs. Diverging here would pick different experts on the offload
+    // path than on the resident one, and nothing would report it.
+    ggml_tensor * probs    = hp.expert_gating_func == 2 ? ggml_sigmoid(ctx, logits)
+                                                       : ggml_soft_max(ctx, logits);
+    ggml_tensor * rank     = probs;
+    if (ggml_tensor * bias = Wopt("blk.%d.exp_probs_b.bias", il))
+        rank = ggml_add(ctx, probs, bias);
+    ggml_tensor * selected = ggml_argsort_top_k(ctx, rank, n_used);      // [n_used,1] i32
 
     ggml_tensor * probs3   = ggml_reshape_3d(ctx, probs, 1, n_exp, 1);
     ggml_tensor * weights  = ggml_get_rows(ctx, probs3, selected);       // [1,n_used,1]
     weights = ggml_reshape_2d(ctx, weights, n_used, 1);
-    ggml_tensor * wsum = ggml_sum_rows(ctx, weights);
-    wsum = ggml_clamp(ctx, wsum, 6.103515625e-5f, INFINITY);
-    weights = ggml_div(ctx, weights, wsum);
+    if (hp.arch != Arch::STEP35 || hp.expert_weights_norm) {
+        ggml_tensor * wsum = ggml_sum_rows(ctx, weights);
+        wsum = ggml_clamp(ctx, wsum, 6.103515625e-5f, INFINITY);
+        weights = ggml_div(ctx, weights, wsum);
+    }
     if (hp.expert_weights_scale != 0.0f && hp.expert_weights_scale != 1.0f)
         weights = ggml_scale(ctx, weights, hp.expert_weights_scale);
 
@@ -2045,7 +2057,7 @@ ggml_tensor * Runtime::Impl::build_moe_cached(ggml_context * ctx, ggml_cgraph * 
     ggml_tensor * x3   = ggml_reshape_3d(ctx, ffn_in, n_embd, 1, 1);
     ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3,  slot_u);
     ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3,  slot_g);
-    ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);              // [ff_exp,n_used,1]
+    ggml_tensor * act  = swiglu_limited(ctx, gate, up, hp.swiglu_limit_exp(il));  // [ff_exp,n_used,1]
     ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, slot_d); // [n_embd,n_used,1]
 
     // weighted sum of the n_used experts as one GEMV
@@ -2058,9 +2070,10 @@ ggml_tensor * Runtime::Impl::build_moe_cached(ggml_context * ctx, ggml_cgraph * 
         ggml_tensor * g  = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), ffn_in);
         ggml_tensor * u  = ggml_mul_mat(ctx, up_sh, ffn_in);
         ggml_tensor * sh = ggml_mul_mat(ctx, W("blk.%d.ffn_down_shexp.weight", il),
-                                        ggml_mul(ctx, ggml_silu(ctx, g), u));
-        ggml_tensor * sg = ggml_sigmoid(ctx, ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp_shexp.weight", il), ffn_in));
-        sh = ggml_mul(ctx, sh, sg);
+                                        swiglu_limited(ctx, g, u, hp.swiglu_limit_shexp(il)));
+        // step35 has no shared-expert gate and adds it unconditionally.
+        if (ggml_tensor * gw = Wopt("blk.%d.ffn_gate_inp_shexp.weight", il))
+            sh = ggml_mul(ctx, sh, ggml_sigmoid(ctx, ggml_mul_mat(ctx, gw, ffn_in)));
         moe_out = ggml_add(ctx, moe_out, sh);
     }
     return moe_out;
@@ -2158,13 +2171,18 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             return ggml_view_2d(ctx, t, t->ne[0], tlen, t->nb[1], (size_t) tc0 * t->nb[1]);
         };
         const int n_kv_c = n_past + tc0 + tlen;
+        const int n_head_l    = (int) hp.head_count(il);      // per-layer on step35
+        const int n_head_kv_l = (int) hp.head_count_kv(il);
         const bool recurrent = hp.is_recurrent(il);
         ggml_tensor * inp_pos = nullptr, * inp_mask = nullptr;
         if (!recurrent) {
             inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rope_dim(tlen));
             ggml_set_input(inp_pos);  ggml_set_name(inp_pos, "inp_pos");
             inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv_c, tlen);
-            ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
+            ggml_set_input(inp_mask);
+            // One graph per layer here, so the layer's attention type picks the
+            // input name and fill_masks() then uploads the matching mask.
+            ggml_set_name(inp_mask, hp.is_swa(il) ? "inp_mask_swa" : "inp_mask");
         }
 
         ggml_tensor * h_c = tslice(h_b);
@@ -2178,22 +2196,22 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             if (gated) {
                 ggml_tensor * Qf = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur);
                 const size_t es = ggml_element_size(Qf);
-                Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head, tlen,
-                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head, 0);
-                gate_t = ggml_view_3d(ctx, Qf, n_embd_head, n_head, tlen,
-                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head, es * n_embd_head);
-                gate_t = ggml_cont_2d(ctx, gate_t, n_embd_head * n_head, tlen);
+                Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head_l, tlen,
+                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head_l, 0);
+                gate_t = ggml_view_3d(ctx, Qf, n_embd_head, n_head_l, tlen,
+                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head_l, es * n_embd_head);
+                gate_t = ggml_cont_2d(ctx, gate_t, n_embd_head * n_head_l, tlen);
                 K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
                 V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
-                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, tlen);
-                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, tlen);
+                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv_l, tlen);
+                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv_l, tlen);
             } else {
                 Q = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur);
                 K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
                 V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
-                Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head,    tlen);
-                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, tlen);
-                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, tlen);
+                Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head_l,    tlen);
+                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv_l, tlen);
+                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv_l, tlen);
             }
             Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il));
             K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il));
@@ -2201,6 +2219,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             K = apply_rope(ctx, K, inp_pos, il);
             ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, tlen, n_kv_c, n_past + tc0);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
+            att = apply_attn_gate(ctx, il, att, cur, n_head_l, tlen);
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
         }
 
@@ -2209,19 +2228,41 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         if (gated) ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", il));
         else       ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il));
 
+        // Leading dense block (step35 blk.0-2): no routed experts, so the layer
+        // finishes here and its seg B is skipped entirely. Returning nullptr is
+        // how the drivers below learn there is nothing to fetch.
+        if (!hp.is_moe_layer(il)) {
+            ggml_tensor * gt = ggml_mul_mat(ctx, W("blk.%d.ffn_gate.weight", il), ffn_in);
+            ggml_tensor * up = ggml_mul_mat(ctx, W("blk.%d.ffn_up.weight",   il), ffn_in);
+            ggml_tensor * ff = ggml_mul_mat(ctx, W("blk.%d.ffn_down.weight", il),
+                                            swiglu_limited(ctx, gt, up, hp.swiglu_limit_exp(il)));
+            ggml_tensor * h_new = ggml_add(ctx, ff, attn_resid);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, tslice(h_b)));
+            return (ggml_tensor *) nullptr;
+        }
+
         // multi-token router
         ggml_tensor * logits = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp.weight", il), ffn_in);  // [n_exp, tlen]
-        ggml_tensor * probs   = ggml_soft_max(ctx, logits);
+        // Same routing as build_moe / build_router: sigmoid + selection bias on
+        // step35, softmax elsewhere. All four copies have to agree or the paths
+        // silently pick different experts.
+        ggml_tensor * probs = hp.expert_gating_func == 2 ? ggml_sigmoid(ctx, logits)
+                                                        : ggml_soft_max(ctx, logits);
+        ggml_tensor * rank  = probs;
+        if (ggml_tensor * bias = Wopt("blk.%d.exp_probs_b.bias", il))
+            rank = ggml_add(ctx, probs, bias);
         // argsort_top_k returns a STRIDED view (nb[1] = n_exp*4); make it contiguous
         // so the [n_used, tlen] host readback (ggml_backend_tensor_get) is not corrupted
         // for columns >= 1 (it ignores strides). Single-token path is T=1 so unaffected.
-        ggml_tensor * selected = ggml_cont(ctx, ggml_argsort_top_k(ctx, probs, n_used));  // [n_used, tlen]
+        ggml_tensor * selected = ggml_cont(ctx, ggml_argsort_top_k(ctx, rank, n_used));  // [n_used, tlen]
         ggml_tensor * probs3  = ggml_reshape_3d(ctx, probs, 1, n_exp, tlen);
         ggml_tensor * weights = ggml_get_rows(ctx, probs3, selected);             // [1, n_used, tlen]
         weights = ggml_reshape_2d(ctx, weights, n_used, tlen);
-        ggml_tensor * wsum = ggml_sum_rows(ctx, weights);
-        wsum = ggml_clamp(ctx, wsum, 6.103515625e-5f, INFINITY);
-        weights = ggml_div(ctx, weights, wsum);
+        if (hp.arch != Arch::STEP35 || hp.expert_weights_norm) {
+            ggml_tensor * wsum = ggml_sum_rows(ctx, weights);
+            wsum = ggml_clamp(ctx, wsum, 6.103515625e-5f, INFINITY);
+            weights = ggml_div(ctx, weights, wsum);
+        }
         if (hp.expert_weights_scale != 0.0f && hp.expert_weights_scale != 1.0f)
             weights = ggml_scale(ctx, weights, hp.expert_weights_scale);
         ggml_set_output(selected);
@@ -2246,7 +2287,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_tensor * x3   = ggml_reshape_3d(ctx, ffn_l, n_embd, 1, len);
         ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3, tslice(slot_u_b));
         ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3, tslice(slot_g_b));
-        ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * act  = swiglu_limited(ctx, gate, up, hp.swiglu_limit_exp(il));
         ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, tslice(slot_d_b)); // [n_embd, n_used, len]
         experts = ggml_mul(ctx, experts, ggml_reshape_3d(ctx, tslice(carry_wgt[il & 1]), 1, n_used, len));
         ggml_tensor * moe_out = nullptr;
@@ -2260,9 +2301,11 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             ggml_tensor * g  = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), ffn_l);
             ggml_tensor * u  = ggml_mul_mat(ctx, up_sh, ffn_l);
             ggml_tensor * sh = ggml_mul_mat(ctx, W("blk.%d.ffn_down_shexp.weight", il),
-                                            ggml_mul(ctx, ggml_silu(ctx, g), u));
-            ggml_tensor * sgt = ggml_sigmoid(ctx, ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp_shexp.weight", il), ffn_l));
-            moe_out = ggml_add(ctx, moe_out, ggml_mul(ctx, sh, sgt));
+                                            swiglu_limited(ctx, g, u, hp.swiglu_limit_shexp(il)));
+            // step35 has no shared-expert gate and adds it unconditionally.
+            if (ggml_tensor * gw = Wopt("blk.%d.ffn_gate_inp_shexp.weight", il))
+                sh = ggml_mul(ctx, sh, ggml_sigmoid(ctx, ggml_mul_mat(ctx, gw, ffn_l)));
+            moe_out = ggml_add(ctx, moe_out, sh);
         }
         ggml_tensor * h_new = ggml_add(ctx, moe_out, tslice(carry_res[il & 1]));  // [n_embd, len]
         ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, tslice(h_b)));
@@ -2285,17 +2328,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                 ggml_backend_tensor_set(ip, pos_all.data() + tc0, 0, (size_t) tlen * sizeof(int32_t));
             }
         }
-        if (ggml_tensor * im = ggml_graph_get_tensor(gf, "inp_mask")) {
-            const int n_kv_c = n_past + tc0 + tlen;
-            std::vector<ggml_fp16_t> mask((size_t) n_kv_c * tlen);
-            const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
-            for (int i = 0; i < tlen; ++i) {
-                const int abs_i = n_past + tc0 + i;
-                for (int j = 0; j < n_kv_c; ++j)
-                    mask[(size_t) i * n_kv_c + j] = (j <= abs_i) ? z : ninf;
-            }
-            ggml_backend_tensor_set(im, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
-        }
+        fill_masks(gf, tlen, n_past + tc0 + tlen, n_past + tc0);
     };
 
     // QWEN_PREFILL_STATS=1 logs, per (chunk,layer), the distinct-expert union and
@@ -2510,10 +2543,12 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                 set_attn_inputs(gf, tc0, tlen);
                 if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
                     throw std::runtime_error("decode_cached_batch: seg A compute failed");
-                ggml_backend_tensor_get(selected, sel.data() + (size_t) tc0 * n_used, 0,
-                                        (size_t) n_used * tlen * sizeof(int32_t));
+                if (selected)
+                    ggml_backend_tensor_get(selected, sel.data() + (size_t) tc0 * n_used, 0,
+                                            (size_t) n_used * tlen * sizeof(int32_t));
                 ggml_free(ctx);
             }
+            if (!hp.is_moe_layer(il)) continue;   // dense block: seg A finished it
             prune_layer(il);
             plan_slices(il);
             const auto s0 = ecache->stats();
@@ -2554,10 +2589,28 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         set_attn_inputs(gf, 0, T);
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("decode_cached_batch: seg A0 compute failed");
-        ggml_backend_tensor_get(selected, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
+        if (selected)
+            ggml_backend_tensor_get(selected, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
         ggml_free(ctx);
     }
     for (int il = 0; il < N; ++il) {
+        if (!hp.is_moe_layer(il)) {
+            // Dense block: seg A already finished it, so there is no seg B to
+            // fuse the next layer's seg A onto -- run that one on its own.
+            if (il + 1 < N) {
+                ggml_context * ctx = new_ctx();
+                ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+                ggml_tensor * nsel = build_segA(ctx, gf, il + 1, 0, T);
+                run(ctx, gf);
+                set_attn_inputs(gf, 0, T);
+                if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+                    throw std::runtime_error("decode_cached_batch: dense seg A compute failed");
+                if (nsel)
+                    ggml_backend_tensor_get(nsel, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
+                ggml_free(ctx);
+            }
+            continue;
+        }
         plan_slices(il);
         const auto s0 = ecache->stats();
         const int nsl = (int) slices.size();
@@ -2721,13 +2774,16 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     // normed FFN input / residual / router weights into the layer's parity carry,
     // and exposes `selected` (router top-k) for host readback. Returns selected.
     auto build_segA = [&](ggml_context * ctx, ggml_cgraph * gf, int il) -> ggml_tensor * {
+        const int n_head_l    = (int) hp.head_count(il);      // per-layer on step35
+        const int n_head_kv_l = (int) hp.head_count_kv(il);
         const bool recurrent = hp.is_recurrent(il);
         ggml_tensor * inp_pos = nullptr, * inp_mask = nullptr;
         if (!recurrent) {
             inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rope_dim(1));
             ggml_set_input(inp_pos);  ggml_set_name(inp_pos, "inp_pos");
             inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, 1);
-            ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
+            ggml_set_input(inp_mask);
+            ggml_set_name(inp_mask, hp.is_swa(il) ? "inp_mask_swa" : "inp_mask");
         }
         ggml_tensor * cur = ggml_rms_norm(ctx, p_h, eps);
         cur = ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il));
@@ -2738,22 +2794,22 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             if (gated) {
                 ggml_tensor * Qf = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur);
                 const size_t es = ggml_element_size(Qf);
-                Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head, 1,
-                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head, 0);
-                gate_t = ggml_view_3d(ctx, Qf, n_embd_head, n_head, 1,
-                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head, es * n_embd_head);
-                gate_t = ggml_cont_2d(ctx, gate_t, n_embd_head * n_head, 1);
+                Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head_l, 1,
+                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head_l, 0);
+                gate_t = ggml_view_3d(ctx, Qf, n_embd_head, n_head_l, 1,
+                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head_l, es * n_embd_head);
+                gate_t = ggml_cont_2d(ctx, gate_t, n_embd_head * n_head_l, 1);
                 K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
                 V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
-                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, 1);
-                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, 1);
+                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv_l, 1);
+                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv_l, 1);
             } else {
                 Q = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur);
                 K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
                 V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
-                Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head,    1);
-                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, 1);
-                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, 1);
+                Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head_l,    1);
+                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv_l, 1);
+                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv_l, 1);
             }
             Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il));
             K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il));
@@ -2761,12 +2817,23 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             K = apply_rope(ctx, K, inp_pos, il);
             ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, 1, n_kv);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
+            att = apply_attn_gate(ctx, il, att, cur, n_head_l, 1);
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
         }
         ggml_tensor * attn_resid = ggml_add(ctx, cur, p_h);
         ggml_tensor * ffn_in;
         if (gated) ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", il));
         else       ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il));
+        if (!hp.is_moe_layer(il)) {
+            // Leading dense block: no experts, so there is no seg B for it.
+            ggml_tensor * gt = ggml_mul_mat(ctx, W("blk.%d.ffn_gate.weight", il), ffn_in);
+            ggml_tensor * up = ggml_mul_mat(ctx, W("blk.%d.ffn_up.weight",   il), ffn_in);
+            ggml_tensor * ff = ggml_mul_mat(ctx, W("blk.%d.ffn_down.weight", il),
+                                            swiglu_limited(ctx, gt, up, hp.swiglu_limit_exp(il)));
+            ggml_tensor * h_new = ggml_add(ctx, ff, attn_resid);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, h_new, n_embd), p_h));
+            return (ggml_tensor *) nullptr;
+        }
         ggml_tensor * weights = nullptr;
         ggml_tensor * selected = build_router(ctx, gf, il, ffn_in, weights);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, carry_ffn[il & 1]));
@@ -2789,12 +2856,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             fill_rope_pos(posv, 1, mrope_next);
             ggml_backend_tensor_set(ip, posv.data(), 0, posv.size() * sizeof(int32_t));
         }
-        if (ggml_tensor * im = ggml_graph_get_tensor(gf, "inp_mask")) {
-            std::vector<ggml_fp16_t> mask(n_kv);
-            const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
-            for (int j = 0; j < n_kv; ++j) mask[j] = (j <= n_past) ? z : ninf;
-            ggml_backend_tensor_set(im, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
-        }
+        fill_masks(gf, 1, n_kv, n_past);
     };
     // Read back layer `il`'s router selection and make those experts resident.
     auto ensure_layer = [&](ggml_tensor * selected, int il) {
@@ -2816,13 +2878,15 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         run(ctx, gf);
         set_attn_inputs(gf);
         compute(gf, "seg A0 compute failed");
-        ensure_layer(selected, 0);
+        if (selected) ensure_layer(selected, 0);
         ggml_free(ctx);
     }
     for (int il = 0; il < N; ++il) {
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-        build_segB(ctx, gf, il);
+        // A dense block finished inside its own seg A, so it has no seg B; the
+        // next layer's seg A then runs alone instead of fused onto one.
+        if (hp.is_moe_layer(il)) build_segB(ctx, gf, il);
         ggml_tensor * nsel = (il + 1 < N) ? build_segA(ctx, gf, il + 1) : nullptr;
         run(ctx, gf);
         set_attn_inputs(gf);

@@ -125,6 +125,9 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
             for (int il = 0; il < n_layer; ++il) {
                 char name[256];
                 snprintf(name, sizeof(name), role_fmt((Role) r), il);
+                // Leading dense blocks (step35) have no expert tensors at all;
+                // asking for their file offset would throw.
+                if (!model.tensor(name)) continue;
                 foff_[r][il]  = model.tensor_file_offset(name);
                 fpath_[r][il] = model.tensor_file(name);
             }
@@ -140,8 +143,10 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
         layer_pool_[r].assign(n_layer, -1);
         for (int il = 0; il < n_layer; ++il) {
             ggml_tensor * t = role_tensor(model, (Role) r, il);
-            if (!t) throw std::runtime_error("ExpertCache: missing expert tensor (role " +
-                                             std::to_string(r) + ", layer " + std::to_string(il) + ")");
+            // A dense block has no routed experts. Leave layer_pool_ at -1 (the
+            // "not served" sentinel the Pool::quota vector already documents)
+            // and let every consumer skip it via serves().
+            if (!t) continue;
             int idx = -1;
             for (int s = 0; s < (int) sigs.size(); ++s) {
                 if (sigs[s].role == r && sigs[s].type == (int) t->type &&
@@ -157,6 +162,12 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
             layer_pool_[r][il] = idx;
         }
     }
+    for (int il = 0; il < n_layer; ++il)
+        if (serves(il)) moe_layers_.push_back(il);
+    if (moe_layers_.empty()) throw std::runtime_error("ExpertCache: model has no routed experts");
+    if ((int) moe_layers_.size() != n_layer)
+        fprintf(stderr, "expert cache: %zu of %d layers have routed experts (%d dense)\n",
+                moe_layers_.size(), n_layer, n_layer - (int) moe_layers_.size());
 
     // ---- size each pool: uniform residency fraction across all experts ----
     size_t total_bytes = 0;
@@ -294,6 +305,7 @@ int ExpertCache::min_slots() const {
 }
 
 int ExpertCache::capacity(int layer) const {
+    if (!serves(layer)) return n_expert_;   // dense block: nothing to bound
     int m = INT32_MAX;
     for (int r = 0; r < N_ROLE; ++r) {
         const Pool & p = pools_[layer_pool_[r][layer]];
@@ -308,6 +320,7 @@ int ExpertCache::capacity(int layer) const {
 }
 
 int ExpertCache::quota_of(int layer) const {
+    if (!serves(layer)) return n_expert_;
     int m = INT32_MAX;
     for (int r = 0; r < N_ROLE; ++r) {
         const Pool & p = pools_[layer_pool_[r][layer]];
@@ -355,7 +368,7 @@ void ExpertCache::compute_quota(std::vector<int> & quota) const {
 
     // Correctness floor first: every layer must be able to hold one token's
     // selection, or a single ensure() evicts its own slots.
-    for (int il = 0; il < n_layer_; ++il)
+    for (int il : moe_layers_)
         while (quota[il] < n_used_ && take(il)) quota[il]++;
 
     // Then the miss-minimising greedy: a slot is worth the accesses it serves,
@@ -399,7 +412,7 @@ void ExpertCache::rebalance(size_t fill_budget) {
     std::vector<int> seen(n_layer_, 0);
 
     size_t moved = 0;
-    for (int il = 0; il < n_layer_; ++il)
+    for (int il : moe_layers_)
         for (int r = 0; r < N_ROLE; ++r) {
             Pool & pool = pools_[layer_pool_[r][il]];
             if (pool.quota[il] != quota[il]) { pool.quota[il] = quota[il]; ++moved; }
@@ -416,7 +429,7 @@ void ExpertCache::rebalance(size_t fill_budget) {
     for (const auto & e : ents) {
         if (filled >= fill_budget) break;
         const int key = e.second, il = key / n_expert_, ex = key % n_expert_;
-        if (seen[il] >= quota[il]) continue;
+        if (!serves(il) || seen[il] >= quota[il]) continue;
         seen[il]++;
         bool all = true;
         for (int r = 0; r < N_ROLE; ++r)
@@ -431,7 +444,7 @@ void ExpertCache::rebalance(size_t fill_budget) {
 
     ggml_backend_synchronize(backend_);
     int qmin = n_expert_, qmax = 0;
-    for (int il = 0; il < n_layer_; ++il) { qmin = std::min(qmin, quota[il]); qmax = std::max(qmax, quota[il]); }
+    for (int il : moe_layers_) { qmin = std::min(qmin, quota[il]); qmax = std::max(qmax, quota[il]); }
     fprintf(stderr, "expert cache: per-layer quotas on (%zu role-quotas set, range %d..%d experts), "
                     "%zu experts prefetched into the new shape\n", moved, qmin, qmax, filled);
     if (getenv("QWEN_LAYER_QUOTA_DUMP")) {

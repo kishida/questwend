@@ -155,6 +155,11 @@ private:
     // A reserved-but-not-yet-loaded slot fetch (used for parallel SSD reads).
     struct FetchJob { Pool * pool; int role; int expert; int slot; };
 
+    // Does this layer own slots? False for a leading dense block (step35), whose
+    // layer_pool_ entries stay at the -1 sentinel -- every loop over layers must
+    // go through moe_layers_ or check this, or it indexes pools_[-1].
+    bool serves(int layer) const { return layer_pool_[0][layer] >= 0; }
+
     int  install(Pool & pool, int key, int layer, int expert, Role role); // fetch into a free/LRU slot
     int  slot_for(Pool & pool, int layer, int expert, Role role);
     int  reserve_victim(Pool & pool, int key);   // evict + claim a slot, no fetch
@@ -164,6 +169,8 @@ private:
     void fetch_slab(Role role, int layer, int expert, ggml_tensor * dst, int slot);
     void fetch_parallel(int layer, std::vector<FetchJob> & jobs);  // SSD: parallel pread + serial H2D
     uint8_t * host_of(const ggml_tensor * t) const;  // pool host ptr for a slot tensor (or null)
+
+    std::vector<int> moe_layers_;   // layers that actually have routed experts
 
     Model &        model_;
     ggml_backend_t backend_ = nullptr;   // GPU backend (for async H2D on its stream)
