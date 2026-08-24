@@ -54,8 +54,14 @@ def main():
                          "kernels, so bit equality is not expected)")
     a = ap.parse_args()
 
-    ref = parse_ref(a.ref)
-    qw = dict(parse_qw(a.qw))
+    # Either side may be a llama-debug capture or a qw_dump capture, so that two
+    # qwencpp runs (resident vs offload, Metal vs CPU) can be diffed the same way.
+    def load(path):
+        r = parse_ref(path)
+        return r if r else parse_qw(path)
+
+    ref = load(a.ref)
+    qw = dict(load(a.qw))
     if not ref:
         sys.exit("no reference tensors parsed from " + a.ref)
     if not qw:

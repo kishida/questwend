@@ -2186,8 +2186,14 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         }
 
         ggml_tensor * h_c = tslice(h_b);
+        // h_c is a view of the persistent carry buffer, which this same graph
+        // overwrites with the layer's output -- dumping it directly would read
+        // back l_out. Copy it when (and only when) the dump is on.
+        // ...and the copy has to be forced into the graph, or it is never computed.
+        if (dump_wants(il))
+            ggml_build_forward_expand(gf, dbg(ggml_cont(ctx, h_c), "attn_norm_in", il));
         ggml_tensor * cur = ggml_rms_norm(ctx, h_c, eps);
-        cur = ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il));
+        cur = dbg(ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il)), "attn_norm", il);
 
         if (recurrent) {
             cur = build_gdn(ctx, gf, il, cur, tlen);
@@ -2206,27 +2212,28 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                 K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv_l, tlen);
                 V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv_l, tlen);
             } else {
-                Q = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur);
-                K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
-                V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
+                Q = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur), "Qcur", il);
+                K = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur), "Kcur", il);
+                V = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur), "Vcur", il);
                 Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head_l,    tlen);
                 K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv_l, tlen);
                 V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv_l, tlen);
             }
-            Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il));
-            K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il));
-            Q = apply_rope(ctx, Q, inp_pos, il);
-            K = apply_rope(ctx, K, inp_pos, il);
+            Q = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il)), "Qcur_normed", il);
+            K = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il)), "Kcur_normed", il);
+            Q = dbg(apply_rope(ctx, Q, inp_pos, il), "Qcur_pos", il);
+            K = dbg(apply_rope(ctx, K, inp_pos, il), "Kcur_pos", il);
             ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, tlen, n_kv_c, n_past + tc0);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
-            att = apply_attn_gate(ctx, il, att, cur, n_head_l, tlen);
-            cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
+            dbg(att, "attn_out", il);
+            att = dbg(apply_attn_gate(ctx, il, att, cur, n_head_l, tlen), "attn_gated", il);
+            cur = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att), "attn_proj", il);
         }
 
-        ggml_tensor * attn_resid = ggml_add(ctx, cur, h_c);          // [n_embd, tlen]
+        ggml_tensor * attn_resid = dbg(ggml_add(ctx, cur, h_c), "ffn_inp", il);   // [n_embd, tlen]
         ggml_tensor * ffn_in;
         if (gated) ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", il));
-        else       ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il));
+        else       ffn_in = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il)), "ffn_norm", il);
 
         // Leading dense block (step35 blk.0-2): no routed experts, so the layer
         // finishes here and its seg B is skipped entirely. Returning nullptr is
@@ -2236,7 +2243,8 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             ggml_tensor * up = ggml_mul_mat(ctx, W("blk.%d.ffn_up.weight",   il), ffn_in);
             ggml_tensor * ff = ggml_mul_mat(ctx, W("blk.%d.ffn_down.weight", il),
                                             swiglu_limited(ctx, gt, up, hp.swiglu_limit_exp(il)));
-            ggml_tensor * h_new = ggml_add(ctx, ff, attn_resid);
+            dbg(ff, "ffn_out", il);
+            ggml_tensor * h_new = dbg(ggml_add(ctx, ff, attn_resid), "l_out", il);
             ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, tslice(h_b)));
             return (ggml_tensor *) nullptr;
         }
@@ -2248,9 +2256,11 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         // silently pick different experts.
         ggml_tensor * probs = hp.expert_gating_func == 2 ? ggml_sigmoid(ctx, logits)
                                                         : ggml_soft_max(ctx, logits);
+        dbg(logits, "ffn_moe_logits", il);
+        dbg(probs,  "ffn_moe_probs",  il);
         ggml_tensor * rank  = probs;
         if (ggml_tensor * bias = Wopt("blk.%d.exp_probs_b.bias", il))
-            rank = ggml_add(ctx, probs, bias);
+            rank = dbg(ggml_add(ctx, probs, bias), "ffn_moe_probs_biased", il);
         // argsort_top_k returns a STRIDED view (nb[1] = n_exp*4); make it contiguous
         // so the [n_used, tlen] host readback (ggml_backend_tensor_get) is not corrupted
         // for columns >= 1 (it ignores strides). Single-token path is T=1 so unaffected.
@@ -2265,6 +2275,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         }
         if (hp.expert_weights_scale != 0.0f && hp.expert_weights_scale != 1.0f)
             weights = ggml_scale(ctx, weights, hp.expert_weights_scale);
+        dbg(weights, "ffn_moe_weights_scaled", il);
         ggml_set_output(selected);
         ggml_build_forward_expand(gf, selected);
 
@@ -2296,6 +2307,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             moe_out = i ? ggml_add(ctx, moe_out, v) : v;
         }
         if (n_used == 1) moe_out = ggml_cont(ctx, moe_out);
+        dbg(moe_out, "ffn_moe_out", il);
 
         if (ggml_tensor * up_sh = Wopt("blk.%d.ffn_up_shexp.weight", il)) {
             ggml_tensor * g  = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), ffn_l);
@@ -2305,9 +2317,10 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             // step35 has no shared-expert gate and adds it unconditionally.
             if (ggml_tensor * gw = Wopt("blk.%d.ffn_gate_inp_shexp.weight", il))
                 sh = ggml_mul(ctx, sh, ggml_sigmoid(ctx, ggml_mul_mat(ctx, gw, ffn_l)));
-            moe_out = ggml_add(ctx, moe_out, sh);
+            dbg(sh, "ffn_shared_out", il);
+            moe_out = dbg(ggml_add(ctx, moe_out, sh), "ffn_out", il);
         }
-        ggml_tensor * h_new = ggml_add(ctx, moe_out, tslice(carry_res[il & 1]));  // [n_embd, len]
+        ggml_tensor * h_new = dbg(ggml_add(ctx, moe_out, tslice(carry_res[il & 1])), "l_out", il);  // [n_embd, len]
         ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, tslice(h_b)));
     };
 
@@ -2543,6 +2556,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                 set_attn_inputs(gf, tc0, tlen);
                 if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
                     throw std::runtime_error("decode_cached_batch: seg A compute failed");
+                dump_flush("segA");
                 if (selected)
                     ggml_backend_tensor_get(selected, sel.data() + (size_t) tc0 * n_used, 0,
                                             (size_t) n_used * tlen * sizeof(int32_t));
@@ -2573,6 +2587,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                 run(ctx, gf);
                 if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
                     throw std::runtime_error("decode_cached_batch: seg B compute failed");
+                dump_flush("segB");
                 ggml_free(ctx);
             }
             log_layer(il, nsl, s0);
@@ -2589,6 +2604,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         set_attn_inputs(gf, 0, T);
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("decode_cached_batch: seg A0 compute failed");
+                dump_flush("segA");
         if (selected)
             ggml_backend_tensor_get(selected, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
         ggml_free(ctx);
@@ -2605,6 +2621,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                 set_attn_inputs(gf, 0, T);
                 if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
                     throw std::runtime_error("decode_cached_batch: dense seg A compute failed");
+                dump_flush("segA");
                 if (nsel)
                     ggml_backend_tensor_get(nsel, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
                 ggml_free(ctx);
@@ -2625,6 +2642,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             set_attn_inputs(gf, 0, T);
             if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
                 throw std::runtime_error("decode_cached_batch: fused segB/segA compute failed");
+                dump_flush("segBA");
             if (nsel)
                 ggml_backend_tensor_get(nsel, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
             ggml_free(ctx);
@@ -2656,7 +2674,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
         ggml_tensor * last = ggml_view_2d(ctx, h_b, n_embd, 1, h_b->nb[1], (size_t) (T - 1) * h_b->nb[1]);
         ggml_tensor * cur = ggml_rms_norm(ctx, last, eps);
-        cur = ggml_mul(ctx, cur, model.tensor("output_norm.weight"));
+        cur = dbg(ggml_mul(ctx, cur, model.tensor("output_norm.weight")), "result_norm", -1);
         ggml_tensor * output_w = model.tensor("output.weight");
         if (!output_w) output_w = model.tensor("token_embd.weight");
         cur = ggml_mul_mat(ctx, output_w, cur);
@@ -2668,6 +2686,8 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         const int n_vocab = (int) cur->ne[0];
         logits.resize(n_vocab);
         ggml_backend_tensor_get(cur, logits.data(), 0, n_vocab * sizeof(float));
+        dbg(cur, "result_output", -1);
+        dump_flush("out");
         ggml_free(ctx);
     }
 

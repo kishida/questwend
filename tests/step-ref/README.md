@@ -33,6 +33,26 @@ like `-3$` matches nothing -- it becomes `^-3$`.
 `--save-logits` disables the tensor callback entirely, so `04` and `05` have to
 be separate runs.
 
+## Comparing a qwencpp run
+
+`QWEN_DUMP_LAYERS=0,3,44` makes qw-cli pin the same intermediates and print the
+same labels, so `cmp.py` diffs the two mechanically (it reads either format on
+either side, so two qwencpp runs can also be compared against each other):
+
+```
+python cmp.py 04-tensors.log 13-qw-offload.log
+```
+
+`13-qw-offload.log` is the offload path (`--vram-budget 20 --experts-ssd`, CPU
+backend) against the same GGUF. Two facts worth keeping:
+
+- Re-running it at a different budget (29% vs ~10% residency) gives **62/62
+  identical sums**. The expert cache decides where a weight comes from, never
+  what it is, and this is the check that says so.
+- Its remaining deltas are no larger than those between the Metal and CPU
+  backends running the *same* qwencpp code, so they are kernel noise rather than
+  a fault in the offload graphs. Layer 0 agrees to 8e-7.
+
 ## Caveats
 
 - **`07-bench.log` is a cold-cache artifact** (tg 17.64 t/s). The identical
