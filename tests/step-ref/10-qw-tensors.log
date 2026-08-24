@@ -1,0 +1,83 @@
+gguf: 3 shards, 754 tensors total
+arch          = step35
+n_layer       = 45
+n_embd        = 4096
+n_ff          = 11264
+n_head        = 96 (kv=8, per-layer)
+n_embd_head   = 128
+n_ctx_train   = 262144
+n_vocab       = 128896
+rope_freq_base= 5e+06
+rms_eps       = 1e-05
+n_expert      = 288 (used=8, ff_exp=1280)
+SWA           = 512 (33/45 layers, rope_base_swa=10000)
+n_rot         = 64 full / 128 swa
+dense_lead    = 3 (ff_shexp=1280, gating=sigmoid, norm=yes, scale=3)
+tensors       = 754
+vocab tokens  = 128896
+bos/eos       = 0/128007
+backend: GPU [MTL0] Apple M3 Ultra
+token_embd: q4_K natively supported by backend get_rows (no fallback copy)
+qw_dump[decode]:               attn_norm_in-0 = {4096, 6, 1, 1} sum = 1.825022
+qw_dump[decode]:                  attn_norm-0 = {4096, 6, 1, 1} sum = 186.364755
+qw_dump[decode]:                       Qcur-0 = {8192, 6, 1, 1} sum = -1329.265151
+qw_dump[decode]:                       Kcur-0 = {1024, 6, 1, 1} sum = -831.790111
+qw_dump[decode]:                       Vcur-0 = {1024, 6, 1, 1} sum = -32.581735
+qw_dump[decode]:                Qcur_normed-0 = {128, 64, 6, 1} sum = -1058.798760
+qw_dump[decode]:                Kcur_normed-0 = {128, 8, 6, 1} sum = -349.255691
+qw_dump[decode]:                   Qcur_pos-0 = {128, 64, 6, 1} sum = -761.119869
+qw_dump[decode]:                   Kcur_pos-0 = {128, 8, 6, 1} sum = -337.319991
+qw_dump[decode]:                   attn_out-0 = {8192, 6, 1, 1} sum = -1396.545665
+qw_dump[decode]:                 attn_gated-0 = {8192, 6, 1, 1} sum = -24.773885
+qw_dump[decode]:                  attn_proj-0 = {4096, 6, 1, 1} sum = 13.514484
+qw_dump[decode]:                    ffn_inp-0 = {4096, 6, 1, 1} sum = 15.339507
+qw_dump[decode]:                   ffn_norm-0 = {4096, 6, 1, 1} sum = -45.959295
+qw_dump[decode]:                    ffn_out-0 = {4096, 6, 1, 1} sum = -91.551787
+qw_dump[decode]:                      l_out-0 = {4096, 6, 1, 1} sum = -76.212280
+qw_dump[decode]:               attn_norm_in-3 = {4096, 6, 1, 1} sum = -1503.441223
+qw_dump[decode]:                  attn_norm-3 = {4096, 6, 1, 1} sum = 50.648051
+qw_dump[decode]:                       Qcur-3 = {12288, 6, 1, 1} sum = -1380.220795
+qw_dump[decode]:                       Kcur-3 = {1024, 6, 1, 1} sum = -73.273371
+qw_dump[decode]:                       Vcur-3 = {1024, 6, 1, 1} sum = 6.665557
+qw_dump[decode]:                Qcur_normed-3 = {128, 96, 6, 1} sum = -2429.621175
+qw_dump[decode]:                Kcur_normed-3 = {128, 8, 6, 1} sum = 0.181666
+qw_dump[decode]:                   Qcur_pos-3 = {128, 96, 6, 1} sum = -3231.828442
+qw_dump[decode]:                   Kcur_pos-3 = {128, 8, 6, 1} sum = -193.071717
+qw_dump[decode]:                   attn_out-3 = {12288, 6, 1, 1} sum = 262.776389
+qw_dump[decode]:                 attn_gated-3 = {12288, 6, 1, 1} sum = -14.034088
+qw_dump[decode]:                  attn_proj-3 = {4096, 6, 1, 1} sum = -130.643578
+qw_dump[decode]:                    ffn_inp-3 = {4096, 6, 1, 1} sum = -1634.084840
+qw_dump[decode]:                   ffn_norm-3 = {4096, 6, 1, 1} sum = -13.910673
+qw_dump[decode]:             ffn_moe_logits-3 = {288, 6, 1, 1} sum = -3363.689485
+qw_dump[decode]:              ffn_moe_probs-3 = {288, 6, 1, 1} sum = 352.346945
+qw_dump[decode]:       ffn_moe_probs_biased-3 = {288, 6, 1, 1} sum = 15440.704434
+qw_dump[decode]:     ffn_moe_weights_scaled-3 = {1, 8, 6, 1} sum = 18.000000
+qw_dump[decode]:             ffn_shared_out-3 = {4096, 6, 1, 1} sum = -437.906777
+qw_dump[decode]:                ffn_moe_out-3 = {4096, 6, 1, 1} sum = -438.460926
+qw_dump[decode]:                    ffn_out-3 = {4096, 6, 1, 1} sum = -438.460926
+qw_dump[decode]:                      l_out-3 = {4096, 6, 1, 1} sum = -2072.545836
+qw_dump[decode]:              attn_norm_in-44 = {4096, 6, 1, 1} sum = 7605.104502
+qw_dump[decode]:                 attn_norm-44 = {4096, 6, 1, 1} sum = 355.247720
+qw_dump[decode]:                      Qcur-44 = {8192, 6, 1, 1} sum = 228.583767
+qw_dump[decode]:                      Kcur-44 = {1024, 6, 1, 1} sum = -413.151780
+qw_dump[decode]:                      Vcur-44 = {1024, 6, 1, 1} sum = 67.989516
+qw_dump[decode]:               Qcur_normed-44 = {128, 64, 6, 1} sum = -334.325603
+qw_dump[decode]:               Kcur_normed-44 = {128, 8, 6, 1} sum = -63.965558
+qw_dump[decode]:                  Qcur_pos-44 = {128, 64, 6, 1} sum = -296.909815
+qw_dump[decode]:                  Kcur_pos-44 = {128, 8, 6, 1} sum = -31.422257
+qw_dump[decode]:                  attn_out-44 = {8192, 6, 1, 1} sum = -707.057011
+qw_dump[decode]:                attn_gated-44 = {8192, 6, 1, 1} sum = -372.174698
+qw_dump[decode]:                 attn_proj-44 = {4096, 6, 1, 1} sum = 829.817521
+qw_dump[decode]:                   ffn_inp-44 = {4096, 6, 1, 1} sum = 8434.922050
+qw_dump[decode]:                  ffn_norm-44 = {4096, 6, 1, 1} sum = 459.130952
+qw_dump[decode]:            ffn_moe_logits-44 = {288, 6, 1, 1} sum = -7035.873867
+qw_dump[decode]:             ffn_moe_probs-44 = {288, 6, 1, 1} sum = 88.598382
+qw_dump[decode]:      ffn_moe_probs_biased-44 = {288, 6, 1, 1} sum = 8587.461802
+qw_dump[decode]:    ffn_moe_weights_scaled-44 = {1, 8, 6, 1} sum = 18.000000
+qw_dump[decode]:            ffn_shared_out-44 = {4096, 6, 1, 1} sum = 9070.753357
+qw_dump[decode]:               ffn_moe_out-44 = {4096, 6, 1, 1} sum = 10792.698999
+qw_dump[decode]:                   ffn_out-44 = {4096, 6, 1, 1} sum = 10792.698999
+qw_dump[decode]:                     l_out-44 = {4096, 6, 1, 1} sum = 19227.621084
+qw_dump[decode]:                  result_norm = {4096, 6, 1, 1} sum = 1536.574989
+qw_dump[decode]:                result_output = {128896, 6, 1, 1} sum = -767326.469644
+The capital of France is Paris

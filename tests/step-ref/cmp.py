@@ -7,6 +7,10 @@ Both sides print one whole-tensor sum per named intermediate, and the names
 match (qwencpp's dbg() copies llama.cpp's cb() labels). The first genuine
 divergence is what the implementation got wrong -- every later tensor inherits
 it -- so read the top MISMATCH line and ignore the cascade below it.
+
+Caveat: a sum that sits near zero (heavy cancellation across the tensor) has a
+huge *relative* error for a negligible absolute one. Read the abs column before
+believing a MISMATCH on a small sum.
 """
 import argparse, io, re, sys
 
@@ -71,7 +75,8 @@ def main():
         bad += 1
         if first_bad is None:
             first_bad = name
-        print("MISMATCH %-30s ref %16.6f   qw %16.6f   rel %8.4f" % (name, rv, qv, rel))
+        print("MISMATCH %-26s ref %15.6f  qw %15.6f  rel %7.4f  abs %12.6f"
+              % (name, rv, qv, rel, abs(rv - qv)))
 
     print()
     print("matched %d, mismatched %d, missing from qw %d (of %d reference tensors)"

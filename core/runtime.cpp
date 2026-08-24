@@ -1113,6 +1113,10 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
         }
     }
 
+    // llama.cpp reserves "ffn_moe_out" for the routed experts alone and calls the
+    // routed + shared sum "ffn_out"; dump here so the two captures line up.
+    dbg(moe_out, "ffn_moe_out", il);
+
     // shared expert (qwen35moe / qwen3next): gated SwiGLU added to the MoE output
     if (ggml_tensor * up_sh = Wopt("blk.%d.ffn_up_shexp.weight", il)) {
         ggml_tensor * g  = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), x);
@@ -1126,7 +1130,6 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
         dbg(sh, "ffn_shared_out", il);
         moe_out = ggml_add(ctx, moe_out, sh);
     }
-    dbg(moe_out, "ffn_moe_out", il);
     return moe_out;
 }
 
