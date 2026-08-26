@@ -1,5 +1,6 @@
 #include "runtime.h"
 #include "model.h"
+#include "ngram_table.h"
 #include "expert_cache.h"
 
 #include "ggml.h"
@@ -278,6 +279,18 @@ struct Runtime::Impl {
     std::vector<ggml_tensor *> v_cache;     // [n_embd_gqa, n_ctx]  (attention layers, non-transposed)
     std::vector<ggml_tensor *> conv_state;  // [d_conv-1, conv_ch]  (GDN layers)
     std::vector<ggml_tensor *> ssm_state;   // [S, S, H_v]          (GDN layers)
+    // qwen4exp PLE: the module's own dilated-conv history, kept per PLE layer
+    // and shaped like conv_state -- tokens on ne[0] so a batch concatenates.
+    std::vector<ggml_tensor *> ple_conv_state;  // [(K-1)*ngram, hc_dim]
+
+    // The n-gram table lives outside every backend buffer (see ngram_table.h).
+    // ngram_hist carries the tokens preceding the current batch so a chunked
+    // prefill and a token-at-a-time decode hash the same context a single-shot
+    // pass would; it is cleared by reset() alongside the KV.
+    std::unique_ptr<NgramTable> ngram;
+    std::vector<int32_t> ngram_hist;
+    std::vector<int32_t> ngram_rows;    // scratch: n_heads row indices per token
+    std::vector<float>   ngram_embd;    // scratch: the gathered rows, F32
 
     ggml_gallocr_t galloc = nullptr;
 
@@ -461,6 +474,14 @@ struct Runtime::Impl {
         if (!t) throw std::runtime_error(std::string("missing tensor: ") + name);
         return t;
     }
+    // Is the PLE module part of the graph? False for a model without one and
+    // for --ngram off, which is what makes that flag a graph-level switch
+    // rather than just a storage choice.
+    bool use_ple() const {
+        return ngram && ngram->mode() != NgramTable::Mode::OFF &&
+               model.hparams().has_ple();
+    }
+
     ggml_tensor * Wopt(const char * fmt, int il) {
         char name[256];
         snprintf(name, sizeof(name), fmt, il);
@@ -521,6 +542,10 @@ struct Runtime::Impl {
                                ggml_tensor ** inject);
     ggml_tensor * build_hc_combine(ggml_context * ctx, ggml_tensor * res_hc,
                                    ggml_tensor * block_out, ggml_tensor * inject);
+    // qwen4exp PLE. `emb` is the host-gathered n-gram rows [n_embd, n_tokens].
+    ggml_tensor * build_ple(ggml_context * ctx, ggml_cgraph * gf, int il,
+                            ggml_tensor * res_hc, ggml_tensor * emb, int n_tokens);
+    void fill_ple_input(ggml_cgraph * gf, const int32_t * tokens, int n_tokens);
     ggml_tensor * build_moe(ggml_context * ctx, ggml_cgraph * gf, int il,
                             ggml_tensor * x, int n_tokens);
     const std::vector<float> & decode(const std::vector<int32_t> & tokens);
@@ -780,8 +805,27 @@ void Runtime::Impl::init() {
     const int S       = hp.ssm_d_state;
     const int H_v     = hp.ssm_dt_rank;
 
+    // The n-gram table is deliberately built after the weights: it is not one of
+    // them. No backend buffer holds it in any mode.
+    {
+        NgramTable::Mode m = NgramTable::Mode::DISK;
+        if (!NgramTable::parse_mode(cfg.ngram_mode, m)) {
+            throw std::runtime_error("--ngram: expected off, disk or ram, got '"
+                                     + cfg.ngram_mode + "'");
+        }
+        ngram.reset(new NgramTable(model, m, cfg.ngram_cache_mb));
+        if (hp.has_ple()) {
+            fprintf(stderr, "ngram: %s", NgramTable::mode_name(ngram->mode()));
+            if (ngram->mode() == NgramTable::Mode::OFF) {
+                fprintf(stderr, " (n-gram embedding disabled)\n");
+            } else {
+                fprintf(stderr, " (%zu MB resident)\n", ngram->resident_bytes() >> 20);
+            }
+        }
+    }
+
     ggml_init_params kp{};
-    kp.mem_size   = (size_t) ggml_tensor_overhead() * n_layer * 4 + 4096;
+    kp.mem_size   = (size_t) ggml_tensor_overhead() * n_layer * 5 + 4096;
     kp.no_alloc   = true;
     st_ctx = ggml_init(kp);
 
@@ -789,6 +833,7 @@ void Runtime::Impl::init() {
     v_cache.assign(n_layer, nullptr);
     conv_state.assign(n_layer, nullptr);
     ssm_state.assign(n_layer, nullptr);
+    ple_conv_state.assign(n_layer, nullptr);
 
     for (int il = 0; il < n_layer; ++il) {
         if (hp.is_recurrent(il)) {
@@ -807,6 +852,12 @@ void Runtime::Impl::init() {
             ggml_set_name(k_cache[il], ("k_" + std::to_string(il)).c_str());
             ggml_set_name(v_cache[il], ("v_" + std::to_string(il)).c_str());
         }
+        // independent of the attention/GDN split: a PLE layer can be either
+        if (use_ple() && hp.is_ple(il)) {
+            ple_conv_state[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F32,
+                    hp.ple_conv_state(), hp.n_embd_hc());
+            ggml_set_name(ple_conv_state[il], ("ple_conv_" + std::to_string(il)).c_str());
+        }
     }
     // A layer's KV / recurrent state must live on the device that computes the
     // layer, so with a split the one state buffer becomes one per device.
@@ -821,6 +872,7 @@ void Runtime::Impl::init() {
                 if ((size_t) dev_of(il) != d) continue;
                 if (k_cache[il])    { ts.push_back(k_cache[il]);    ts.push_back(v_cache[il]); }
                 if (conv_state[il]) { ts.push_back(conv_state[il]); ts.push_back(ssm_state[il]); }
+                if (ple_conv_state[il]) ts.push_back(ple_conv_state[il]);
             }
             st_bufs[d] = alloc_tensor_list(ggml_backend_get_default_buffer_type(gpus[d]),
                                            ts, "state buffer");
@@ -834,6 +886,15 @@ void Runtime::Impl::init() {
     }
     // A sched no longer implies offload: a multi-GPU resident model has one too,
     // and it has no expert cache to build.
+    // The expert-offload paths (layer-major prefill, fused decode) build their
+    // own graphs and do not carry the PLE module yet. Say so instead of quietly
+    // dropping a branch of the model: the numbers would look plausible.
+    if ((use_expert_offload || ssd_mode) && use_ple()) {
+        throw std::runtime_error(
+                "the PLE n-gram embedding is not implemented on the expert-offload "
+                "path yet -- run without --vram-budget/--experts-ssd, or pass "
+                "--ngram off to run this model without it");
+    }
     if (use_expert_offload || ssd_mode) {
         init_cache();   // dynamic per-expert VRAM cache for the decode hot path
     }
@@ -1197,8 +1258,10 @@ void Runtime::Impl::zero_states() {
             zeros.assign((n + sizeof(float) - 1) / sizeof(float), 0.0f);   // round up: n need not be a multiple of 4 (F16 KV)
         ggml_backend_tensor_set(t, zeros.data(), 0, n);
     };
-    for (auto * t : conv_state) zero(t);
-    for (auto * t : ssm_state)  zero(t);
+    for (auto * t : conv_state)     zero(t);
+    for (auto * t : ssm_state)      zero(t);
+    for (auto * t : ple_conv_state) zero(t);
+    ngram_hist.clear();
     for (auto * t : k_cache)    zero(t);
     for (auto * t : v_cache)    zero(t);
 }
@@ -1502,6 +1565,109 @@ ggml_tensor * Runtime::Impl::build_hc_combine(ggml_context * ctx, ggml_tensor * 
     return ggml_add(ctx, res_hc, ggml_mul(ctx, b, w));
 }
 
+// Hash this batch's tokens to n-gram table rows, fetch them and upload the
+// result into the graph's "inp_ple" input. No-op when the graph has none
+// (a model without PLE, or --ngram off).
+void Runtime::Impl::fill_ple_input(ggml_cgraph * gf, const int32_t * tokens, int n_tokens) {
+    if (!use_ple()) return;
+    ggml_tensor * t = ggml_graph_get_tensor(gf, "inp_ple");
+    if (!t) return;
+
+    const auto & hp = model.hparams();
+    ngram_rows.clear();
+    ngram->hash_rows(tokens, n_tokens, ngram_hist, ngram_rows);
+
+    ngram_embd.resize(ngram_rows.size() * hp.ple_head_dim);
+    ngram->gather(ngram_rows.data(), ngram_rows.size(), ngram_embd.data());
+
+    GGML_ASSERT(ggml_nbytes(t) == ngram_embd.size() * sizeof(float));
+    ggml_backend_tensor_set(t, ngram_embd.data(), 0, ggml_nbytes(t));
+}
+
+// ---- qwen4exp PLE: n-gram hash embedding (one designated layer) ----
+//
+// `emb` is the gathered table rows, [n_embd, n_tokens], already dequantised on
+// the host: which rows to fetch is a pure function of the token ids, so the
+// gather never enters the graph and the 26.8 GiB table is not a tensor here.
+// See ngram_table.h for why that matters.
+//
+// The module is a gated additive branch onto the wide residual:
+//   res += sigmoid(<key(emb), query(res)>) * value(emb) + conv(that)
+// which is why dropping it (--ngram off) leaves a stack that still runs.
+ggml_tensor * Runtime::Impl::build_ple(ggml_context * ctx, ggml_cgraph * gf, int il,
+        ggml_tensor * res_hc, ggml_tensor * emb, int n_tokens) {
+    const auto & hp  = model.hparams();
+    const int n_embd = hp.n_embd;
+    const int hc     = hp.hc_count;
+    const int hc_dim = hc * n_embd;
+    const float eps  = hp.rms_eps;
+
+    // grouped RMSNorm over one residual stream, with a gamma spanning all of
+    // them -- the same shape build_hc_mix uses
+    auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * w) {
+        ggml_tensor * t = ggml_rms_norm(ctx, ggml_reshape_3d(ctx, x, n_embd, hc, n_tokens), eps);
+        t = ggml_mul(ctx, ggml_reshape_2d(ctx, t, hc_dim, n_tokens), w);
+        return ggml_reshape_3d(ctx, t, n_embd, hc, n_tokens);
+    };
+
+    ggml_tensor * key   = ggml_mul_mat(ctx, W("blk.%d.ple_key.weight",   il), emb);
+    ggml_tensor * value = ggml_mul_mat(ctx, W("blk.%d.ple_value.weight", il), emb);
+
+    key = grouped_norm(key, W("blk.%d.ple_norm_key.weight", il));
+    ggml_tensor * query = grouped_norm(res_hc, W("blk.%d.ple_norm_query.weight", il));
+
+    // per-stream dot product, then a signed square root before the sigmoid
+    ggml_tensor * sc = ggml_scale(ctx, ggml_sum_rows(ctx, ggml_mul(ctx, key, query)),
+                                  1.0f / sqrtf((float) n_embd));
+    ggml_tensor * mag  = ggml_sqrt(ctx, ggml_clamp(ctx, ggml_abs(ctx, sc), 1e-6f, INFINITY));
+    ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul(ctx, ggml_sgn(ctx, sc), mag));
+
+    // one n_embd-wide value broadcast across the streams, scaled by the gate
+    ggml_tensor * v3 = ggml_repeat_4d(ctx,
+            ggml_reshape_3d(ctx, value, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+    ggml_tensor * gated = ggml_mul(ctx, v3, gate);
+
+    ggml_tensor * normalized = grouped_norm(gated, W("blk.%d.ple_norm_conv.weight", il));
+    normalized = ggml_reshape_2d(ctx, normalized, hc_dim, n_tokens);
+
+    // Depthwise causal conv, dilated by the n-gram size. Written as a sum of
+    // shifted per-channel-scaled copies rather than via ggml_conv_1d_dw, which
+    // upstream flags as suspect; on a tensor this small it is a handful of ops.
+    //   out[c, t] = sum_k w[k, c] * x[c, t - (K-1-k)*dilation]
+    const int kern = (int) hp.ple_conv_kernel;
+    const int dil  = (int) hp.ple_ngram_size;
+    const int hist = (int) hp.ple_conv_state();
+
+    // [hist + n_tokens, hc_dim] with tokens on ne[0], so history concatenates
+    ggml_tensor * padded = ggml_concat(ctx, ple_conv_state[il],
+            ggml_cont(ctx, ggml_transpose(ctx, normalized)), 0);
+    ggml_tensor * tail = ggml_view_2d(ctx, padded, hist, hc_dim, padded->nb[1],
+            ggml_row_size(padded->type, n_tokens));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cont(ctx, tail), ple_conv_state[il]));
+
+    ggml_tensor * conv_out = nullptr;
+    ggml_tensor * kernel   = W("blk.%d.ple_conv1d.weight", il);   // [kern, hc_dim]
+    for (int k = 0; k < kern; ++k) {
+        const int start = hist - (kern - 1 - k) * dil;
+        ggml_tensor * shifted = ggml_cont(ctx, ggml_transpose(ctx,
+                ggml_view_2d(ctx, padded, n_tokens, hc_dim, padded->nb[1],
+                             ggml_row_size(padded->type, start))));
+
+        // column k of the kernel is one weight per channel
+        ggml_tensor * wk = ggml_cont(ctx, ggml_view_2d(ctx, kernel, 1, hc_dim,
+                kernel->nb[1], (size_t) k * kernel->nb[0]));
+        wk = ggml_reshape_1d(ctx, wk, hc_dim);
+        if (wk->type != GGML_TYPE_F32) wk = ggml_cast(ctx, wk, GGML_TYPE_F32);
+
+        ggml_tensor * term = ggml_mul(ctx, shifted, wk);
+        conv_out = conv_out ? ggml_add(ctx, conv_out, term) : term;
+    }
+    conv_out = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_silu(ctx, conv_out)),
+                               n_embd, hc, n_tokens);
+
+    return ggml_add(ctx, res_hc, ggml_add(ctx, gated, conv_out));
+}
+
 // ---- MoE FFN (qwen3moe / qwen35moe): softmax gating, top-k, normalized weights ----
 ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int il,
         ggml_tensor * x, int n_tokens) {
@@ -1662,6 +1828,16 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
     // mixers carry every normalization the stack has.
     const bool hc_on = hp.has_hc();
     const int  n_hc  = hc_on ? (int) hp.hc_count : 1;
+    // The PLE rows are gathered on the host and arrive as one plain input; the
+    // graph never touches the table. Sized n_embd because ple_head_dim times
+    // ple_n_heads is exactly the model width.
+    ggml_tensor * inp_ple = nullptr;
+    if (use_ple()) {
+        inp_ple = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp_ple);
+        ggml_set_name(inp_ple, "inp_ple");
+    }
+
     ggml_tensor * res_hc = nullptr;
     if (hc_on) {
         res_hc = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, inpL, n_embd, 1, n_tokens),
@@ -1671,6 +1847,10 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
     for (int il = 0; il < (int) hp.n_main(); ++il) {
         ggml_tensor * inpSA = inpL;
         ggml_tensor * inject = nullptr;
+
+        if (hc_on && use_ple() && hp.is_ple(il)) {
+            res_hc = build_ple(ctx, gf, il, res_hc, inp_ple, n_tokens);
+        }
 
         if (hc_on) {
             cur = build_hc_mix(ctx, res_hc,
@@ -2501,6 +2681,7 @@ const std::vector<float> & Runtime::Impl::decode_reuse(int32_t token) {
     ggml_tensor * inp_kvidx  = ggml_graph_get_tensor(dgf, "inp_kvidx");
 
     ggml_backend_tensor_set(inp_tokens, &token, 0, sizeof(int32_t));
+    fill_ple_input(dgf, &token, 1);
     std::vector<int32_t> posv;
     fill_rope_pos(posv, 1, mrope_next);   // generation token: text, sequential
     ggml_backend_tensor_set(inp_pos, posv.data(), 0, posv.size() * sizeof(int32_t));
@@ -3654,6 +3835,7 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     ggml_tensor * inp_mask   = ggml_graph_get_tensor(f_gf, "inp_mask");
     ggml_tensor * inp_kvidx  = ggml_graph_get_tensor(f_gf, "inp_kvidx");
     ggml_backend_tensor_set(inp_tokens, &token, 0, sizeof(int32_t));
+    fill_ple_input(f_gf, &token, 1);
     std::vector<int32_t> posv;
     fill_rope_pos(posv, 1, mrope_next);   // generation token: text, sequential
     ggml_backend_tensor_set(inp_pos, posv.data(), 0, posv.size() * sizeof(int32_t));
@@ -3989,6 +4171,7 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     ggml_tensor * inp_mask_t   = ggml_graph_get_tensor(gf, "inp_mask");
 
     ggml_backend_tensor_set(inp_tokens_t, tokens.data(), 0, n_tokens * sizeof(int32_t));
+    fill_ple_input(gf, tokens.data(), n_tokens);
 
     std::vector<int32_t> pos;
     const int new_mrope = fill_rope_pos(pos, n_tokens, mrope_next);

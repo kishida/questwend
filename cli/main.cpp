@@ -124,6 +124,10 @@ static void usage(const char * prog) {
     printf("                      auto = every GPU present, share by free VRAM\n");
     printf("  --cache-profile <f> persist/prefetch hot-expert profile (warm restarts)\n");
     printf("  --experts-ssd  stream experts from the GGUF on SSD (no RAM copy)\n");
+    printf("  --ngram <mode> qwen4exp n-gram embedding: disk (default), ram or off.\n");
+    printf("                 The table is 26.8 GB in Qwen3.8-Flash-Next and never\n");
+    printf("                 goes on the GPU; off skips the module entirely\n");
+    printf("  --ngram-cache <MB>  host cache for --ngram disk (default 256)\n");
     printf("  --cpu          force CPU backend\n");
     printf("  --log-tokens-per-sec   print speed\n");
     printf("  --dump-logits <f>  write the prompt's final-token logits to <f> (verification)\n");
@@ -150,6 +154,8 @@ int main(int argc, char ** argv) {
     std::vector<std::string> image_paths;
     int  max_tokens = 128, n_ctx = 0, n_draft = 1;   // n_ctx 0 = model's trained length
     size_t vram_budget_mb = 0;          // total across GPUs (gates expert offload)
+    std::string ngram_mode = "disk";    // --ngram off|disk|ram
+    size_t      ngram_cache_mb = 256;   // --ngram-cache <MB>
     std::string dump_logits;            // --dump-logits <file>
     std::vector<size_t> vram_list;      // --vram-budget, one entry per GPU
     std::vector<int>    gpu_ids;        // --gpus
@@ -209,6 +215,8 @@ int main(int argc, char ** argv) {
         }
         else if (a == "--cache-profile" && i + 1 < argc) cache_profile = next();
         else if (a == "--experts-ssd")      experts_ssd = true;
+        else if (a == "--ngram" && i + 1 < argc)       ngram_mode = next();
+        else if (a == "--ngram-cache" && i + 1 < argc) ngram_cache_mb = (size_t) std::stoul(next());
         else if (a == "--reasoning" && i + 1 < argc) { std::string v = next(); reasoning = (v != "off" && v != "0" && v != "false"); }
         else if (a == "--mtp")              use_mtp = true;
         else if (a == "--draft" && i + 1 < argc) n_draft = std::stoi(next());
@@ -369,6 +377,8 @@ int main(int argc, char ** argv) {
             cfg.vram_budget_mb = vram_list[0];
         cfg.cache_profile  = cache_profile;
         cfg.experts_ssd    = experts_ssd;
+        cfg.ngram_mode     = ngram_mode;
+        cfg.ngram_cache_mb = ngram_cache_mb;
         // MTP needs the nextn block kept VRAM-resident (also the dev MTP test mode).
         cfg.use_mtp        = use_mtp || getenv("QWEN_MTP_TEST");
         cfg.embd_q8        = embd_q8;

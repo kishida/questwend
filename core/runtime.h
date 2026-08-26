@@ -56,6 +56,19 @@ struct RuntimeConfig {
     bool   experts_ssd    = false;   // stream experts from the GGUF on SSD (no RAM copy)
     bool   use_mtp        = false;   // MTP self-speculative decode (keeps nextn block VRAM-resident)
     bool   embd_q8        = false;   // use Q8_0 (not F16) for token embedding fallback (saves VRAM)
+
+    // PLE n-gram embedding (qwen4exp). The table is 26.8 GiB in the IQ1_S quant
+    // of Qwen3.8-Flash-Next -- larger than every other weight put together
+    // except the experts -- and it is never a GPU tensor in any mode:
+    //   "disk" streams the ~n_heads rows a token needs, keeping ngram_cache_mb
+    //          of them in host memory. Bandwidth is trivial, IOPS is not.
+    //   "ram"  holds the whole table (still quantised) in host memory.
+    //   "off"  skips the module. The n-gram branch is a gated add onto the
+    //          residual, so the stack still runs; quality is whatever the model
+    //          is without it. On a machine where the experts would otherwise
+    //          have to stay on disk, this is what buys them a place in RAM.
+    std::string ngram_mode     = "disk";
+    size_t      ngram_cache_mb = 256;
 };
 
 // Parse a --vram-budget argument into MB (the unit RuntimeConfig stores).

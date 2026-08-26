@@ -71,13 +71,49 @@ python tests/qwen4/check_tiny.py
 
 ### 現在の状態
 
-| ケース | プロンプト | 内容 | 結果 |
-|---|---|---|---|
-| `dense-5tok` | 5 トークン | hyper-connection / GDN / dense attention / MoE | **一致**（最大差 0.0006 = span の 0.022%、argmax・top-10 順序とも一致） |
-| `qsa-36tok` | 36 トークン | QSA | **不一致**（QSA 未実装。llama.cpp は QSA、qwencpp は dense） |
+`python tests/qwen4/check_tiny.py` の結果:
+
+| ケース | 内容 | 結果 |
+|---|---|---|
+| `dense-5tok` | hyper-connection / GDN / dense attention / MoE | **一致**（最大差 0.0006 = span の 0.022%） |
+| `ple-5tok` | PLE の n-gram ハッシュ・行 gather・dilated conv | **一致**（最大差 0.0002 = span の 0.007%） |
+| `dense-5tok-ngram-off` | `--ngram off` が PLE 無しモデルを再現するか | **一致** |
+| `qsa-36tok` | QSA | **不一致**（QSA 未実装。llama.cpp は QSA、qwencpp は dense） |
+| `ple-gen` / `nople-gen` | デコード間の状態引き継ぎ（GDN conv/ssm・PLE conv 履歴・n-gram 窓） | **一致**（4 プロンプト × 8 トークン貪欲生成） |
 
 `qsa-36tok` は QSA を実装したら自動的に一致に変わる。36 トークンなのは
 `indexer_top_k + compress_ratio - 1 = 9` を超えさせるため。
+
+生成の比較は「最後の 1 トークンを除いて一致」を基準にしている。両者の logits は
+span の 0.02% まで一致するが、貪欲デコードでは僅差の順位が入れ替わることがあり、
+実際 8 回中 2 回が最終ステップでそれを踏む。配線のバグなら最初のステップで割れる。
+
+## `--ngram`: n-gram embedding のスイッチ
+
+```
+--ngram <mode>       disk（既定） / ram / off
+--ngram-cache <MB>   disk モードの行キャッシュ（既定 256）
+```
+
+**どのモードでも GPU には載らない。** qwencpp は llama.cpp と違い、PLE テーブルを
+ggml テンソルにしていない（`Model::ple_table()` はメタデータだけを持ち、どの
+backend buffer にも入らない）。行番号はトークン ID だけから決まりモデルの計算に
+依存しないので、ホスト側で pread → 逆量子化 → `[n_embd, T]` の F32 入力として
+グラフに渡している。1 トークンあたり 16 行 × 90 バイト。
+
+| モード | 常駐 | 律速 |
+|---|---|---|
+| `disk` | 行キャッシュのみ（既定 256 MB） | ランダム read の **IOPS**（帯域ではない） |
+| `ram` | テーブル全体 26.8 GiB（量子化のまま） | なし |
+| `off` | 0 | なし。モジュールごとスキップ |
+
+`off` が意味を持つ理由: PLE は残差へのゲート付き加算ブランチなので、外しても
+スタックは動く。そして 64 GB マシンでは **`off` にすると expert 37.1 GiB が RAM に
+載る**（26.8 + 37.1 = 63.9 GiB では載らない）。品質への影響は未測定。
+
+実装は [core/ngram_table.h](../../core/ngram_table.h) / [.cpp](../../core/ngram_table.cpp)。
+prefill では全行番号がグラフ実行前に判明するので、miss をファイルオフセット順に
+ソートしてから読む（HDD ではランダムシークが片方向スイープになる）。
 
 ## 参照キャプチャ手順
 

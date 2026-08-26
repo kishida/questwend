@@ -178,6 +178,11 @@ public:
     // Tensor lookup by exact GGUF name (e.g. "blk.0.attn_q.weight").
     ggml_tensor * tensor(const std::string & name) const;
 
+    // The PLE n-gram table's metadata (type and shape), or null when the model
+    // has none. It is not in tensor(): no backend buffer ever holds it, and
+    // NgramTable streams its rows straight from tensor_file()/_offset().
+    ggml_tensor * ple_table() const { return ple_table_; }
+
     // Token embedding tensor suitable for ggml_get_rows on any backend.
     // (CUDA get_rows does not support K-quant/IQ types, so a dequantized F16
     //  copy is provided for those; Q8_0 is used instead when set_embd_q8(true).)
@@ -264,6 +269,8 @@ private:
     std::string    path_;
     gguf_context * gguf_   = nullptr;        // KV metadata (first shard)
     ggml_context * meta_   = nullptr;        // unified tensor metadata (+ data after load_weights)
+    ggml_context * ple_ctx_ = nullptr;       // metadata for the PLE table alone (never allocated)
+    ggml_tensor  * ple_table_ = nullptr;
     ggml_backend_buffer * weights_buf_ = nullptr;
     std::map<std::string, ggml_tensor *> tensors_;
 

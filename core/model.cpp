@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -69,7 +70,8 @@ Model::~Model() {
     if (embd_ctx_)    ggml_free(embd_ctx_);
     if (weights_buf_) ggml_backend_buffer_free(weights_buf_);
     if (gguf_) gguf_free(gguf_);
-    if (meta_) ggml_free(meta_);
+    if (meta_)    ggml_free(meta_);
+    if (ple_ctx_) ggml_free(ple_ctx_);
 }
 
 // Whether `backend` can run ggml_get_rows directly on a tensor of te's type.
@@ -599,12 +601,29 @@ std::unique_ptr<Model> Model::load(const std::string & path) {
     mp.no_alloc = true;
     m->meta_ = ggml_init(mp);
 
+    // The PLE n-gram table is deliberately kept out of `meta_` and `tensors_`.
+    // Every load_weights_* path walks those to fill a backend buffer, and this
+    // one tensor is 26.8 GiB in Qwen3.8-Flash-Next -- it is streamed row by row
+    // by NgramTable instead, from the file offset recorded in `src_` like any
+    // other tensor. Keeping it in a context nothing allocates is what makes
+    // "never resident" the default rather than something each path opts into.
+    ggml_init_params pp{};
+    pp.mem_size = ggml_tensor_overhead() + 1024;
+    pp.no_alloc = true;
+    m->ple_ctx_ = ggml_init(pp);
+
     for (const auto & sh : tmp) {
         for (ggml_tensor * t = ggml_get_first_tensor(sh.meta); t; t = ggml_get_next_tensor(sh.meta, t)) {
             const char * nm = ggml_get_name(t);
-            ggml_tensor * ut = ggml_new_tensor(m->meta_, t->type, ggml_n_dims(t), t->ne);
+            const bool is_ple = strcmp(nm, "per_layer_token_embd.weight") == 0;
+            ggml_tensor * ut = ggml_new_tensor(is_ple ? m->ple_ctx_ : m->meta_,
+                                               t->type, ggml_n_dims(t), t->ne);
             ggml_set_name(ut, nm);
-            m->tensors_[nm] = ut;
+            if (is_ple) {
+                m->ple_table_ = ut;
+            } else {
+                m->tensors_[nm] = ut;
+            }
             const int64_t tid = gguf_find_tensor(sh.g, nm);
             m->src_[nm] = { sh.path, sh.data_off + gguf_get_tensor_offset(sh.g, tid) };
         }
