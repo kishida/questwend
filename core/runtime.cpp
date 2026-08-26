@@ -164,6 +164,30 @@ struct Runtime::Impl {
     }
     bool                  ssd_mode = false;     // experts streamed from SSD (no RAM copy)
     ggml_gallocr_t        cache_galloc = nullptr;
+    // One graph allocator per GPU: under a layer split each per-layer segment
+    // graph is allocated and run on the device that owns the layer, so this path
+    // never touches the scheduler at all.
+    std::vector<ggml_gallocr_t> cache_gallocs;
+
+    // Carry tensors exist once per device. A layer's segment graph must read and
+    // write carries in the memory of the device that runs it; otherwise every
+    // layer on a secondary device becomes a cross-device round trip with a
+    // device sync, which is what made this path ~100x slower than the fused one.
+    // The p_* members below point at the set for the layer currently being
+    // built (use_carry); only the hidden state ever crosses, once per device
+    // boundary (hop_carry).
+    struct CarrySet {
+        ggml_context *        ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        ggml_tensor * h = nullptr, * ffn_in = nullptr, * resid = nullptr, * weights = nullptr;
+        ggml_tensor * ffn_in2 = nullptr, * resid2 = nullptr, * weights2 = nullptr;
+        ggml_tensor * slot_g = nullptr, * slot_u = nullptr, * slot_d = nullptr;
+    };
+    std::vector<CarrySet> carries;
+    std::vector<float>    hop_buf;      // staging for the boundary hidden-state hop
+
+    void use_carry(int d);
+    void hop_carry(int from, int to);
     // persistent "carry" tensors that bridge the per-layer graph segments
     ggml_context *        cctx       = nullptr;
     ggml_backend_buffer_t cbuf       = nullptr;
@@ -381,7 +405,13 @@ struct Runtime::Impl {
         if (f_ctx)          ggml_free(f_ctx);
         if (bak_buf)        ggml_backend_buffer_free(bak_buf);
         if (bak_ctx)        ggml_free(bak_ctx);
-        if (cache_galloc)   ggml_gallocr_free(cache_galloc);
+        for (auto g : cache_gallocs) if (g) ggml_gallocr_free(g);
+        cache_galloc = nullptr;   // aliases cache_gallocs[0], already freed
+        for (auto & c : carries) {
+            if (c.buf) ggml_backend_buffer_free(c.buf);
+            if (c.ctx) ggml_free(c.ctx);
+        }
+        carries.clear();
         if (cbuf)           ggml_backend_buffer_free(cbuf);
         if (cctx)           ggml_free(cctx);
         if (sched)          ggml_backend_sched_free(sched);
@@ -818,6 +848,34 @@ void Runtime::Impl::plan_layers() {
     }
 }
 
+// Point the p_* carry members at device `d`'s set, so the segment graphs built
+// after this call read and write carries in that device's memory.
+void Runtime::Impl::use_carry(int d) {
+    if (carries.empty()) return;
+    const CarrySet & c = carries[(size_t) std::min<size_t>((size_t) d, carries.size() - 1)];
+    p_h        = c.h;
+    p_ffn_in   = c.ffn_in;
+    p_resid    = c.resid;
+    p_weights  = c.weights;
+    p_ffn_in2  = c.ffn_in2;
+    p_resid2   = c.resid2;
+    p_weights2 = c.weights2;
+    p_slot_g   = c.slot_g;
+    p_slot_u   = c.slot_u;
+    p_slot_d   = c.slot_d;
+}
+
+// Move the running hidden state across a device boundary. This is the only
+// value that crosses -- n_embd floats (~8 KB), once per boundary per token,
+// which is the whole point of assigning layers in contiguous ranges.
+void Runtime::Impl::hop_carry(int from, int to) {
+    if (from == to || carries.size() <= 1) return;
+    const size_t n = ggml_nbytes(carries[(size_t) from].h);
+    hop_buf.resize(n / sizeof(float));
+    ggml_backend_tensor_get(carries[(size_t) from].h, hop_buf.data(), 0, n);
+    ggml_backend_tensor_set(carries[(size_t) to].h,   hop_buf.data(), 0, n);
+}
+
 // Allocate the VRAM slot pools and the persistent per-layer carry tensors.
 void Runtime::Impl::init_cache() {
     const auto & hp = model.hparams();
@@ -881,42 +939,62 @@ void Runtime::Impl::init_cache() {
 
     // persistent carry tensors (bridge per-layer graph segments) + fast-path
     // in-graph remap table (g2s_all) and selection readback (sel_all).
+    // One carry set per GPU (exactly one without a split, which reproduces the
+    // original single-buffer layout). See the CarrySet comment in Impl.
+    carries.resize(std::max<size_t>(gpus.size(), 1));
+    for (size_t d = 0; d < carries.size(); ++d) {
+        CarrySet & c = carries[d];
+        ggml_init_params ccp{};
+        ccp.mem_size = ggml_tensor_overhead() * 16 + 256;
+        ccp.no_alloc = true;
+        c.ctx      = ggml_init(ccp);
+        c.h        = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
+        c.ffn_in   = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
+        c.resid    = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
+        c.weights  = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_used);
+        c.ffn_in2  = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
+        c.resid2   = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
+        c.weights2 = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_used);
+        c.slot_g   = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, n_used, 1);
+        c.slot_u   = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, n_used, 1);
+        c.slot_d   = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, n_used, 1);
+        char nm[64];
+        const char * base[10] = { "h", "ffn_in", "resid", "weights", "ffn_in2",
+                                  "resid2", "weights2", "slot_g", "slot_u", "slot_d" };
+        ggml_tensor * ts[10] = { c.h, c.ffn_in, c.resid, c.weights, c.ffn_in2,
+                                 c.resid2, c.weights2, c.slot_g, c.slot_u, c.slot_d };
+        for (int k = 0; k < 10; ++k) {
+            snprintf(nm, sizeof(nm), "carry%zu.%s", d, base[k]);
+            ggml_set_name(ts[k], nm);
+        }
+        c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, gpus.empty() ? backend : gpus[d]);
+        if (!c.buf) throw std::runtime_error("init_cache: failed to alloc carry buffer");
+    }
+    use_carry(0);
+
+    // Model-wide tables for the fused single-graph path. That graph is planned
+    // by a scheduler, which copies these to whichever device needs them, so one
+    // copy on the primary is enough.
     ggml_init_params cp{};
-    cp.mem_size = ggml_tensor_overhead() * 16 + 256;
+    cp.mem_size = ggml_tensor_overhead() * 8 + 256;
     cp.no_alloc = true;
     cctx = ggml_init(cp);
-    p_h       = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
-    p_ffn_in  = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
-    p_resid   = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
-    p_weights = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_used);
-    p_ffn_in2 = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
-    p_resid2  = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
-    p_weights2= ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_used);
-    p_slot_g  = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, 1);
-    p_slot_u  = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, 1);
-    p_slot_d  = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, 1);
     g2s_all   = ggml_new_tensor_3d(cctx, GGML_TYPE_I32, 1, hp.n_expert, 3 * hp.n_layer);
     sel_all   = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, hp.n_layer);
     resmask_all = ggml_new_tensor_2d(cctx, GGML_TYPE_F32, hp.n_expert, hp.n_layer);
     ggml_set_name(resmask_all, "carry.resmask");
     want_all = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, hp.n_layer);
     ggml_set_name(want_all, "carry.want");
-    ggml_set_name(p_h, "carry.h");
-    ggml_set_name(p_ffn_in, "carry.ffn_in");
-    ggml_set_name(p_resid, "carry.resid");
-    ggml_set_name(p_weights, "carry.weights");
-    ggml_set_name(p_ffn_in2, "carry.ffn_in2");
-    ggml_set_name(p_resid2, "carry.resid2");
-    ggml_set_name(p_weights2, "carry.weights2");
-    ggml_set_name(p_slot_g, "carry.slot_g");
-    ggml_set_name(p_slot_u, "carry.slot_u");
-    ggml_set_name(p_slot_d, "carry.slot_d");
     ggml_set_name(g2s_all, "carry.g2s");
     ggml_set_name(sel_all, "carry.sel");
     cbuf = ggml_backend_alloc_ctx_tensors(cctx, backend);
-    if (!cbuf) throw std::runtime_error("init_cache: failed to alloc carry buffer");
+    if (!cbuf) throw std::runtime_error("init_cache: failed to alloc table buffer");
 
-    cache_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    cache_gallocs.clear();
+    for (size_t d = 0; d < std::max<size_t>(gpus.size(), 1); ++d)
+        cache_gallocs.push_back(ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(gpus.empty() ? backend : gpus[d])));
+    cache_galloc = cache_gallocs[0];   // alias: the primary's, used by batched prefill
     f_galloc     = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
 
     g2s_host.assign((size_t) 3 * hp.n_layer * hp.n_expert, 0);
@@ -927,16 +1005,6 @@ void Runtime::Impl::init_cache() {
     if (getenv("QWEN_FASTCACHE")) cache_fast_enabled = true;   // experimental single-graph path
     if (getenv("QWEN_RESIDENT_DECODE")) { cache_fast_enabled = true; resident_decode = true; }
 
-    // The per-layer cached decode builds one graph per layer segment. Under a
-    // split the scheduler cannot see past a single segment, so every layer on a
-    // secondary device costs a round trip for the carry tensors (which all live
-    // on the primary) plus a device sync -- measured at ~100x slower, not a few
-    // percent. The fused path builds one graph per token, which sched splits
-    // into one contiguous range per device with a single boundary copy.
-    if (multi_gpu() && !cache_fast_enabled)
-        fprintf(stderr,
-                "warning: multi-GPU decode without the fused graph is extremely slow "
-                "(per-layer cross-device copies). Pass --resident-decode.\n");
 
     init_state_backup();   // GDN rollback buffers (speculative miss / MTP reject)
 
@@ -2860,15 +2928,21 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         gp.no_alloc = true;
         return ggml_init(gp);
     };
-    auto run = [&](ggml_context * ctx, ggml_cgraph * gf) {
-        if (!alloc_graph(cache_galloc, gf))
+    // Every segment graph here touches exactly one device -- the layer's weights,
+    // KV rows, expert pool and carries all live together -- so it is allocated
+    // and run directly on that device. Going through the scheduler instead would
+    // re-plan the graph and synchronize per segment, which at one token per
+    // graph costs far more than the segment computes.
+    auto run = [&](ggml_context * ctx, ggml_cgraph * gf, int dev) {
+        if (!ggml_gallocr_alloc_graph(cache_gallocs[(size_t) dev], gf))
             throw std::runtime_error("decode_cached: gallocr alloc failed");
     };
     const bool prof_dc = getenv("QWEN_PROF_DC") != nullptr;
     auto wall0 = std::chrono::steady_clock::now();
-    auto compute = [&](ggml_cgraph * gf, const char * msg) {
+    auto compute = [&](ggml_cgraph * gf, int dev, const char * msg) {
         auto t = std::chrono::steady_clock::now();
-        if (compute_graph(gf) != GGML_STATUS_SUCCESS)
+        ggml_backend_t be = gpus.empty() ? backend : gpus[(size_t) dev];
+        if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error(std::string("decode_cached: ") + msg);
         if (prof_dc) dc_gpu_ms += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t).count();
@@ -2885,19 +2959,20 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         ggml_set_input(inp); ggml_set_name(inp, "inp_tok");
         ggml_tensor * emb = ggml_get_rows(ctx, model.tok_embd_rows(), inp);  // [n_embd,1]
         ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, emb, n_embd), p_h));
-        run(ctx, gf);
+        run(ctx, gf, 0);
         ggml_backend_tensor_set(inp, &token, 0, sizeof(int32_t));
-        compute(gf, "embed compute failed");
+        compute(gf, 0, "embed compute failed");
         ggml_free(ctx);
     }
 
     std::vector<int32_t> sel(n_used), slot_g(n_used), slot_u(n_used), slot_d(n_used);
 
     // Double-buffered carry tensors (parity by layer) so a fused segB(L)+segA(L+1)
-    // graph has no write-after-read hazard on the carry buffers.
-    ggml_tensor * carry_ffn[2] = { p_ffn_in, p_ffn_in2 };
-    ggml_tensor * carry_res[2] = { p_resid,  p_resid2  };
-    ggml_tensor * carry_wgt[2] = { p_weights, p_weights2 };
+    // graph has no write-after-read hazard on the carry buffers. These read the
+    // p_* members at call time, so they follow use_carry() to the right device.
+    auto carry_ffn = [&](int il) { return (il & 1) ? p_ffn_in2  : p_ffn_in;  };
+    auto carry_res = [&](int il) { return (il & 1) ? p_resid2   : p_resid;   };
+    auto carry_wgt = [&](int il) { return (il & 1) ? p_weights2 : p_weights; };
 
     // Append seg A (attention/GDN + router) for layer `il` to (ctx,gf). Writes the
     // normed FFN input / residual / router weights into the layer's parity carry,
@@ -2951,16 +3026,16 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         else       ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il));
         ggml_tensor * weights = nullptr;
         ggml_tensor * selected = build_router(ctx, gf, il, ffn_in, weights);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, carry_ffn[il & 1]));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, carry_res[il & 1]));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, weights, n_used), carry_wgt[il & 1]));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, carry_ffn(il)));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, carry_res(il)));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, weights, n_used), carry_wgt(il)));
         return selected;
     };
     // Append seg B (cached expert matmul + residual) for layer `il`; writes p_h.
     auto build_segB = [&](ggml_context * ctx, ggml_cgraph * gf, int il) {
-        ggml_tensor * moe_out = build_moe_cached(ctx, gf, il, carry_ffn[il & 1],
-                                                 p_slot_g, p_slot_u, p_slot_d, carry_wgt[il & 1]);
-        ggml_tensor * h_new = ggml_add(ctx, moe_out, carry_res[il & 1]);
+        ggml_tensor * moe_out = build_moe_cached(ctx, gf, il, carry_ffn(il),
+                                                 p_slot_g, p_slot_u, p_slot_d, carry_wgt(il));
+        ggml_tensor * h_new = ggml_add(ctx, moe_out, carry_res(il));
         ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, h_new, n_embd), p_h));
     };
     // Set the attention pos/mask inputs of a graph (no-op if it has none, e.g. a
@@ -2991,27 +3066,52 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
 
     // seg A(0) on its own, then fuse segB(L)+segA(L+1) per step so each layer
     // boundary is a single GPU submit instead of two (~halves the dispatches).
+    // Under a layer split the fusion is broken at the one device boundary,
+    // where the two halves belong to different devices: segB finishes on the
+    // old device, the hidden state hops, and segA starts on the new one.
     {
+        use_carry(dev_of(0));
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
         ggml_tensor * selected = build_segA(ctx, gf, 0);
-        run(ctx, gf);
+        run(ctx, gf, dev_of(0));
         set_attn_inputs(gf);
-        compute(gf, "seg A0 compute failed");
+        compute(gf, dev_of(0), "seg A0 compute failed");
         ensure_layer(selected, 0);
         ggml_free(ctx);
     }
     for (int il = 0; il < N; ++il) {
+        const int d     = dev_of(il);
+        const int dnext = (il + 1 < N) ? dev_of(il + 1) : d;
+        const bool cross = (il + 1 < N) && dnext != d;
+
+        use_carry(d);
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
         build_segB(ctx, gf, il);
-        ggml_tensor * nsel = (il + 1 < N) ? build_segA(ctx, gf, il + 1) : nullptr;
-        run(ctx, gf);
+        ggml_tensor * nsel = (il + 1 < N && !cross) ? build_segA(ctx, gf, il + 1) : nullptr;
+        run(ctx, gf, d);
         set_attn_inputs(gf);
-        compute(gf, "fused segB/segA compute failed");
+        compute(gf, d, "fused segB/segA compute failed");
         if (nsel) ensure_layer(nsel, il + 1);
         ggml_free(ctx);
+
+        if (cross) {
+            hop_carry(d, dnext);
+            use_carry(dnext);
+            ggml_context * c2 = new_ctx();
+            ggml_cgraph * g2 = ggml_new_graph_custom(c2, GRAPH_SIZE, false);
+            ggml_tensor * s2 = build_segA(c2, g2, il + 1);
+            run(c2, g2, dnext);
+            set_attn_inputs(g2);
+            compute(g2, dnext, "seg A across a device boundary failed");
+            ensure_layer(s2, il + 1);
+            ggml_free(c2);
+        }
     }
+    // the final norm and output head are model-global, so they live on the primary
+    hop_carry(dev_of(N - 1), 0);
+    use_carry(0);
 
     // ---- final norm + output projection ----
     std::vector<float> out;
@@ -3025,8 +3125,8 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         cur = ggml_mul_mat(ctx, output_w, cur);
         ggml_set_name(cur, "logits");
         ggml_build_forward_expand(gf, cur);
-        run(ctx, gf);
-        compute(gf, "output compute failed");
+        run(ctx, gf, 0);
+        compute(gf, 0, "output compute failed");
         const int n_vocab = (int) cur->ne[0];
         logits.resize(n_vocab);
         ggml_backend_tensor_get(cur, logits.data(), 0, n_vocab * sizeof(float));
