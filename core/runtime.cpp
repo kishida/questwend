@@ -203,6 +203,11 @@ struct Runtime::Impl {
         ggml_tensor * h = nullptr, * ffn_in = nullptr, * resid = nullptr, * weights = nullptr;
         ggml_tensor * ffn_in2 = nullptr, * resid2 = nullptr, * weights2 = nullptr;
         ggml_tensor * slot_g = nullptr, * slot_u = nullptr, * slot_d = nullptr;
+        // qwen4exp: `resid` has no meaning when the residual is hc streams wide
+        // (seg B re-reads `h` instead); what seg B needs from seg A is the
+        // scatter weights the ffn mixer produced. `ple` holds this token's
+        // gathered n-gram rows.
+        ggml_tensor * inject = nullptr, * inject2 = nullptr, * ple = nullptr;
     };
     std::vector<CarrySet> carries;
     std::vector<float>    hop_buf;      // staging for the boundary hidden-state hop
@@ -227,6 +232,9 @@ struct Runtime::Impl {
     ggml_tensor *         p_slot_g   = nullptr;  // [n_used]   gate slot ids (host -> GPU)
     ggml_tensor *         p_slot_u   = nullptr;  // [n_used]   up   slot ids
     ggml_tensor *         p_slot_d   = nullptr;  // [n_used]   down slot ids
+    ggml_tensor *         p_inject   = nullptr;  // [hc]       hc scatter weights (seg A -> B)
+    ggml_tensor *         p_inject2  = nullptr;
+    ggml_tensor *         p_ple      = nullptr;  // [n_embd]   this token's n-gram rows
 
     // Phase B v2-fast: optimistic single-graph decode over the VRAM cache.
     // One persistent (CUDA-graph friendly) graph runs the whole token; per-layer
@@ -886,15 +894,6 @@ void Runtime::Impl::init() {
     }
     // A sched no longer implies offload: a multi-GPU resident model has one too,
     // and it has no expert cache to build.
-    // The expert-offload paths (layer-major prefill, fused decode) build their
-    // own graphs and do not carry the PLE module yet. Say so instead of quietly
-    // dropping a branch of the model: the numbers would look plausible.
-    if ((use_expert_offload || ssd_mode) && use_ple()) {
-        throw std::runtime_error(
-                "the PLE n-gram embedding is not implemented on the expert-offload "
-                "path yet -- run without --vram-budget/--experts-ssd, or pass "
-                "--ngram off to run this model without it");
-    }
     if (use_expert_offload || ssd_mode) {
         init_cache();   // dynamic per-expert VRAM cache for the decode hot path
     }
@@ -993,6 +992,9 @@ void Runtime::Impl::use_carry(int d) {
     p_slot_g   = c.slot_g;
     p_slot_u   = c.slot_u;
     p_slot_d   = c.slot_d;
+    p_inject   = c.inject;
+    p_inject2  = c.inject2;
+    p_ple      = c.ple;
 }
 
 // Move the running hidden state across a device boundary. This is the only
@@ -1024,6 +1026,7 @@ void Runtime::Impl::hop_carry_ab(int from, int to, int il) {
     };
     if (il & 1) { cp(a.ffn_in2, b.ffn_in2); cp(a.resid2, b.resid2); cp(a.weights2, b.weights2); }
     else        { cp(a.ffn_in,  b.ffn_in ); cp(a.resid,  b.resid ); cp(a.weights,  b.weights ); }
+    if (a.inject) cp(il & 1 ? a.inject2 : a.inject, il & 1 ? b.inject2 : b.inject);
 }
 
 // Decide where each layer's expert pool lives, from how much VRAM each device
@@ -1162,10 +1165,13 @@ void Runtime::Impl::init_cache() {
     for (size_t d = 0; d < carries.size(); ++d) {
         CarrySet & c = carries[d];
         ggml_init_params ccp{};
-        ccp.mem_size = ggml_tensor_overhead() * 16 + 256;
+        ccp.mem_size = ggml_tensor_overhead() * 20 + 256;
         ccp.no_alloc = true;
         c.ctx      = ggml_init(ccp);
-        c.h        = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
+        // hc widens the running hidden state; everything else is per-token
+        c.h        = hp.has_hc()
+                ? ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, n_embd, hp.hc_count)
+                : ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
         c.ffn_in   = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
         c.resid    = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
         c.weights  = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_used);
@@ -1175,6 +1181,13 @@ void Runtime::Impl::init_cache() {
         c.slot_g   = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, n_used, 1);
         c.slot_u   = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, n_used, 1);
         c.slot_d   = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, n_used, 1);
+        if (hp.has_hc()) {
+            c.inject  = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, hp.hc_count);
+            c.inject2 = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, hp.hc_count);
+        }
+        if (use_ple()) {
+            c.ple = ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, n_embd, 1);
+        }
         char nm[64];
         const char * base[10] = { "h", "ffn_in", "resid", "weights", "ffn_in2",
                                   "resid2", "weights2", "slot_g", "slot_u", "slot_d" };
@@ -1183,6 +1196,13 @@ void Runtime::Impl::init_cache() {
         for (int k = 0; k < 10; ++k) {
             snprintf(nm, sizeof(nm), "carry%zu.%s", d, base[k]);
             ggml_set_name(ts[k], nm);
+        }
+        const char * opt_base[3] = { "inject", "inject2", "ple" };
+        ggml_tensor * opt[3] = { c.inject, c.inject2, c.ple };
+        for (int k = 0; k < 3; ++k) {
+            if (!opt[k]) continue;
+            snprintf(nm, sizeof(nm), "carry%zu.%s", d, opt_base[k]);
+            ggml_set_name(opt[k], nm);
         }
         c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, gpus.empty() ? backend : gpus[d]);
         if (!c.buf) throw std::runtime_error("init_cache: failed to alloc carry buffer");
@@ -2793,14 +2813,30 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     const int   T         = n_tokens;
     const int   n_kv      = n_past + T;
 
+    // qwen4exp: the residual carried between segments is hc streams wide, and
+    // the per-layer scatter weights ("inject") produced by seg A's second mixer
+    // have to reach seg B, so they join the double-buffered carries.
+    const bool hc_on = hp.has_hc();
+    const int  n_hc  = hc_on ? (int) hp.hc_count : 1;
+    if (hc_on && n_ovr > 0) {
+        throw std::runtime_error("image embeddings are not wired into the "
+                                 "hyper-connection residual yet");
+    }
+
     // temp carry tensors sized for this batch (bridge seg A->B and layer->layer).
     // ffn_in/resid/weights are double-buffered (parity by layer) so the fused
     // segB(L)+segA(L+1) graph has no write-after-read hazard (mirrors decode_cached).
     ggml_init_params tp{};
-    tp.mem_size = ggml_tensor_overhead() * 12 + 256;
+    tp.mem_size = ggml_tensor_overhead() * 16 + 256;
     tp.no_alloc = true;
     ggml_context * tctx = ggml_init(tp);
-    ggml_tensor * h_b       = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
+    ggml_tensor * h_b       = hc_on
+            ? ggml_new_tensor_3d(tctx, GGML_TYPE_F32, n_embd, n_hc, T)
+            : ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
+    ggml_tensor * inject_b  = hc_on ? ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_hc, T) : nullptr;
+    ggml_tensor * inject_b2 = hc_on ? ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_hc, T) : nullptr;
+    // the whole chunk's gathered n-gram rows, filled once on the host below
+    ggml_tensor * ple_b     = use_ple() ? ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T) : nullptr;
     ggml_tensor * ffn_in_b  = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
     ggml_tensor * resid_b   = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
     ggml_tensor * weights_b = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_used, T);
@@ -2831,12 +2867,28 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_tensor * inp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
         ggml_set_input(inp); ggml_set_name(inp, "inp_tok");
         ggml_tensor * emb = ggml_get_rows(ctx, model.tok_embd_rows(), inp);  // [n_embd, T]
+        if (hc_on) {
+            // the wide residual starts as hc identical copies of the embedding
+            emb = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, emb, n_embd, 1, T),
+                                 n_embd, n_hc, T, 1);
+        }
         ggml_build_forward_expand(gf, ggml_cpy(ctx, emb, h_b));
         run(ctx, gf);
         ggml_backend_tensor_set(inp, toks, 0, T * sizeof(int32_t));
         if (compute_graph(gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("decode_cached_batch: embed compute failed");
         ggml_free(ctx);
+    }
+
+    // The n-gram rows for the whole chunk in one host pass: every index is known
+    // before any graph runs, so the misses go to disk in file order (see
+    // NgramTable::gather) instead of one scattered read per seg A slice.
+    if (ple_b) {
+        ngram_rows.clear();
+        ngram->hash_rows(toks, T, ngram_hist, ngram_rows);
+        ngram_embd.resize(ngram_rows.size() * hp.ple_head_dim);
+        ngram->gather(ngram_rows.data(), ngram_rows.size(), ngram_embd.data());
+        ggml_backend_tensor_set(ple_b, ngram_embd.data(), 0, ggml_nbytes(ple_b));
     }
 
     // vision: overwrite the image-span rows of the embed output with the
@@ -2852,6 +2904,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     ggml_tensor * carry_ffn[2] = { ffn_in_b,  ffn_in_b2  };
     ggml_tensor * carry_res[2] = { resid_b,   resid_b2   };
     ggml_tensor * carry_wgt[2] = { weights_b, weights_b2 };
+    ggml_tensor * carry_inj[2] = { inject_b,  inject_b2  };
 
     // Append seg A (attention/GDN + router) for layer `il` over the token slice
     // [tc0, tc0+tlen) of the chunk; writes that slice of the layer's parity carry
@@ -2863,6 +2916,12 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         auto tslice = [&](ggml_tensor * t) {   // token-dim slice view [ne0, tlen]
             return ggml_view_2d(ctx, t, t->ne[0], tlen, t->nb[1], (size_t) tc0 * t->nb[1]);
         };
+        // the wide residual has tokens on ne[2], so it slices one dimension over
+        auto hslice = [&](ggml_tensor * t) {
+            return hc_on ? ggml_view_3d(ctx, t, n_embd, n_hc, tlen,
+                                        t->nb[1], t->nb[2], (size_t) tc0 * t->nb[2])
+                         : tslice(t);
+        };
         const int n_kv_c = n_past + tc0 + tlen;
         const bool recurrent = hp.is_recurrent(il);
         ggml_tensor * inp_pos = nullptr, * inp_mask = nullptr;
@@ -2873,9 +2932,23 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
         }
 
-        ggml_tensor * h_c = tslice(h_b);
-        ggml_tensor * cur = ggml_rms_norm(ctx, h_c, eps);
-        cur = ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il));
+        ggml_tensor * h_c = hslice(h_b);
+        ggml_tensor * res_hc = nullptr, * inject = nullptr;
+        ggml_tensor * cur;
+        if (hc_on) {
+            res_hc = h_c;
+            if (ple_b && hp.is_ple(il)) {
+                res_hc = build_ple(ctx, gf, il, res_hc, tslice(ple_b), tlen);
+            }
+            cur = build_hc_mix(ctx, res_hc,
+                    W("blk.%d.hc_attn_norm.weight",   il),
+                    W("blk.%d.hc_attn_down.weight",   il),
+                    W("blk.%d.hc_attn_up.weight",     il),
+                    W("blk.%d.hc_attn_inject.weight", il), &inject);
+        } else {
+            cur = ggml_rms_norm(ctx, h_c, eps);
+            cur = ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il));
+        }
 
         if (recurrent) {
             cur = build_gdn(ctx, gf, il, cur, tlen);
@@ -2910,10 +2983,24 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
         }
 
-        ggml_tensor * attn_resid = ggml_add(ctx, cur, h_c);          // [n_embd, tlen]
+        ggml_tensor * attn_resid = nullptr;
         ggml_tensor * ffn_in;
-        if (gated) ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", il));
-        else       ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il));
+        if (hc_on) {
+            res_hc = build_hc_combine(ctx, res_hc, cur, inject);
+            ffn_in = build_hc_mix(ctx, res_hc,
+                    W("blk.%d.hc_ffn_norm.weight",   il),
+                    W("blk.%d.hc_ffn_down.weight",   il),
+                    W("blk.%d.hc_ffn_up.weight",     il),
+                    W("blk.%d.hc_ffn_inject.weight", il), &inject);
+            // seg B resumes from the residual as it stands after attention
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, res_hc, hslice(h_b)));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, inject, tslice(carry_inj[il & 1])));
+        } else {
+            attn_resid = ggml_add(ctx, cur, h_c);          // [n_embd, tlen]
+            if (gated) ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", il));
+            else       ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, tslice(carry_res[il & 1])));
+        }
 
         // multi-token router
         ggml_tensor * logits = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp.weight", il), ffn_in);  // [n_exp, tlen]
@@ -2934,7 +3021,6 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_build_forward_expand(gf, selected);
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, tslice(carry_ffn[il & 1])));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, tslice(carry_res[il & 1])));
         ggml_build_forward_expand(gf, ggml_cpy(ctx, weights, tslice(carry_wgt[il & 1])));
         return selected;
     };
@@ -2970,8 +3056,16 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             ggml_tensor * sgt = ggml_sigmoid(ctx, ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp_shexp.weight", il), ffn_l));
             moe_out = ggml_add(ctx, moe_out, ggml_mul(ctx, sh, sgt));
         }
-        ggml_tensor * h_new = ggml_add(ctx, moe_out, tslice(carry_res[il & 1]));  // [n_embd, len]
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, tslice(h_b)));
+        if (hc_on) {
+            ggml_tensor * res_hc = ggml_view_3d(ctx, h_b, n_embd, n_hc, len,
+                    h_b->nb[1], h_b->nb[2], (size_t) t0 * h_b->nb[2]);
+            ggml_tensor * h_new = build_hc_combine(ctx, res_hc, moe_out,
+                                                   tslice(carry_inj[il & 1]));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, res_hc));
+        } else {
+            ggml_tensor * h_new = ggml_add(ctx, moe_out, tslice(carry_res[il & 1]));  // [n_embd, len]
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, tslice(h_b)));
+        }
     };
 
     // Set the attention pos/mask inputs of a graph (no-op for GDN-only graphs)
@@ -3310,9 +3404,21 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     if (want_logits) {
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-        ggml_tensor * last = ggml_view_2d(ctx, h_b, n_embd, 1, h_b->nb[1], (size_t) (T - 1) * h_b->nb[1]);
-        ggml_tensor * cur = ggml_rms_norm(ctx, last, eps);
-        cur = ggml_mul(ctx, cur, model.tensor("output_norm.weight"));
+        ggml_tensor * cur;
+        if (hc_on) {
+            // the final mixer is the output norm; qwen4exp carries no other one
+            ggml_tensor * last = ggml_view_3d(ctx, h_b, n_embd, n_hc, 1,
+                    h_b->nb[1], h_b->nb[2], (size_t) (T - 1) * h_b->nb[2]);
+            cur = build_hc_mix(ctx, last,
+                    model.tensor("output_hc_norm.weight"),
+                    model.tensor("output_hc_down.weight"),
+                    model.tensor("output_hc_up.weight"), nullptr, nullptr);
+        } else {
+            ggml_tensor * last = ggml_view_2d(ctx, h_b, n_embd, 1, h_b->nb[1],
+                                              (size_t) (T - 1) * h_b->nb[1]);
+            cur = ggml_rms_norm(ctx, last, eps);
+            cur = ggml_mul(ctx, cur, model.tensor("output_norm.weight"));
+        }
         ggml_tensor * output_w = model.tensor("output.weight");
         if (!output_w) output_w = model.tensor("token_embd.weight");
         cur = ggml_mul_mat(ctx, output_w, cur);
@@ -3380,6 +3486,8 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     const float eps       = hp.rms_eps;
     const bool  gated     = hp.has_gdn;
     const int   n_kv      = n_past + 1;
+    const bool  hc_on     = hp.has_hc();
+    const int   n_hc      = hc_on ? (int) hp.hc_count : 1;
 
     auto new_ctx = [&]() {
         ggml_init_params gp{};
@@ -3417,11 +3525,22 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         ggml_tensor * inp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
         ggml_set_input(inp); ggml_set_name(inp, "inp_tok");
         ggml_tensor * emb = ggml_get_rows(ctx, model.tok_embd_rows(), inp);  // [n_embd,1]
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, emb, n_embd), p_h));
+        emb = hp.has_hc()
+                ? ggml_repeat_4d(ctx, ggml_reshape_2d(ctx, emb, n_embd, 1), n_embd, hp.hc_count, 1, 1)
+                : ggml_reshape_1d(ctx, emb, n_embd);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, emb, p_h));
         run(ctx, gf, 0);
         ggml_backend_tensor_set(inp, &token, 0, sizeof(int32_t));
         compute(gf, 0, "embed compute failed");
         ggml_free(ctx);
+    }
+
+    if (p_ple) {
+        ngram_rows.clear();
+        ngram->hash_rows(&token, 1, ngram_hist, ngram_rows);
+        ngram_embd.resize(ngram_rows.size() * hp.ple_head_dim);
+        ngram->gather(ngram_rows.data(), ngram_rows.size(), ngram_embd.data());
+        ggml_backend_tensor_set(p_ple, ngram_embd.data(), 0, ggml_nbytes(p_ple));
     }
 
     std::vector<int32_t> sel(n_used), slot_g(n_used), slot_u(n_used), slot_d(n_used);
@@ -3432,6 +3551,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     auto carry_ffn = [&](int il) { return (il & 1) ? p_ffn_in2  : p_ffn_in;  };
     auto carry_res = [&](int il) { return (il & 1) ? p_resid2   : p_resid;   };
     auto carry_wgt = [&](int il) { return (il & 1) ? p_weights2 : p_weights; };
+    auto carry_inj = [&](int il) { return (il & 1) ? p_inject2  : p_inject;  };
 
     // Append seg A (attention/GDN + router) for layer `il` to (ctx,gf). Writes the
     // normed FFN input / residual / router weights into the layer's parity carry,
@@ -3445,8 +3565,22 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, 1);
             ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
         }
-        ggml_tensor * cur = ggml_rms_norm(ctx, p_h, eps);
-        cur = ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il));
+        ggml_tensor * res_hc = nullptr, * inject = nullptr;
+        ggml_tensor * cur;
+        if (hc_on) {
+            res_hc = ggml_reshape_3d(ctx, p_h, n_embd, n_hc, 1);
+            if (p_ple && hp.is_ple(il)) {
+                res_hc = build_ple(ctx, gf, il, res_hc, p_ple, 1);
+            }
+            cur = build_hc_mix(ctx, res_hc,
+                    W("blk.%d.hc_attn_norm.weight",   il),
+                    W("blk.%d.hc_attn_down.weight",   il),
+                    W("blk.%d.hc_attn_up.weight",     il),
+                    W("blk.%d.hc_attn_inject.weight", il), &inject);
+        } else {
+            cur = ggml_rms_norm(ctx, p_h, eps);
+            cur = ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il));
+        }
         if (recurrent) {
             cur = build_gdn(ctx, gf, il, cur, 1);
         } else {
@@ -3479,14 +3613,27 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
         }
-        ggml_tensor * attn_resid = ggml_add(ctx, cur, p_h);
         ggml_tensor * ffn_in;
-        if (gated) ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", il));
-        else       ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il));
+        if (hc_on) {
+            res_hc = build_hc_combine(ctx, res_hc, cur, inject);
+            ffn_in = build_hc_mix(ctx, res_hc,
+                    W("blk.%d.hc_ffn_norm.weight",   il),
+                    W("blk.%d.hc_ffn_down.weight",   il),
+                    W("blk.%d.hc_ffn_up.weight",     il),
+                    W("blk.%d.hc_ffn_inject.weight", il), &inject);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx,
+                    ggml_reshape_2d(ctx, res_hc, n_embd, n_hc), p_h));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx,
+                    ggml_reshape_1d(ctx, inject, n_hc), carry_inj(il)));
+        } else {
+            ggml_tensor * attn_resid = ggml_add(ctx, cur, p_h);
+            if (gated) ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", il));
+            else       ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, carry_res(il)));
+        }
         ggml_tensor * weights = nullptr;
         ggml_tensor * selected = build_router(ctx, gf, il, ffn_in, weights);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, carry_ffn(il)));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, carry_res(il)));
         ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, weights, n_used), carry_wgt(il)));
         return selected;
     };
@@ -3494,8 +3641,17 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     auto build_segB = [&](ggml_context * ctx, ggml_cgraph * gf, int il) {
         ggml_tensor * moe_out = build_moe_cached(ctx, gf, il, carry_ffn(il),
                                                  p_slot_g, p_slot_u, p_slot_d, carry_wgt(il));
-        ggml_tensor * h_new = ggml_add(ctx, moe_out, carry_res(il));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, h_new, n_embd), p_h));
+        if (hc_on) {
+            ggml_tensor * res_hc = ggml_reshape_3d(ctx, p_h, n_embd, n_hc, 1);
+            ggml_tensor * h_new = build_hc_combine(ctx, res_hc,
+                    ggml_reshape_2d(ctx, moe_out, n_embd, 1),
+                    ggml_reshape_2d(ctx, carry_inj(il), n_hc, 1));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx,
+                    ggml_reshape_2d(ctx, h_new, n_embd, n_hc), p_h));
+        } else {
+            ggml_tensor * h_new = ggml_add(ctx, moe_out, carry_res(il));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, h_new, n_embd), p_h));
+        }
     };
     // Set the attention pos/mask inputs of a graph (no-op if it has none, e.g. a
     // segB-only graph or a GDN-only seg A).
@@ -3586,8 +3742,17 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     {
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-        ggml_tensor * cur = ggml_rms_norm(ctx, p_h, eps);
-        cur = ggml_mul(ctx, cur, model.tensor("output_norm.weight"));
+        ggml_tensor * cur;
+        if (hc_on) {
+            // the final mixer is the output norm; qwen4exp carries no other one
+            cur = build_hc_mix(ctx, ggml_reshape_3d(ctx, p_h, n_embd, n_hc, 1),
+                    model.tensor("output_hc_norm.weight"),
+                    model.tensor("output_hc_down.weight"),
+                    model.tensor("output_hc_up.weight"), nullptr, nullptr);
+        } else {
+            cur = ggml_rms_norm(ctx, p_h, eps);
+            cur = ggml_mul(ctx, cur, model.tensor("output_norm.weight"));
+        }
         ggml_tensor * output_w = model.tensor("output.weight");
         if (!output_w) output_w = model.tensor("token_embd.weight");
         cur = ggml_mul_mat(ctx, output_w, cur);

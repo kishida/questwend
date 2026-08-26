@@ -75,14 +75,20 @@ python tests/qwen4/check_tiny.py
 
 | ケース | 内容 | 結果 |
 |---|---|---|
-| `dense-5tok` | hyper-connection / GDN / dense attention / MoE | **一致**（最大差 0.0006 = span の 0.022%） |
-| `ple-5tok` | PLE の n-gram ハッシュ・行 gather・dilated conv | **一致**（最大差 0.0002 = span の 0.007%） |
+| `dense-5tok` | hyper-connection / GDN / dense attention / MoE | **一致**（最大差 span の 0.022%） |
+| `ple-5tok` | PLE の n-gram ハッシュ・行 gather・dilated conv | **一致**（span の 0.007%） |
 | `dense-5tok-ngram-off` | `--ngram off` が PLE 無しモデルを再現するか | **一致** |
+| `offload` / `offload-ssd` | expert-offload 経路（segA/segB）が広い残差と PLE を運べるか | **一致**（span の 0.27%、argmax・top-10 順序とも一致） |
+| `ple-gen` / `nople-gen` / `ple-ssd-gen` | デコード間の状態引き継ぎ（GDN conv/ssm・PLE conv 履歴・n-gram 窓） | **一致**（4 プロンプト × 8 トークン貪欲生成） |
 | `qsa-36tok` | QSA | **不一致**（QSA 未実装。llama.cpp は QSA、qwencpp は dense） |
-| `ple-gen` / `nople-gen` | デコード間の状態引き継ぎ（GDN conv/ssm・PLE conv 履歴・n-gram 窓） | **一致**（4 プロンプト × 8 トークン貪欲生成） |
 
 `qsa-36tok` は QSA を実装したら自動的に一致に変わる。36 トークンなのは
 `indexer_top_k + compress_ratio - 1 = 9` を超えさせるため。
+
+offload 系の許容差が緩い（0.27%）のは GPU と CPU の数値差であって offload 経路の
+問題ではない。常駐 GPU 実行がまったく同じ数字（最大差 0.007391、同じ index）を出す。
+極小モデルの head 幅 32 は CUDA の flash-attention カーネルが受け付けないので
+`QWEN_NO_FLASH=1` を付けている（実物の head 幅は 256）。
 
 生成の比較は「最後の 1 トークンを除いて一致」を基準にしている。両者の logits は
 span の 0.02% まで一致するが、貪欲デコードでは僅差の順位が入れ替わることがあり、

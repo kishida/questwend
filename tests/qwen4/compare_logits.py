@@ -6,7 +6,12 @@ write, and reports the worst absolute/relative gap plus whether the argmax and
 the top-k ordering agree. Ordering is what actually matters for generation, so
 it is reported separately from the raw numbers.
 
-    python tests/qwen4/compare_logits.py <reference.txt> <ours.txt> [--top 10]
+    python tests/qwen4/compare_logits.py <reference.txt> <ours.txt> [--top=10] [--tol=1e-3]
+
+--tol is the pass threshold as a fraction of the logit span. 1e-3 is what an
+f32 CPU graph reproducing another f32 CPU graph looks like; a GPU run against a
+CPU reference needs more room (F16 KV cache, different kernels) and 5e-3 is the
+measured figure there.
 """
 import sys
 
@@ -27,10 +32,12 @@ def load(path):
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
-    top = 10
+    top, tol = 10, 1e-3
     for a in sys.argv[1:]:
-        if a.startswith('--top'):
-            top = int(a.split('=', 1)[1]) if '=' in a else top
+        if a.startswith('--top='):
+            top = int(a.split('=', 1)[1])
+        elif a.startswith('--tol='):
+            tol = float(a.split('=', 1)[1])
     if len(args) < 2:
         raise SystemExit(__doc__)
 
@@ -58,8 +65,7 @@ def main():
         print(f'  ref  {order_ref[:top]}')
         print(f'  ours {order_our[:top]}')
 
-    # a clean pass is what a correct port of a graph looks like in f32
-    sys.exit(0 if diffs[worst] < 1e-3 * max(span, 1.0) else 1)
+    sys.exit(0 if diffs[worst] < tol * max(span, 1.0) else 1)
 
 
 if __name__ == '__main__':
