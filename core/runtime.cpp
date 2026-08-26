@@ -3531,6 +3531,33 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                     pf_chunk, il, n_drop, total > 0.0 ? dropped / total : 0.0);
     };
 
+    // QWEN_NAN_CHECK=1: read the running hidden state back after every layer and
+    // report the first one that is not finite. A NaN anywhere in a 48-layer
+    // stack reaches the logits as a uniform NaN, which says nothing about where
+    // it started; this says which layer.
+    static const bool nan_check = getenv("QWEN_NAN_CHECK") != nullptr;
+    bool nan_seen = false;
+    std::vector<float> nan_buf;
+    auto check_nan = [&](int il, const char * where) {
+        if (!nan_check) return;
+        nan_buf.resize(ggml_nelements(h_b));
+        ggml_backend_tensor_get(h_b, nan_buf.data(), 0, ggml_nbytes(h_b));
+        float mx = 0.0f;
+        size_t bad = (size_t) -1;
+        for (size_t i = 0; i < nan_buf.size(); ++i) {
+            const float v = nan_buf[i];
+            if (!std::isfinite(v)) { if (bad == (size_t) -1) bad = i; continue; }
+            mx = std::max(mx, std::fabs(v));
+        }
+        fprintf(stderr, "nan-check: layer %2d after %s  max|h|=%.4g  recr=%d",
+                il, where, mx, (int) hp.is_recurrent(il));
+        if (bad != (size_t) -1) {
+            fprintf(stderr, "  FIRST NON-FINITE at [%zu] = %g", bad, nan_buf[bad]);
+        }
+        fprintf(stderr, "\n");
+        if (bad != (size_t) -1) nan_seen = true;
+    };
+
     if (T > sega_chunk) {
         // ---- Layer-major prefill: for each layer, run seg A over attention-sized
         // token sub-chunks (KV/GDN state chains within the layer), then seg B once
@@ -3551,6 +3578,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                                         (size_t) n_used * tlen * sizeof(int32_t));
                 ggml_free(ctx);
             }
+            check_nan(il, "seg A");
             prune_layer(il);
             plan_slices(il);
             const auto s0 = ec_stats_sum();
@@ -3578,6 +3606,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                 ggml_free(ctx);
             }
             log_layer(il, nsl, s0);
+            check_nan(il, "seg B");
         }
     } else {
     // seg A(0) on its own, then fuse segB(L)+segA(L+1) per step so each layer
@@ -3614,6 +3643,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             ggml_free(ctx);
         }
         log_layer(il, nsl, s0);
+        check_nan(il, "seg B");
     }
     }
 

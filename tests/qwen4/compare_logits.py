@@ -73,7 +73,8 @@ def main():
         print(f'  ref  {order_ref[:top]}')
         print(f'  ours {order_our[:top]}')
 
-    ok = (order_ref[0] == order_our[0]) if judge == 'argmax'          else diffs[worst] < tol * max(span, 1.0)
+    ok = (order_ref[0] == order_our[0]) if judge == 'argmax' \
+         else diffs[worst] < tol * max(span, 1.0)
     sys.exit(0 if ok else 1)
 
 
