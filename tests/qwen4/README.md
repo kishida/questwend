@@ -18,6 +18,7 @@ qwencpp に `qwen4exp` アーキテクチャを実装するための、llama.cpp
 | `dump_gguf.py` | GGUF ヘッダのみを読むダンパ。ダウンロード途中の `.part` でも動く（`gguf_dump.py` は全体を mmap して reshape するので落ちる） |
 | `make_tiny_model.py` | 同じ構造の**極小 qwen4exp を乱数生成**（8層 / d=128 / 7 MiB、全 F32）。`--no-ple` で PLE 抜き版 |
 | `check_tiny.py` | 極小モデルを qw-cli に通し、記録済みの llama.cpp 参照と比較する |
+| `check_weights.py` | GGUF の重みが壊れていないか、ロードせずに数秒で確認する |
 | `compare_logits.py` | `index: value` 形式の logits ダンプ 2 本を比較（最大差・argmax・top-k 順序） |
 | `01-tiny/` | 極小モデルの参照 logits。`.gguf` は seed 固定で再生成できるのでコミットしない |
 
@@ -140,6 +141,49 @@ backend buffer にも入らない）。行番号はトークン ID だけから�
 実装は [core/ngram_table.h](../../core/ngram_table.h) / [.cpp](../../core/ngram_table.cpp)。
 prefill では全行番号がグラフ実行前に判明するので、miss をファイルオフセット順に
 ソートしてから読む（HDD ではランダムシークが片方向スイープになる）。
+
+## ダウンロードの検証（先にやること）
+
+```bash
+python tests/qwen4/check_weights.py <先頭シャード>.gguf
+```
+
+RMSNorm の gamma は学習済みモデルなら必ず 1 付近にある。それだけを読む
+（層あたり数 KB）ので数秒で終わり、破損した領域を層番号で指してくれる。
+
+実際にこれで IQ1_S の破損を捕まえた: 層 29〜32 だけ gamma の中央値が 0.0001〜0.013、
+`hc_*_inject` などに inf が混入していた。**切り詰めではなく途中のバイトが化けている**
+種類の破損なので、サイズを見ても分からない。全ロードは数分かかるうえ、出てくるのは
+「logits が全部 NaN」という原因の分からない結果だけ。
+
+## 512GB Mac で動かす（全常駐）
+
+Q4_K_XL は全部 RAM に載るので、オフロードを使わない**常駐パス**（`build_graph`）で走る。
+これが極小モデルで最も検証されている経路でもある。
+
+```bash
+git clone <repo> qwencpp && cd qwencpp && git checkout qwen4
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DQW_METAL=ON
+cmake --build build -j
+
+python tests/qwen4/check_weights.py ~/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-*.gguf
+
+./build/qw-cli -m ~/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-*.gguf --info
+./build/qw-cli -m ~/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-*.gguf \
+    -p "The capital of France is" -n 32 --n-ctx 4096 --ngram ram --temp 0
+```
+
+`--ngram ram` は n-gram テーブル（量子化のまま、Q4_K_XL なら 30 GB 前後）を丸ごと
+ホストメモリに置く。512GB なら素直にこれが速い。ディスクに残したいときは
+`--ngram disk --ngram-cache 4096`、品質への影響を測りたいときは `--ngram off`。
+
+うまくいかないときの切り分け:
+
+| 症状 | 次の一手 |
+|---|---|
+| logits が NaN / 出力が同じトークンの連打 | `QWEN_NAN_CHECK=1`（オフロード経路のみ）と `check_weights.py` |
+| 2051 トークンを超えると出力が崩れる | QSA。`.*indexer_.*` を `QWEN_QSA_DEBUG=1` と突き合わせる |
+| 起動が遅い | 常駐パスは全重みを読む。Q4_K_XL なら 100 GB 超 |
 
 ## 参照キャプチャ手順
 

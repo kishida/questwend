@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#ifndef _WIN32
+#include <sys/types.h>   // off_t, for fseeko
+#endif
 #include <cstring>
 #include <list>
 #include <stdexcept>
