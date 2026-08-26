@@ -118,7 +118,9 @@ struct HParams {
 
     // GGUF metadata (display / identification)
     std::string  general_name;  // general.name
-    uint32_t     file_type = 0; // general.file_type (ggml_ftype enum value)
+    // general.file_type. The value is a llama_ftype, not the ggml_ftype the
+    // name suggests -- the two agree up to Q5_1 and diverge from there.
+    uint32_t     file_type = 0;
 
     bool is_moe() const { return n_expert > 0; }
     // Main transformer stack excludes the trailing MTP (next-token-prediction) blocks.

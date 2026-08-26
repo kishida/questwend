@@ -751,7 +751,11 @@ int main(int argc, char ** argv) {
 
     // Build a human-readable display name: "Qwen3-30B-A3B Q8_0(qwen3)"
     auto ftype_label = [](uint32_t ft) -> const char * {
-        // Values match llama_ftype (what GGUF general.file_type actually stores)
+        // llama_ftype, which is what GGUF general.file_type stores -- NOT
+        // ggml_ftype, whose values diverge from 10 onwards. Two of these were
+        // once missing (Q2_K_S and IQ3_XS), which shifted everything above them
+        // by two and made an IQ1_S model announce itself as IQ3_S. Gaps in the
+        // numbering are ftypes that were removed from the format.
         switch (ft) {
             case  0: return "F32";      case  1: return "F16";
             case  2: return "Q4_0";     case  3: return "Q4_1";
@@ -762,10 +766,16 @@ int main(int argc, char ** argv) {
             case 15: return "Q4_K_M";   case 16: return "Q5_K_S";
             case 17: return "Q5_K_M";   case 18: return "Q6_K";
             case 19: return "IQ2_XXS";  case 20: return "IQ2_XS";
-            case 21: return "IQ3_XXS";  case 22: return "IQ1_S";
-            case 23: return "IQ4_NL";   case 24: return "IQ3_S";
-            case 25: return "IQ2_S";    case 26: return "IQ4_XS";
-            case 27: return "IQ1_M";    case 28: return "BF16";
+            case 21: return "Q2_K_S";   case 22: return "IQ3_XS";
+            case 23: return "IQ3_XXS";  case 24: return "IQ1_S";
+            case 25: return "IQ4_NL";   case 26: return "IQ3_S";
+            case 27: return "IQ3_M";    case 28: return "IQ2_S";
+            case 29: return "IQ2_M";    case 30: return "IQ4_XS";
+            case 31: return "IQ1_M";    case 32: return "BF16";
+            case 36: return "TQ1_0";    case 37: return "TQ2_0";
+            case 38: return "MXFP4_MOE"; case 39: return "NVFP4";
+            case 40: return "Q1_0";     case 41: return "Q2_0";
+            case 1024: return "";       // GUESSED: the file did not say
             default: return "";
         }
     };
