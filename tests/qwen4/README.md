@@ -142,6 +142,38 @@ backend buffer にも入らない）。行番号はトークン ID だけから�
 prefill では全行番号がグラフ実行前に判明するので、miss をファイルオフセット順に
 ソートしてから読む（HDD ではランダムシークが片方向スイープになる）。
 
+### 実モデルでの動作（2026-08-27）
+
+**Apple M3 Ultra / 512GB / Metal で `UD-Q4_K_XL`（4 シャード）が完走。**
+`--ngram ram` / `--ngram disk` / `--ngram off` の 3 モードとも同一の出力で、
+プロンプトのタイポ（"Framce"）を正しく France と解釈している。
+
+```
+backend: GPU [MTL0] Apple M3 Ultra
+token_embd: q8_0 natively supported by backend get_rows (no fallback copy)
+ngram table: 26.8 / 26.8 GiB
+ngram: ram (27465 MB resident)
+The capital of Framce is
+<think>
+The user is asking about the capital of France (they made a typo writing
+"Framce" instead of "France"). The capital of France
+```
+
+n-gram テーブルは Q4_K_XL でも 26.8 GiB のまま。`ple_head_dim = 160` は 256 の倍数でないので
+256-block の K-quant が使えず、32-block の IQ4_NL に落ちるため。
+
+**3 モードで貪欲デコードの出力が一致した**のは `--ngram off` の品質影響についての
+最初の実データだが、1 プロンプトでは何も結論できない。まともな測定はまだ。
+
+Windows 側では IQ1_S で層 0〜28 まで健全に動作することを確認済み
+（層 29 以降はダウンロード破損のため未評価。`check_weights.py` 参照）。
+
+### まだ検証していない経路
+
+**QSA（キャッシュ 2051 トークン超）は Metal 上で未実行。** それ未満では QSA は完全に
+不活性（dense と数値一致）なので、上の実行は QSA を一度も通っていない。
+`ggml_fill` / `ggml_set_rows` を使うので Metal 側のカーネル有無が最初の関門。
+
 ## ダウンロードの検証（先にやること）
 
 ```bash
