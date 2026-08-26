@@ -115,6 +115,13 @@ struct Runtime::Impl {
     std::vector<std::unique_ptr<ExpertCache>> ecaches;
     ExpertCache *         ecache = nullptr;
     // The cache holding `il`'s experts: the one on the device that computes it.
+    // Prefill runs its expert matmuls at the pool, like decode does. Routing
+    // prefill to the layer's compute device instead was tried and measured: it
+    // does speed prefill up (+3-6%, the heavy matmul lands on the fast card),
+    // but prefill is also what WARMS the pools, so the pool device starts decode
+    // cold and has to fault its share in one miss at a time. Net -10% at 128
+    // generated tokens and still -2% at 512, where the transient has mostly
+    // washed out. The two are not separable; don't try it again.
     ExpertCache * ec_of(int il) const {
         if (ecaches.size() <= 1) return ecache;
         const size_t d = (size_t) pdev_of(il);
