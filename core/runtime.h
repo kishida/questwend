@@ -68,18 +68,26 @@ size_t parse_vram_budget_mb(const std::string & arg, bool * legacy_mb = nullptr)
 //   --vram-budget "13.5,5"  -> one budget per device, each parsed as above
 //   --gpus        "1,0"     -> device indices into gpu_devices(), primary first
 //   --gpu-split   "0.8,0"   -> compute-layer share per device (0 = expert pool)
+//                  "auto"   -> share by --vram-budget, or by free VRAM without it
 // A single-element --vram-budget keeps the old single-GPU meaning.
 bool parse_vram_budget_list(const std::string & arg, std::vector<size_t> & out,
                             bool * legacy_mb = nullptr);
 bool parse_gpu_list(const std::string & arg, std::vector<int> & out);
+// "auto" parses to an empty `out` (a valid plan, ratio decided later), so the
+// caller must track whether the flag was present separately.
 bool parse_gpu_split(const std::string & arg, std::vector<float> & out);
 
-// Combine the three parsed lists into RuntimeConfig::gpus. `out` is left empty
-// for the plain single-GPU case (no --gpus, and at most one entry each), which
-// keeps the historical "first device that initializes" behavior. Prints what
-// disagrees and returns false when the list lengths are inconsistent.
+// Combine the parsed lists into RuntimeConfig::gpus.
+//
+// `split_given` is the multi-GPU switch: without --gpu-split exactly one GPU is
+// used, whatever else was listed, which keeps every existing command line doing
+// what it always did. Naming several devices without it is a mistake worth a
+// note rather than a silent layer split. `out` is left empty for the plain
+// default (no --gpus either), preserving "first device that initializes".
+// Prints what disagrees and returns false when the list lengths are inconsistent.
 bool build_gpu_plan(const std::vector<int> & gpu_ids,
                     const std::vector<float> & gpu_split,
+                    bool split_given,
                     const std::vector<size_t> & vram_mb,
                     std::vector<GpuPlan> & out);
 

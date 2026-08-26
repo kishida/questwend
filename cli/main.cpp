@@ -105,13 +105,18 @@ static void usage(const char * prog) {
     printf("  --seed <N>     RNG seed (0 = random)\n");
     printf("  --vram-budget <GB>  offload expert weights to CPU; keep non-expert on GPU\n");
     printf("                      GB, fractions ok (13.5); suffix M/G to be explicit (13500M)\n");
-    printf("                      one value per GPU with --gpus (e.g. 13.5,5)\n");
-    printf("  --gpus <list>       GPU device indices to use, primary first (e.g. 1 or 1,0)\n");
-    printf("  --gpu-split <list>  each GPU's share of the compute layers (e.g. 0.8,0.2).\n");
-    printf("                      A GPU given 0 holds no layers, so its whole budget\n");
-    printf("                      becomes expert pool for the others. Default splits\n");
-    printf("                      by --vram-budget, or by free VRAM when it is omitted\n");
-    printf("                      (which runs a model too big for one card on several).\n");
+    printf("                      one value per GPU with --gpu-split (e.g. 13.5,5)\n");
+    printf("  --gpus <list>       GPU device index, or indices with --gpu-split,\n");
+    printf("                      primary first (e.g. 1, or 1,0)\n");
+    printf("  --gpu-split <spec>  spread the model over several GPUs (off by default:\n");
+    printf("                      without this flag exactly one GPU is used).\n");
+    printf("                      auto      = share by --vram-budget, or by free VRAM\n");
+    printf("                                  without it (runs a model too big for\n");
+    printf("                                  one card on several)\n");
+    printf("                      0.8,0.2   = each GPU's share of the compute layers;\n");
+    printf("                                  a GPU given 0 holds no layers, so its\n");
+    printf("                                  whole budget becomes expert pool for the\n");
+    printf("                                  others\n");
     printf("  --cache-profile <f> persist/prefetch hot-expert profile (warm restarts)\n");
     printf("  --experts-ssd  stream experts from the GGUF on SSD (no RAM copy)\n");
     printf("  --cpu          force CPU backend\n");
@@ -141,7 +146,8 @@ int main(int argc, char ** argv) {
     size_t vram_budget_mb = 0;          // total across GPUs (gates expert offload)
     std::vector<size_t> vram_list;      // --vram-budget, one entry per GPU
     std::vector<int>    gpu_ids;        // --gpus
-    std::vector<float>  gpu_split;      // --gpu-split
+    std::vector<float>  gpu_split;      // --gpu-split ("auto" leaves this empty)
+    bool gpu_split_given = false;       // the multi-GPU switch; without it, one GPU
     bool interactive = false, info_only = false, chat = false, log_speed = false, force_cpu = false;
     bool experts_ssd = false, reasoning = true, use_mtp = false, embd_q8 = false, vision_test = false;
     SamplerConfig sc;
@@ -172,9 +178,10 @@ int main(int argc, char ** argv) {
         else if (a == "--gpu-split" && i + 1 < argc) {
             const std::string v = next();
             if (!parse_gpu_split(v, gpu_split)) {
-                fprintf(stderr, "error: bad --gpu-split value: %s (expected e.g. 0.8,0.2 -- non-negative, not all zero)\n", v.c_str());
+                fprintf(stderr, "error: bad --gpu-split value: %s (expected auto, or e.g. 0.8,0.2 -- non-negative, not all zero)\n", v.c_str());
                 return 1;
             }
+            gpu_split_given = true;
         }
         else if (a == "--vram-budget" && i + 1 < argc) {
             const std::string v = next();
@@ -343,7 +350,11 @@ int main(int argc, char ** argv) {
         cfg.n_ctx          = n_ctx;
         cfg.use_cuda       = !force_cpu;
         cfg.vram_budget_mb = vram_budget_mb;
-        if (!build_gpu_plan(gpu_ids, gpu_split, vram_list, cfg.gpus)) return 1;
+        if (!build_gpu_plan(gpu_ids, gpu_split, gpu_split_given, vram_list, cfg.gpus)) return 1;
+        // Across GPUs vram_budget_mb only gates offload (each device's own budget
+        // comes from the plan), but on one GPU it IS the budget -- so it has to be
+        // that GPU's value, never the total of a list whose tail is being ignored.
+        if (cfg.gpus.size() <= 1 && !vram_list.empty()) cfg.vram_budget_mb = vram_list[0];
         cfg.cache_profile  = cache_profile;
         cfg.experts_ssd    = experts_ssd;
         // MTP needs the nextn block kept VRAM-resident (also the dev MTP test mode).

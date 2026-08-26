@@ -4128,6 +4128,9 @@ bool parse_gpu_list(const std::string & arg, std::vector<int> & out) {
 }
 
 bool parse_gpu_split(const std::string & arg, std::vector<float> & out) {
+    std::string lower;
+    for (char c : arg) lower += (char) tolower((unsigned char) c);
+    if (lower == "auto") { out.clear(); return true; }   // ratio decided from budgets / free VRAM
     std::vector<float> v;
     double sum = 0.0;
     for (const auto & f : split_csv(arg)) {
@@ -4145,13 +4148,35 @@ bool parse_gpu_split(const std::string & arg, std::vector<float> & out) {
 
 bool build_gpu_plan(const std::vector<int> & gpu_ids,
                     const std::vector<float> & gpu_split,
+                    bool split_given,
                     const std::vector<size_t> & vram_mb,
                     std::vector<GpuPlan> & out)
 {
-    size_t n = std::max(gpu_ids.size(), std::max(gpu_split.size(), vram_mb.size()));
-    // Nothing multi-GPU was asked for: keep the legacy path (empty plan).
-    if (n <= 1 && gpu_ids.empty() && gpu_split.empty()) { out.clear(); return true; }
-    if (n == 0) { out.clear(); return true; }
+    out.clear();
+
+    // --gpu-split is the switch. Without it, one GPU, exactly as before.
+    if (!split_given) {
+        if (gpu_ids.size() > 1 || vram_mb.size() > 1)
+            fprintf(stderr, "note: %zu GPU(s) named but --gpu-split was not given, so only GPU%d "
+                            "is used; pass --gpu-split to spread the model over several\n",
+                    std::max(gpu_ids.size(), vram_mb.size()),
+                    gpu_ids.empty() ? 0 : gpu_ids[0]);
+        // No device named either: the historical "first device that works".
+        if (gpu_ids.empty()) return true;
+        GpuPlan p;
+        p.device    = gpu_ids[0];
+        p.budget_mb = vram_mb.empty() ? 0 : vram_mb[0];
+        p.split     = -1.0f;
+        out.push_back(p);
+        return true;
+    }
+
+    // An explicit share list fixes the device count; "auto" takes it from
+    // whatever else was named, or from every GPU present.
+    size_t n = gpu_split.size();
+    if (n == 0) n = std::max(gpu_ids.size(), vram_mb.size());
+    if (n == 0) n = gpu_devices().size();
+    if (n == 0) return true;   // no GPU at all: caller falls back to the CPU
 
     // A single budget cannot be shared across GPUs -- each device has its own
     // VRAM, so splitting one number between them would be a guess. Likewise a
