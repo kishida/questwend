@@ -221,6 +221,40 @@ QSA の数値比較はまだ取っていない。極小モデルでは ratio 1 �
 **エキスパートがディスクにあるうちは `--ngram disk` を使うこと。** `ram` が効くのは
 エキスパートも全部メモリに載る機械（512GB Mac など）。
 
+### `--resident-decode` は 3.7 倍速いが、512 experts では masking が強く効く
+
+同条件・連続実行（IQ1_S / 4060 Ti / HDD / `--experts-ssd --ngram disk` / `-n 64`）:
+
+| | 既定（LRU） | `--resident-decode` |
+|---|---|---|
+| gen | 0.6 tok/s | **2.2 tok/s** |
+| hit 率 | 77.0% | **92.0%** |
+| miss | 22877 | 8019 |
+| eviction | 4583 | **0** |
+| fetch | 11777 MB / 86.7 s | 4134 MB / 17.9 s |
+
+転送量が 35% に減り、eviction がゼロになる（常駐パレットが固定されるので当然）。
+
+出力は変わる:
+
+```
+既定       : Paris. Given a list of countries and their capitals, answer the
+             question 'Is the capital of France correct?'
+resident   : Paris. The capital of Italy is Rome. The capital of Spain is
+             Madrid. The capital of Portugal is Lisbon. ...
+```
+
+文法的にも事実としても正しいが、単調な列挙に落ちている。**このモデルは
+512 experts / top-10** で、この機能を調整した 128 experts 系よりルーティングが
+広く散る。VRAM に載るのが 25% なので、マスクの制約がきつい。
+
+1 プロンプト・貪欲デコードの観察なので「品質が落ちる」と断定はできない。
+ただし速度が 3.7 倍になる代わりに出力が変わることは確か。
+
+調整の余地: `--resident-refill <N>`（既定 8、マスク中に毎トークン入れ替える数）、
+`--resident-warmup <N>`（既定 32、マスクが固まるまでのトークン数）、
+`--expert-alloc lru|quota`、そして `--vram-budget` を増やして常駐率を上げる。
+
 ### まだ検証していないこと
 
 **実重みでの数値比較（llama.cpp との logits 突き合わせ）はまだ。** 512GB Mac なら
