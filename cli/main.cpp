@@ -126,6 +126,7 @@ static void usage(const char * prog) {
     printf("  --experts-ssd  stream experts from the GGUF on SSD (no RAM copy)\n");
     printf("  --cpu          force CPU backend\n");
     printf("  --log-tokens-per-sec   print speed\n");
+    printf("  --dump-logits <f>  write the prompt's final-token logits to <f> (verification)\n");
     printf("  --info         print model info and exit\n");
     printf("offload tuning (equivalent to the QWEN_* env vars; flag wins):\n");
     printf("  --resident-decode   resident-only routing decode: fused graph, no per-token miss\n");
@@ -149,6 +150,7 @@ int main(int argc, char ** argv) {
     std::vector<std::string> image_paths;
     int  max_tokens = 128, n_ctx = 0, n_draft = 1;   // n_ctx 0 = model's trained length
     size_t vram_budget_mb = 0;          // total across GPUs (gates expert offload)
+    std::string dump_logits;            // --dump-logits <file>
     std::vector<size_t> vram_list;      // --vram-budget, one entry per GPU
     std::vector<int>    gpu_ids;        // --gpus
     std::vector<float>  gpu_split;      // --gpu-split ("auto" leaves this empty)
@@ -233,6 +235,7 @@ int main(int argc, char ** argv) {
 #ifdef _WIN32
         else if (a == "--bench-read" && i + 1 < argc) return bench_read(next());
 #endif
+        else if (a == "--dump-logits" && i + 1 < argc) dump_logits = next();
         else if (a == "--info")             info_only = true;
         else if (a == "-h" || a == "--help"){ usage(argv[0]); return 0; }
         else {
@@ -471,6 +474,22 @@ int main(int argc, char ** argv) {
             auto tp0 = clk::now();
             auto logits = rt.decode(ids);
             double prefill_s = secs(clk::now() - tp0);
+
+            // --dump-logits: the prompt's final-token logits, one "i: value" per
+            // line -- the same shape llama-debug --save-logits writes, so the two
+            // can be diffed directly (see tests/qwen4/compare_logits.py).
+            if (!dump_logits.empty()) {
+                FILE * f = fopen(dump_logits.c_str(), "w");
+                if (!f) {
+                    fprintf(stderr, "error: cannot write %s\n", dump_logits.c_str());
+                    return;
+                }
+                for (size_t i = 0; i < logits.size(); ++i) {
+                    fprintf(f, "%zu: %g\n", i, logits[i]);
+                }
+                fclose(f);
+                fprintf(stderr, "logits (%zu) -> %s\n", logits.size(), dump_logits.c_str());
+            }
 
             // token generation
             smp.prime(ids);   // repetition-penalty window (prompt tail)

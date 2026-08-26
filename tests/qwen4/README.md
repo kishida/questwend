@@ -16,6 +16,10 @@ qwencpp に `qwen4exp` アーキテクチャを実装するための、llama.cpp
 | | |
 |---|---|
 | `dump_gguf.py` | GGUF ヘッダのみを読むダンパ。ダウンロード途中の `.part` でも動く（`gguf_dump.py` は全体を mmap して reshape するので落ちる） |
+| `make_tiny_model.py` | 同じ構造の**極小 qwen4exp を乱数生成**（8層 / d=128 / 7 MiB、全 F32）。`--no-ple` で PLE 抜き版 |
+| `check_tiny.py` | 極小モデルを qw-cli に通し、記録済みの llama.cpp 参照と比較する |
+| `compare_logits.py` | `index: value` 形式の logits ダンプ 2 本を比較（最大差・argmax・top-k 順序） |
+| `01-tiny/` | 極小モデルの参照 logits。`.gguf` は seed 固定で再生成できるのでコミットしない |
 | `00-arch/` | ハイパーパラメータ・テンソル一覧・トークナイザ（**シャード 1 だけで取れるので取得済み**） |
 | `03-tokenizer/` | `llama-tokenize` の出力 |
 | `04-tensors/` | `llama-debug --tensor-filter` の中間テンソルダンプ |
@@ -50,6 +54,30 @@ PLE の n-gram 文脈リセットはこちらで起きる。`ple.image_token_id 
 expert の 21.09 GiB が IQ4_NL なのは `n_ff_exp = 640` が 256 の倍数でなく、
 `ffn_down_exps`（`ne[0] = 640`）に 256-block 量子化を使えないため。
 expert 1 個 3 role 合計 1.55 MiB、top-10 × 48 層 = **742 MiB/token**（ヒット率 0% のとき）。
+
+## 極小モデルによる検証（67 GiB を待たずに済ませる）
+
+実物は 67.55 GiB あり、HDD 上では 1 回のグラフ確認に数分かかる。そこで
+`make_tiny_model.py` が**同じ構造の乱数モデル**（8層 / d=128 / hc=4 / 512→8 experts /
+層1 に PLE / 全 F32、7 MiB）を書き出す。**同じファイルを llama.cpp `pr-27742` と
+qwencpp の両方が読める**ので、これがそのまま数値の参照になる。
+
+```bash
+python tests/qwen4/check_tiny.py
+```
+
+`.gguf` はコミットしない（`.gitignore` の `*.gguf`）。生成は seed 固定なので
+`check_tiny.py` が毎回作り直しても記録済みの参照と一致する。
+
+### 現在の状態
+
+| ケース | プロンプト | 内容 | 結果 |
+|---|---|---|---|
+| `dense-5tok` | 5 トークン | hyper-connection / GDN / dense attention / MoE | **一致**（最大差 0.0006 = span の 0.022%、argmax・top-10 順序とも一致） |
+| `qsa-36tok` | 36 トークン | QSA | **不一致**（QSA 未実装。llama.cpp は QSA、qwencpp は dense） |
+
+`qsa-36tok` は QSA を実装したら自動的に一致に変わる。36 トークンなのは
+`indexer_top_k + compress_ratio - 1 = 9` を超えさせるため。
 
 ## 参照キャプチャ手順
 

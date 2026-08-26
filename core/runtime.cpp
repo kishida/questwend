@@ -506,6 +506,21 @@ struct Runtime::Impl {
                              ggml_tensor * mask, int n_tokens, int n_kv, int kv_pos = -1);
     ggml_tensor * build_gdn(ggml_context * ctx, ggml_cgraph * gf, int il,
                             ggml_tensor * x, int n_tokens);
+    // ---- qwen4exp hyper-connections ----
+    // The residual is hc_count streams wide. Each block reads one n_embd-wide
+    // view of it (build_hc_mix) and its output is scattered back over all the
+    // streams (build_hc_combine). The mixer's grouped RMSNorm is what a plain
+    // architecture would call attn_norm / ffn_norm -- qwen4exp carries no
+    // separate norm tensors, and the final mixer doubles as the output norm.
+    //   res_hc is [n_embd, hc, n_tokens]; the mix returns [n_embd, n_tokens].
+    // `inject`, when non-null, receives the [hc, n_tokens] scatter weights that
+    // the matching build_hc_combine needs.
+    ggml_tensor * build_hc_mix(ggml_context * ctx, ggml_tensor * res_hc,
+                               ggml_tensor * w_norm, ggml_tensor * w_down,
+                               ggml_tensor * w_up, ggml_tensor * w_inject,
+                               ggml_tensor ** inject);
+    ggml_tensor * build_hc_combine(ggml_context * ctx, ggml_tensor * res_hc,
+                                   ggml_tensor * block_out, ggml_tensor * inject);
     ggml_tensor * build_moe(ggml_context * ctx, ggml_cgraph * gf, int il,
                             ggml_tensor * x, int n_tokens);
     const std::vector<float> & decode(const std::vector<int32_t> & tokens);
@@ -1405,16 +1420,86 @@ ggml_tensor * Runtime::Impl::build_gdn(ggml_context * ctx, ggml_cgraph * gf, int
                 ggml_reshape_3d(ctx, ssm_state[il], S, S, H_v)));
     }
 
-    // gated RMSNorm with z: rms_norm(output)*ssm_norm * silu(z)
+    // gated RMSNorm with z: rms_norm(output)*ssm_norm * gate(z)
     output = ggml_cont(ctx, output);
     output = ggml_rms_norm(ctx, output, eps);
     output = ggml_mul(ctx, output, W("blk.%d.ssm_norm.weight", il));   // broadcast [S]
     ggml_tensor * zr = ggml_reshape_4d(ctx, z, S, H_v, n_tokens, 1);
-    output = ggml_mul(ctx, output, ggml_silu(ctx, zr));
+    // qwen4exp is Qwen3.5's GDN with one numerical difference: the output gate
+    // is a sigmoid rather than a silu.
+    output = ggml_mul(ctx, output, hp.arch == Arch::QWEN4EXP ? ggml_sigmoid(ctx, zr)
+                                                             : ggml_silu(ctx, zr));
 
     output = ggml_reshape_2d(ctx, output, S * H_v, n_tokens);
     ggml_tensor * cur = ggml_mul_mat(ctx, W("blk.%d.ssm_out.weight", il), output);  // [n_embd, n_tokens]
     return cur;
+}
+
+// ---- qwen4exp hyper-connections ----
+//
+// The residual stream is `hc` parallel copies of the model width. A block does
+// not read it directly: build_hc_mix normalizes each stream, gates them with a
+// low-rank projection of the whole thing, and averages them into one n_embd-wide
+// block input. build_hc_combine then adds the block's output back into every
+// stream, weighted per stream by the same mixer's `inject` head.
+//
+// The 2*sigmoid in combine centres the scatter weights on 1, so a zero
+// injection matrix degenerates to the ordinary residual add -- which is the
+// clearest way to read what the mechanism is doing.
+ggml_tensor * Runtime::Impl::build_hc_mix(ggml_context * ctx, ggml_tensor * res_hc,
+        ggml_tensor * w_norm, ggml_tensor * w_down, ggml_tensor * w_up,
+        ggml_tensor * w_inject, ggml_tensor ** inject) {
+    const auto & hp   = model.hparams();
+    const int n_embd  = hp.n_embd;
+    const int hc      = hp.hc_count;
+    const int hc_dim  = hc * n_embd;
+    const int64_t T   = res_hc->ne[2];
+
+    // grouped RMSNorm: rms_norm reduces over ne[0] = one stream, then the
+    // [hc_dim] gamma scales all of them. The converter folded the gammas to
+    // (1 + w), so this is a plain multiply.
+    ggml_tensor * xn = ggml_rms_norm(ctx, res_hc, hp.rms_eps);
+    xn = ggml_reshape_2d(ctx, xn, hc_dim, T);
+    xn = ggml_mul(ctx, xn, w_norm);
+
+    ggml_tensor * lo = ggml_mul_mat(ctx, w_down, xn);                  // [low_rank, T]
+    lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float) hc));
+    ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_up, lo)); // [hc_dim, T]
+
+    ggml_tensor * gated = ggml_reshape_3d(ctx, ggml_mul(ctx, xn, gate), n_embd, hc, T);
+
+    // collapse the streams by their mean. hc is 4, so an explicit sum of views
+    // is both shorter and cheaper than a reduction op.
+    const size_t stride = ggml_row_size(gated->type, n_embd) * hc;
+    ggml_tensor * mixed = ggml_cont(ctx,
+            ggml_view_2d(ctx, gated, n_embd, T, stride, 0));
+    for (int c = 1; c < hc; ++c) {
+        mixed = ggml_add(ctx, mixed,
+                ggml_view_2d(ctx, gated, n_embd, T, stride,
+                             ggml_row_size(gated->type, n_embd) * c));
+    }
+    mixed = ggml_scale(ctx, mixed, 1.0f / (float) hc);
+
+    if (inject) {
+        *inject = ggml_mul_mat(ctx, w_inject, xn);                     // [hc, T]
+    }
+    return mixed;
+}
+
+ggml_tensor * Runtime::Impl::build_hc_combine(ggml_context * ctx, ggml_tensor * res_hc,
+        ggml_tensor * block_out, ggml_tensor * inject) {
+    const auto & hp  = model.hparams();
+    const int n_embd = hp.n_embd;
+    const int hc     = hp.hc_count;
+    const int64_t T  = res_hc->ne[2];
+
+    ggml_tensor * w = ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) hc));
+    w = ggml_reshape_3d(ctx, ggml_scale(ctx, w, 2.0f), 1, hc, T);
+
+    ggml_tensor * b = ggml_repeat_4d(ctx,
+            ggml_reshape_3d(ctx, block_out, n_embd, 1, T), n_embd, hc, T, 1);
+
+    return ggml_add(ctx, res_hc, ggml_mul(ctx, b, w));
 }
 
 // ---- MoE FFN (qwen3moe / qwen35moe): softmax gating, top-k, normalized weights ----
@@ -1572,11 +1657,31 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
         }
     }
 
+    // qwen4exp: the residual is hc identical copies of the embedding. There is
+    // no attn_norm / ffn_norm / output_norm anywhere in the file -- the hc
+    // mixers carry every normalization the stack has.
+    const bool hc_on = hp.has_hc();
+    const int  n_hc  = hc_on ? (int) hp.hc_count : 1;
+    ggml_tensor * res_hc = nullptr;
+    if (hc_on) {
+        res_hc = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, inpL, n_embd, 1, n_tokens),
+                                n_embd, n_hc, n_tokens, 1);
+    }
+
     for (int il = 0; il < (int) hp.n_main(); ++il) {
         ggml_tensor * inpSA = inpL;
+        ggml_tensor * inject = nullptr;
 
-        cur = ggml_rms_norm(ctx, inpL, eps);
-        cur = ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il));
+        if (hc_on) {
+            cur = build_hc_mix(ctx, res_hc,
+                    W("blk.%d.hc_attn_norm.weight",   il),
+                    W("blk.%d.hc_attn_down.weight",   il),
+                    W("blk.%d.hc_attn_up.weight",     il),
+                    W("blk.%d.hc_attn_inject.weight", il), &inject);
+        } else {
+            cur = ggml_rms_norm(ctx, inpL, eps);
+            cur = ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il));
+        }
 
         if (hp.is_recurrent(il)) {
             cur = build_gdn(ctx, gf, il, cur, n_tokens);
@@ -1615,16 +1720,25 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
         }
 
-        cur = ggml_add(ctx, cur, inpSA);
-
-        // FFN with (qwen35) post-attention norm placement
-        ggml_tensor * ffn_res = cur;
+        ggml_tensor * ffn_res = nullptr;
         ggml_tensor * ffn_in;
-        if (gated) {
-            ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W(post_norm_name, il));
+        if (hc_on) {
+            res_hc = build_hc_combine(ctx, res_hc, cur, inject);
+            ffn_in = build_hc_mix(ctx, res_hc,
+                    W("blk.%d.hc_ffn_norm.weight",   il),
+                    W("blk.%d.hc_ffn_down.weight",   il),
+                    W("blk.%d.hc_ffn_up.weight",     il),
+                    W("blk.%d.hc_ffn_inject.weight", il), &inject);
         } else {
-            ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W("blk.%d.ffn_norm.weight", il));
-            ffn_res = cur;  // same residual for qwen3 (norm of cur, add cur)
+            cur = ggml_add(ctx, cur, inpSA);
+
+            // FFN with (qwen35) post-attention norm placement
+            ffn_res = cur;
+            if (gated) {
+                ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W(post_norm_name, il));
+            } else {
+                ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W("blk.%d.ffn_norm.weight", il));
+            }
         }
 
         ggml_tensor * ff;
@@ -1636,11 +1750,17 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
             ff = ggml_mul_mat(ctx, W("blk.%d.ffn_down.weight", il), ggml_mul(ctx, ggml_silu(ctx, gt), up));
         }
 
-        cur = ggml_add(ctx, ff, ffn_res);
-        inpL = cur;
+        if (hc_on) {
+            res_hc = build_hc_combine(ctx, res_hc, ff, inject);
+        } else {
+            inpL = ggml_add(ctx, ff, ffn_res);
+        }
     }
 
     // expose the main stack's last hidden (pre-output-norm) for the MTP module
+    // (hc has no single n_embd-wide "last hidden", but no hc model carries an
+    //  MTP block either, so the two never meet)
+    GGML_ASSERT(!(capture_hidden && hc_on) && "MTP capture is not defined for a hyper-connection residual");
     if (capture_hidden) {
         ggml_set_name(inpL, "main_hidden");
         ggml_set_output(inpL);
@@ -1649,14 +1769,31 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
 
     // Narrow to the last token before the output norm when the caller only wants
     // that row: everything downstream then runs once instead of n_tokens times.
-    ggml_tensor * head_in = inpL;
-    if (!logits_all && n_tokens > 1) {
-        head_in = ggml_cont(ctx, ggml_view_2d(ctx, inpL, n_embd, 1, inpL->nb[1],
-                                              (size_t) (n_tokens - 1) * inpL->nb[1]));
-    }
+    if (hc_on) {
+        // Narrow the wide residual before the final mixer, not after: the mixer
+        // is two hc_dim matmuls per token and a prefill throws all but the last
+        // row away.
+        ggml_tensor * r = res_hc;
+        if (!logits_all && n_tokens > 1) {
+            r = ggml_cont(ctx, ggml_view_3d(ctx, res_hc, n_embd, n_hc, 1,
+                    res_hc->nb[1], res_hc->nb[2],
+                    (size_t) (n_tokens - 1) * res_hc->nb[2]));
+        }
+        // the final mixer IS the output norm; the file carries no separate one
+        cur = build_hc_mix(ctx, r,
+                model.tensor("output_hc_norm.weight"),
+                model.tensor("output_hc_down.weight"),
+                model.tensor("output_hc_up.weight"), nullptr, nullptr);
+    } else {
+        ggml_tensor * head_in = inpL;
+        if (!logits_all && n_tokens > 1) {
+            head_in = ggml_cont(ctx, ggml_view_2d(ctx, inpL, n_embd, 1, inpL->nb[1],
+                                                  (size_t) (n_tokens - 1) * inpL->nb[1]));
+        }
 
-    cur = ggml_rms_norm(ctx, head_in, eps);
-    cur = ggml_mul(ctx, cur, model.tensor("output_norm.weight"));
+        cur = ggml_rms_norm(ctx, head_in, eps);
+        cur = ggml_mul(ctx, cur, model.tensor("output_norm.weight"));
+    }
 
     ggml_tensor * output_w = model.tensor("output.weight");
     if (!output_w) output_w = model.tensor("token_embd.weight");
