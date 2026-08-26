@@ -214,8 +214,11 @@ int DevicePlan::dev_of_name(const std::string & name) const {
     if (p >= name.size() || !isdigit((unsigned char) name[p])) return 0;
     for (; p < name.size() && isdigit((unsigned char) name[p]); ++p)
         il = il * 10 + (name[p] - '0');
-    if (il < 0 || (size_t) il >= layer_dev.size()) return 0;
-    const int d = layer_dev[(size_t) il];
+    // Shared experts run with the routed experts, on the pool's device.
+    const bool shexp = name.find("_shexp") != std::string::npos;
+    const std::vector<int> & map = (shexp && !pool_dev.empty()) ? pool_dev : layer_dev;
+    if (il < 0 || (size_t) il >= map.size()) return 0;
+    const int d = map[(size_t) il];
     return (d >= 0 && (size_t) d < bufts.size()) ? d : 0;
 }
 

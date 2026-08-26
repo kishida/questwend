@@ -89,6 +89,11 @@ struct HParams {
 struct DevicePlan {
     std::vector<ggml_backend_buffer_type_t> bufts;
     std::vector<int>                        layer_dev;
+    // Device holding each layer's expert pool. The shared-expert weights
+    // (ffn_*_shexp) are computed alongside the routed experts, so they follow
+    // this rather than layer_dev; everything else in the layer -- attention,
+    // norms, the router -- stays with layer_dev. Empty means "same as layer_dev".
+    std::vector<int>                        pool_dev;
 
     size_t n_dev() const { return bufts.size(); }
     // Device index for a GGUF tensor name; 0 when it has no "blk.<N>." prefix

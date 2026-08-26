@@ -58,6 +58,14 @@ struct Runtime::Impl {
     // multi_gpu() is false, which keeps every path below on its original code.
     std::vector<ggml_backend_t> gpus;
     std::vector<int>            layer_dev;      // layer -> index into gpus
+    // Where each layer's EXPERT POOL lives, which need not be where the layer
+    // computes its attention. A device given --gpu-split 0 holds no layers at
+    // all, so its whole budget is surplus; pool_dev hands it the expert pools of
+    // layers whose attention runs elsewhere, and that layer's expert matmul then
+    // runs there too (compute follows the weights -- the alternative, shipping
+    // expert weights device-to-device, is PCIe-bound and pointless). Equal to
+    // layer_dev unless a device is pool-only.
+    std::vector<int>            pool_dev;
     std::vector<size_t>         dev_budget;     // per-device VRAM budget, bytes (0 = unset)
     std::vector<size_t>         dev_weight_bytes;  // per-device weight bytes actually allocated
     std::vector<size_t>         dev_kv_bytes;      // per-device KV/state bytes
@@ -65,6 +73,10 @@ struct Runtime::Impl {
     bool multi_gpu() const { return gpus.size() > 1; }
     int  dev_of(int il) const {
         return layer_dev.empty() ? 0 : layer_dev[(size_t) il];
+    }
+    // Device holding `il`'s expert pool (and therefore running its expert matmul).
+    int  pdev_of(int il) const {
+        return pool_dev.empty() ? dev_of(il) : pool_dev[(size_t) il];
     }
     ggml_backend_t be_of(int il) const {
         return gpus.empty() ? backend : gpus[(size_t) dev_of(il)];
@@ -74,6 +86,7 @@ struct Runtime::Impl {
         DevicePlan p;
         for (ggml_backend_t be : gpus) p.bufts.push_back(ggml_backend_get_default_buffer_type(be));
         p.layer_dev = layer_dev;
+        p.pool_dev  = pool_dev;
         return p;
     }
 
@@ -104,7 +117,7 @@ struct Runtime::Impl {
     // The cache holding `il`'s experts: the one on the device that computes it.
     ExpertCache * ec_of(int il) const {
         if (ecaches.size() <= 1) return ecache;
-        const size_t d = (size_t) dev_of(il);
+        const size_t d = (size_t) pdev_of(il);
         return d < ecaches.size() ? ecaches[d].get() : nullptr;
     }
     // Every live cache, for the whole-model operations (stats, quota mode).
@@ -187,7 +200,9 @@ struct Runtime::Impl {
     std::vector<float>    hop_buf;      // staging for the boundary hidden-state hop
 
     void use_carry(int d);
-    void hop_carry(int from, int to);
+    void hop_carry(int from, int to);            // the running hidden state
+    void hop_carry_ab(int from, int to, int il); // seg A -> seg B carries for layer il
+    void plan_pools();                           // fill pool_dev from per-device surplus
     // persistent "carry" tensors that bridge the per-layer graph segments
     ggml_context *        cctx       = nullptr;
     ggml_backend_buffer_t cbuf       = nullptr;
@@ -846,6 +861,10 @@ void Runtime::Impl::plan_layers() {
             fprintf(stderr, "  GPU%d: layers %d-%d (%d, %.0f%%), %zu MB budget\n",
                     devidx, lo, hi, cnt, 100.0 * cnt / n_main, dev_budget[i] >> 20);
     }
+
+    // Expert pools are placed here too, because weight placement follows them:
+    // a layer's shared-expert weights have to sit with its expert matmul.
+    plan_pools();
 }
 
 // Point the p_* carry members at device `d`'s set, so the segment graphs built
@@ -874,6 +893,88 @@ void Runtime::Impl::hop_carry(int from, int to) {
     hop_buf.resize(n / sizeof(float));
     ggml_backend_tensor_get(carries[(size_t) from].h, hop_buf.data(), 0, n);
     ggml_backend_tensor_set(carries[(size_t) to].h,   hop_buf.data(), 0, n);
+}
+
+// Copy layer `il`'s seg A -> seg B carries across a device boundary. Needed
+// when the layer's expert pool sits on a different device than its attention:
+// the normed FFN input, the residual base and the router weights all have to
+// follow the expert matmul. ~2*n_embd + n_used floats, against expert weights
+// that are three orders of magnitude larger -- which is why the matmul is moved
+// to the pool rather than the pool to the matmul.
+void Runtime::Impl::hop_carry_ab(int from, int to, int il) {
+    if (from == to || carries.size() <= 1) return;
+    const CarrySet & a = carries[(size_t) from];
+    const CarrySet & b = carries[(size_t) to];
+    auto cp = [&](ggml_tensor * s, ggml_tensor * d) {
+        const size_t n = ggml_nbytes(s);
+        hop_buf.resize((n + sizeof(float) - 1) / sizeof(float));
+        ggml_backend_tensor_get(s, hop_buf.data(), 0, n);
+        ggml_backend_tensor_set(d, hop_buf.data(), 0, n);
+    };
+    if (il & 1) { cp(a.ffn_in2, b.ffn_in2); cp(a.resid2, b.resid2); cp(a.weights2, b.weights2); }
+    else        { cp(a.ffn_in,  b.ffn_in ); cp(a.resid,  b.resid ); cp(a.weights,  b.weights ); }
+}
+
+// Decide where each layer's expert pool lives, from how much VRAM each device
+// has left once its own weights and KV are placed. A device with no compute
+// layers contributes its whole budget here, which is what turns --gpu-split 0
+// into a pure expert pool. Ranges are contiguous so that when the split ratios
+// happen to match the surplus ratios, pool_dev == layer_dev and nothing hops.
+void Runtime::Impl::plan_pools() {
+    const auto & hp = model.hparams();
+    const int n_main = (int) hp.n_main();
+    pool_dev.assign((size_t) n_main, 0);
+    for (int il = 0; il < n_main; ++il) pool_dev[(size_t) il] = dev_of(il);
+    if (gpus.size() <= 1) return;
+
+    // Runs before the weights are placed (their placement depends on the answer),
+    // so the surplus is budget minus the KV cache and the compute headroom, with
+    // the non-expert weights left out. They are roughly proportional to a
+    // device's layer count, so leaving them out skews the ratio a little but not
+    // the shape; the placement line below makes the outcome visible.
+    const size_t compute = 1024ull * 1024ull * 1024ull;
+    const int n_embd_gqa = hp.n_head_kv * hp.n_embd_head;
+    const int conv_ch    = hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state;
+    std::vector<double> surplus(gpus.size(), 0.0);
+    double total = 0.0;
+    for (size_t d = 0; d < gpus.size(); ++d) {
+        size_t kv = 0;
+        for (int il = 0; il < (int) hp.n_layer; ++il) {
+            if ((size_t) dev_of(il) != d) continue;
+            if (hp.is_recurrent(il))
+                kv += (size_t) (hp.ssm_d_conv - 1) * conv_ch * 4
+                    + (size_t) hp.ssm_d_state * hp.ssm_d_state * hp.ssm_dt_rank * 4;
+            else
+                kv += (size_t) 2 * n_embd_gqa * cfg.n_ctx * 2;   // F16 K and V
+        }
+        const size_t reserve = kv + compute;
+        surplus[d] = dev_budget[d] > reserve ? (double) (dev_budget[d] - reserve) : 0.0;
+        total += surplus[d];
+    }
+    if (total <= 0.0) return;   // nothing to distribute: pools stay with their layers
+
+    int start = 0;
+    double cum = 0.0;
+    for (size_t d = 0; d < gpus.size(); ++d) {
+        cum += surplus[d] / total;
+        int end = (d + 1 == gpus.size()) ? n_main : (int) llround(cum * n_main);
+        if (surplus[d] <= 0.0) end = start;
+        end = std::max(start, std::min(end, n_main));
+        for (int il = start; il < end; ++il) pool_dev[(size_t) il] = (int) d;
+        start = end;
+    }
+    for (int il = start; il < n_main; ++il) pool_dev[(size_t) il] = (int) gpus.size() - 1;
+
+    int hops = 0;
+    for (int il = 0; il < n_main; ++il) if (pool_dev[(size_t) il] != dev_of(il)) ++hops;
+    fprintf(stderr, "expert pool placement:");
+    for (size_t d = 0; d < gpus.size(); ++d) {
+        int cnt = 0;
+        for (int il = 0; il < n_main; ++il) if (pool_dev[(size_t) il] == (int) d) ++cnt;
+        const int devidx = d < cfg.gpus.size() ? cfg.gpus[d].device : (int) d;
+        fprintf(stderr, " GPU%d=%d layers (%.0f MB surplus)", devidx, cnt, surplus[d] / 1048576.0);
+    }
+    fprintf(stderr, "; %d layer(s) compute experts off their attention device\n", hops);
 }
 
 // Allocate the VRAM slot pools and the persistent per-layer carry tensors.
@@ -909,13 +1010,15 @@ void Runtime::Impl::init_cache() {
             backend, model, n_main, hp.n_expert, n_used, avail, ssd_mode));
     } else {
         // One cache per device, each sized against that device's own budget and
-        // covering only the layers that device computes. A device with no layers
-        // builds no cache at all -- its budget is surplus that nothing claims yet.
+        // covering the layers whose expert pool it holds. That is not always the
+        // set of layers it computes: a device given --gpu-split 0 has no layers
+        // but still takes pools, which is the expert-pool layout (plan_pools()
+        // ran back in plan_layers(), since weight placement follows it).
         for (size_t d = 0; d < gpus.size(); ++d) {
             std::vector<bool> mask((size_t) n_main, false);
             int n_owned = 0;
             for (int il = 0; il < n_main; ++il)
-                if ((size_t) dev_of(il) == d) { mask[(size_t) il] = true; ++n_owned; }
+                if ((size_t) pdev_of(il) == d) { mask[(size_t) il] = true; ++n_owned; }
 
             const size_t gpu_w    = d < dev_weight_bytes.size() ? dev_weight_bytes[d] : 0;
             const size_t kv_bytes = d < dev_kv_bytes.size()     ? dev_kv_bytes[d]     : 0;
@@ -3069,48 +3172,57 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     // Under a layer split the fusion is broken at the one device boundary,
     // where the two halves belong to different devices: segB finishes on the
     // old device, the hidden state hops, and segA starts on the new one.
-    {
-        use_carry(dev_of(0));
+    // Run seg A for `il` on its attention device, then move the A->B carries to
+    // that layer's pool device and resolve residency there, so the following
+    // seg B finds its inputs and slot ids local. Leaves the carry members
+    // pointing at the pool device.
+    auto do_segA = [&](int il) {
+        const int a = dev_of(il);
+        use_carry(a);
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-        ggml_tensor * selected = build_segA(ctx, gf, 0);
-        run(ctx, gf, dev_of(0));
+        ggml_tensor * selected = build_segA(ctx, gf, il);
+        run(ctx, gf, a);
         set_attn_inputs(gf);
-        compute(gf, dev_of(0), "seg A0 compute failed");
-        ensure_layer(selected, 0);
+        compute(gf, a, "seg A compute failed");
+        const int p = pdev_of(il);
+        hop_carry_ab(a, p, il);
+        use_carry(p);
+        ensure_layer(selected, il);
         ggml_free(ctx);
-    }
-    for (int il = 0; il < N; ++il) {
-        const int d     = dev_of(il);
-        const int dnext = (il + 1 < N) ? dev_of(il + 1) : d;
-        const bool cross = (il + 1 < N) && dnext != d;
+    };
 
-        use_carry(d);
+    do_segA(0);
+    for (int il = 0; il < N; ++il) {
+        const int p    = pdev_of(il);                          // seg B runs at the pool
+        const int anxt = (il + 1 < N) ? dev_of(il + 1) : -1;    // next attention device
+        // Keep the segB(L)+segA(L+1) fusion (one submit per layer instead of
+        // two) whenever the next layer's attention runs where this seg B does.
+        const bool fuse = anxt >= 0 && anxt == p;
+
+        use_carry(p);
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
         build_segB(ctx, gf, il);
-        ggml_tensor * nsel = (il + 1 < N && !cross) ? build_segA(ctx, gf, il + 1) : nullptr;
-        run(ctx, gf, d);
+        ggml_tensor * nsel = fuse ? build_segA(ctx, gf, il + 1) : nullptr;
+        run(ctx, gf, p);
         set_attn_inputs(gf);
-        compute(gf, d, "fused segB/segA compute failed");
-        if (nsel) ensure_layer(nsel, il + 1);
+        compute(gf, p, "fused segB/segA compute failed");
+        if (fuse) {
+            const int p1 = pdev_of(il + 1);
+            hop_carry_ab(p, p1, il + 1);
+            use_carry(p1);
+            ensure_layer(nsel, il + 1);
+        }
         ggml_free(ctx);
 
-        if (cross) {
-            hop_carry(d, dnext);
-            use_carry(dnext);
-            ggml_context * c2 = new_ctx();
-            ggml_cgraph * g2 = ggml_new_graph_custom(c2, GRAPH_SIZE, false);
-            ggml_tensor * s2 = build_segA(c2, g2, il + 1);
-            run(c2, g2, dnext);
-            set_attn_inputs(g2);
-            compute(g2, dnext, "seg A across a device boundary failed");
-            ensure_layer(s2, il + 1);
-            ggml_free(c2);
+        if (!fuse && anxt >= 0) {
+            hop_carry(p, anxt);   // only the hidden state crosses
+            do_segA(il + 1);
         }
     }
     // the final norm and output head are model-global, so they live on the primary
-    hop_carry(dev_of(N - 1), 0);
+    hop_carry(pdev_of(N - 1), 0);
     use_carry(0);
 
     // ---- final norm + output projection ----
