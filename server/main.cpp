@@ -485,6 +485,8 @@ int main(int argc, char ** argv) {
     bool gpu_split_given = false;
     std::string cache_profile;
     bool experts_ssd = false;
+    std::string ngram_mode = "disk";    // --ngram off|disk|ram (qwen4exp PLE table)
+    size_t      ngram_cache_mb = 256;   // --ngram-cache <MB>
     bool reasoning_default = true;
     bool use_mtp = false;
     bool embd_q8 = false;
@@ -538,6 +540,8 @@ int main(int argc, char ** argv) {
         }
         else if (a == "--cache-profile" && i + 1 < argc) cache_profile = argv[++i];
         else if (a == "--experts-ssd")      experts_ssd = true;
+        else if (a == "--ngram" && i + 1 < argc)       ngram_mode = argv[++i];
+        else if (a == "--ngram-cache" && i + 1 < argc) ngram_cache_mb = (size_t) std::stoul(argv[++i]);
         else if (a == "--reasoning" && i + 1 < argc) { std::string v = argv[++i]; reasoning_default = (v != "off" && v != "0" && v != "false"); }
         else if (a == "--mtp")              use_mtp = true;
         else if (a == "--draft" && i + 1 < argc) n_draft = std::stoi(argv[++i]);
@@ -602,6 +606,10 @@ int main(int argc, char ** argv) {
             "                      expert pool. auto = every GPU, share by free VRAM\n"
             "  --cache-profile <f> prefetch hot-expert profile (read-only on the server)\n"
             "  --experts-ssd       stream experts from the GGUF on SSD (no RAM copy)\n"
+            "  --ngram <mode>      qwen4exp n-gram embedding: disk (default), ram or off.\n"
+            "                      The table is 26.8 GB in Qwen3.8-Flash-Next and\n"
+            "                      never goes on the GPU; off skips the module\n"
+            "  --ngram-cache <MB>  host cache for --ngram disk (default 256)\n"
             "  --reasoning <on|off> default thinking mode (per-request override: \"reasoning\")\n"
             "  --mtp               MTP self-speculative decode (models with a nextn block)\n"
             "  --draft <N>         MTP draft length (default 1)\n"
@@ -717,6 +725,8 @@ int main(int argc, char ** argv) {
         cfg.cache_profile      = cache_profile;
         cfg.cache_profile_save = false;   // server only reads the profile, never overwrites it
         cfg.experts_ssd        = experts_ssd;
+        cfg.ngram_mode         = ngram_mode;
+        cfg.ngram_cache_mb     = ngram_cache_mb;
         cfg.use_mtp            = use_mtp;  // keeps the nextn block VRAM-resident
         cfg.embd_q8            = embd_q8;
         rt = std::make_unique<Runtime>(*model, cfg);

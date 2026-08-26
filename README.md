@@ -4,7 +4,7 @@
 
 A from-scratch inference engine for Qwen3 / Qwen3.5 / Qwen3.6, built on vendored ggml.
 
-- **Architectures**: `qwen3` (dense), `qwen3moe` (MoE), `qwen35` / `qwen35moe` (Gated DeltaNet hybrid), `qwen3next`
+- **Architectures**: `qwen3` (dense), `qwen3moe` (MoE), `qwen35` / `qwen35moe` (Gated DeltaNet hybrid), `qwen3next`, `qwen4exp` (Qwen3.8-Flash-Next: hyper-connections + QSA + a PLE n-gram embedding)
 - **Backends**: CUDA (Windows/Linux), Metal (macOS), HIP/ROCm (AMD, untested), CPU fallback
 - **Features**:
   - MoE expert offloading (**RAM tier** / **SSD tier**) with a dynamic VRAM expert cache
@@ -161,6 +161,10 @@ qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15 --cache-profile hot.prof
   (`13500M`, `14G`). A bare number of 512 or more is read as MB, so command lines written
   before the unit changed keep working (with a note pointing at the GB spelling).
 - `--experts-ssd`: stream experts from disk (for models too large for RAM).
+- `--ngram <off|disk|ram>`: where qwen4exp keeps its n-gram embedding table (default `disk`).
+  It is 26.8 GB in Qwen3.8-Flash-Next and **never goes on the GPU in any mode**.
+  `off` skips the module entirely -- it is a gated additive branch onto the residual,
+  so the stack still runs. `--ngram-cache <MB>` sizes the host cache for `disk` (default 256).
 - `--cache-profile <file>`: persist the hot-expert frequency profile. **On the same or a similar
   workload the hit rate reaches ~100%, streaming essentially disappears and throughput jumps.**
 

@@ -4,7 +4,7 @@
 
 Qwen3 / Qwen3.5 / Qwen3.6 をスクラッチ実装した推論エンジン（vendored ggml の上に構築）。
 
-- **対応アーキテクチャ**: `qwen3`（dense）, `qwen3moe`（MoE）, `qwen35` / `qwen35moe`（Gated DeltaNet ハイブリッド）, `qwen3next`
+- **対応アーキテクチャ**: `qwen3`（dense）, `qwen3moe`（MoE）, `qwen35` / `qwen35moe`（Gated DeltaNet ハイブリッド）, `qwen3next`, `qwen4exp`（Qwen3.8-Flash-Next: hyper-connection + QSA + PLE n-gram 埋め込み）
 - **バックエンド**: CUDA（Windows/Linux）, Metal（macOS）, HIP/ROCm（AMD, 未検証）, CPU フォールバック
 - **主な機能**:
   - MoE エキスパートのオフロード（**RAM 階層** / **SSD 階層**）＋動的 VRAM エキスパートキャッシュ
@@ -158,6 +158,10 @@ qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15 --cache-profile hot.prof
   512 以上の裸の数値は MB として解釈するので、単位変更前に書いたコマンドはそのまま動く
   （GB 表記を促す注意書きが出る）。
 - `--experts-ssd`: エキスパートをディスクからストリーミング（RAM に載らない巨大モデル向け）。
+- `--ngram <off|disk|ram>`: qwen4exp の n-gram 埋め込みテーブルの置き場（既定 `disk`）。
+  Qwen3.8-Flash-Next では 26.8 GB あり、**どのモードでも GPU には載せない**。
+  `off` はモジュールごとスキップする（残差へのゲート付き加算ブランチなので、外してもスタックは動く）。
+  `disk` のホストキャッシュ量は `--ngram-cache <MB>`（既定 256）。
 - `--cache-profile <file>`: ホットエキスパートの頻度プロファイルを永続化。**同一/類似ワークロードで hit 率が ~100% になり、ストリーミングがほぼ消えて大幅高速化**。
 
 prefill は **layer-major 実行**（層ごとにエキスパートを一度だけ fetch して全トークンを処理）が既定で、
