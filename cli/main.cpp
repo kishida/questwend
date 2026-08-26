@@ -109,8 +109,9 @@ static void usage(const char * prog) {
     printf("  --gpus <list>       GPU device indices to use, primary first (e.g. 1 or 1,0)\n");
     printf("  --gpu-split <list>  each GPU's share of the compute layers (e.g. 0.8,0.2).\n");
     printf("                      A GPU given 0 holds no layers, so its whole budget\n");
-    printf("                      becomes expert pool for the others; default splits\n");
-    printf("                      layers in proportion to the per-GPU --vram-budget.\n");
+    printf("                      becomes expert pool for the others. Default splits\n");
+    printf("                      by --vram-budget, or by free VRAM when it is omitted\n");
+    printf("                      (which runs a model too big for one card on several).\n");
     printf("  --cache-profile <f> persist/prefetch hot-expert profile (warm restarts)\n");
     printf("  --experts-ssd  stream experts from the GGUF on SSD (no RAM copy)\n");
     printf("  --cpu          force CPU backend\n");

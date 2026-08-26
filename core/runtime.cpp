@@ -610,12 +610,24 @@ void Runtime::Impl::init() {
                 if (!be)
                     throw std::runtime_error("failed to init GPU device "
                                              + std::to_string(p.device));
-                fprintf(stderr, "backend: GPU%d [%s] %s (budget %zu MB, split %.3g)\n",
+                // With no --vram-budget there is still a ratio to pick: use what
+                // the device actually has free, so a resident (non-offload)
+                // split lands layers in proportion to real capacity instead of
+                // piling them all onto the primary.
+                size_t budget = p.budget_mb * 1024ull * 1024ull;
+                bool from_free = false;
+                if (budget == 0) {
+                    size_t dev_free = 0, dev_total = 0;
+                    ggml_backend_dev_memory(devs[(size_t) p.device], &dev_free, &dev_total);
+                    budget = dev_free;
+                    from_free = true;
+                }
+                fprintf(stderr, "backend: GPU%d [%s] %s (%s %zu MB, split %.3g)\n",
                         p.device, ggml_backend_dev_name(devs[(size_t) p.device]),
                         ggml_backend_dev_description(devs[(size_t) p.device]),
-                        p.budget_mb, p.split);
+                        from_free ? "free" : "budget", budget >> 20, p.split);
                 gpus.push_back(be);
-                dev_budget.push_back(p.budget_mb * 1024ull * 1024ull);
+                dev_budget.push_back(budget);
             }
             backend = gpus[0];
         }
@@ -717,15 +729,25 @@ void Runtime::Impl::init() {
 
         fprintf(stderr, "expert offload: ON (experts stream into the VRAM cache;"
                         " QWEN_CPU_PREFILL=1 runs prefill experts on CPU instead)\n");
+    } else if (multi_gpu()) {
+        // Plain resident weights spread over the GPUs: no offload, the model
+        // simply does not fit one card. The graph then spans devices, so it
+        // needs a scheduler (and the persistent reuse graph, which assumes a
+        // single backend and its own buffer, has to go).
+        weights_buf_owned = true;   // set first: a throw mid-load still frees what was allocated
+        DevicePlan plan = device_plan();
+        model.load_weights_multi(backend, plan, weights_bufs, &dev_weight_bytes);
+
+        cpu_backend = ggml_backend_cpu_init();
+        if (!cpu_backend) throw std::runtime_error("failed to init CPU backend for multi-GPU");
+        int nth = cfg.n_threads > 0 ? cfg.n_threads : (int) std::thread::hardware_concurrency();
+        if (nth <= 0) nth = 4;
+        ggml_backend_cpu_set_n_threads(cpu_backend, nth);
+        sched = make_sched();
+        reuse_graph = false;
+        fprintf(stderr, "multi-GPU: model resident across %zu GPUs (no expert offload)\n",
+                gpus.size());
     } else {
-        // Plain resident weights. A layer split here would need the same
-        // per-device placement plus a sched to run the graph across devices;
-        // until that is built, say so instead of silently putting every layer
-        // on the primary and reporting multi-GPU numbers that are single-GPU.
-        if (multi_gpu())
-            throw std::runtime_error(
-                "multi-GPU (--gpus with more than one device) currently requires "
-                "expert offload: pass --vram-budget with one budget per GPU");
         weights_bufs.push_back(model.load_weights(backend));
     }
 
@@ -794,7 +816,9 @@ void Runtime::Impl::init() {
     if (!sched) {
         galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
-    if (sched || ssd_mode) {
+    // A sched no longer implies offload: a multi-GPU resident model has one too,
+    // and it has no expert cache to build.
+    if (use_expert_offload || ssd_mode) {
         init_cache();   // dynamic per-expert VRAM cache for the decode hot path
     }
     // MTP: main forward exposes its last hidden, drafted by the nextn block

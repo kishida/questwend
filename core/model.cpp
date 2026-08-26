@@ -222,6 +222,80 @@ int DevicePlan::dev_of_name(const std::string & name) const {
     return (d >= 0 && (size_t) d < bufts.size()) ? d : 0;
 }
 
+void Model::load_weights_multi(ggml_backend_t primary, const DevicePlan & plan,
+                               std::vector<ggml_backend_buffer_t> & out_bufs,
+                               std::vector<size_t> * out_dev_bytes)
+{
+    const size_t n_dev = plan.n_dev();
+    if (n_dev == 0) throw std::runtime_error("load_weights_multi: empty device plan");
+
+    // token embedding for get_rows: same fallback rule as load_weights, but the
+    // copy is allocated into out_bufs on the primary rather than into embd_buf_.
+    ggml_tensor * te = tensor("token_embd.weight");
+    tok_embd_rows_ = te;
+    const bool need_f32_embd = need_embd_fallback(primary, te);
+    if (need_f32_embd) {
+        const ggml_type dst_type = embd_q8_ ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+        fprintf(stderr, "token_embd: %s is not GPU get_rows compatible, re-quantizing to %s\n",
+                ggml_type_name(te->type), ggml_type_name(dst_type));
+        ggml_init_params ep{};
+        ep.mem_size = ggml_tensor_overhead() + 256;
+        ep.no_alloc = true;
+        embd_ctx_ = ggml_init(ep);
+        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, dst_type, te->ne[0], te->ne[1]);
+        ggml_set_name(tok_embd_rows_, embd_q8_ ? "token_embd.q8_0" : "token_embd.f16");
+    }
+
+    std::vector<std::vector<ggml_tensor *>> per_dev(n_dev);
+    for (auto & kv : tensors_) per_dev[(size_t) plan.dev_of_name(kv.first)].push_back(kv.second);
+    if (need_f32_embd) per_dev[0].push_back(tok_embd_rows_);
+
+    if (out_dev_bytes) out_dev_bytes->assign(n_dev, 0);
+    for (size_t d = 0; d < n_dev; ++d) {
+        const size_t before = out_bufs.size();
+        char what[64];
+        snprintf(what, sizeof(what), "gpu%zu weights", d);
+        alloc_tensors_chunked(plan.bufts[d], per_dev[d],
+                              ggml_backend_buft_get_max_size(plan.bufts[d]), what, out_bufs);
+        if (out_dev_bytes)
+            for (size_t k = before; k < out_bufs.size(); ++k)
+                (*out_dev_bytes)[d] += ggml_backend_buffer_get_size(out_bufs[k]);
+    }
+
+    std::map<std::string, void *> files;
+    std::vector<uint8_t> buf;
+    std::vector<float>   f32buf;
+    for (auto & kv : tensors_) {
+        ggml_tensor * t = kv.second;
+        const size_t nb = ggml_nbytes(t);
+        buf.resize(nb);
+        read_tensor_bytes(kv.first, buf.data(), nb, files);
+        ggml_backend_tensor_set(t, buf.data(), 0, nb);
+
+        if (need_f32_embd && t == te) {
+            const int64_t ne = ggml_nelements(te);
+            f32buf.resize(ne);
+            ggml_get_type_traits(te->type)->to_float(buf.data(), f32buf.data(), ne);
+            std::vector<uint8_t> qbuf(ggml_nbytes(tok_embd_rows_));
+            if (embd_q8_) {
+                ggml_quantize_chunk(GGML_TYPE_Q8_0, f32buf.data(), qbuf.data(), 0, te->ne[1], te->ne[0], nullptr);
+            } else {
+                ggml_fp32_to_fp16_row(f32buf.data(), (ggml_fp16_t *) qbuf.data(), ne);
+            }
+            ggml_backend_tensor_set(tok_embd_rows_, qbuf.data(), 0, qbuf.size());
+        }
+    }
+    for (auto & kv : files) if (kv.second) fclose((FILE *) kv.second);
+
+    size_t total = 0;
+    for (auto b : out_bufs) total += ggml_backend_buffer_get_size(b);
+    fprintf(stderr, "weights: %.1f MB resident across %zu GPU(s)", total / 1048576.0, n_dev);
+    if (out_dev_bytes)
+        for (size_t d = 0; d < n_dev; ++d)
+            fprintf(stderr, "%s GPU%zu %.1f MB", d ? "," : ":", d, (*out_dev_bytes)[d] / 1048576.0);
+    fprintf(stderr, "\n");
+}
+
 void Model::load_weights_split(
     ggml_backend_t          gpu_backend,
     ggml_backend_buffer_type_t cpu_buft,

@@ -138,6 +138,15 @@ public:
     // Returns the owning buffer (freed by the caller / engine).
     ggml_backend_buffer * load_weights(ggml_backend_t backend);
 
+    // Multi-GPU variant of load_weights: no offload, every weight stays on a
+    // GPU, but each layer's tensors go to the device that computes the layer.
+    // This is what lets a model that does not fit one card run on two. All
+    // buffers are caller-owned (unlike load_weights, where Model owns the one
+    // buffer it returns).
+    void load_weights_multi(ggml_backend_t primary, const DevicePlan & plan,
+                            std::vector<ggml_backend_buffer_t> & out_bufs,
+                            std::vector<size_t> * out_dev_bytes = nullptr);
+
     // Split variant: expert weight tensors (ffn_*_exps) go to cpu_buft,
     // everything else goes to gpu_backend. All output buffers are caller-owned.
     // Expert weights are spread over several cpu buffers (each below the single
