@@ -27,4 +27,9 @@ std::vector<float> gguf_f32_array(const gguf_context * ctx, const std::string & 
 // Read an int32 array (e.g. tokenizer.ggml.token_type).
 std::vector<int32_t> gguf_i32_array(const gguf_context * ctx, const std::string & key);
 
+// Read a uint64 array (e.g. qwen4exp.ple.head_offsets). The PLE hash needs the
+// full 64-bit width: its multipliers reach ~2^45 and the row offsets index a
+// 320 M row table.
+std::vector<uint64_t> gguf_u64_array(const gguf_context * ctx, const std::string & key);
+
 } // namespace questwend

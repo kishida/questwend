@@ -1,0 +1,41 @@
+# id	type	token   (type 3 = CONTROL, 4 = USER_DEFINED)
+248044	3	<|endoftext|>
+248045	3	<|im_start|>
+248046	3	<|im_end|>
+248047	3	<|object_ref_start|>
+248048	3	<|object_ref_end|>
+248049	3	<|box_start|>
+248050	3	<|box_end|>
+248051	3	<|quad_start|>
+248052	3	<|quad_end|>
+248053	3	<|vision_start|>
+248054	3	<|vision_end|>
+248055	3	<|vision_pad|>
+248056	3	<|image_pad|>
+248057	3	<|video_pad|>
+248058	4	<tool_call>
+248059	4	</tool_call>
+248060	3	<|fim_prefix|>
+248061	3	<|fim_middle|>
+248062	3	<|fim_suffix|>
+248063	3	<|fim_pad|>
+248064	3	<|repo_name|>
+248065	3	<|file_sep|>
+248066	4	<tool_response>
+248067	4	</tool_response>
+248068	4	<think>
+248069	4	</think>
+248070	3	<|audio_start|>
+248071	3	<|audio_end|>
+248072	3	<tts_pad>
+248073	3	<tts_text_bos>
+248074	3	<tts_text_eod>
+248075	3	<tts_text_bos_single>
+248076	3	<|audio_pad|>
+
+# named ids
+tokenizer.ggml.bos_token_id = 248044	'<|endoftext|>'
+tokenizer.ggml.eos_token_id = 248046	'<|im_end|>'
+tokenizer.ggml.padding_token_id = 248044	'<|endoftext|>'
+qwen4exp.ple.eos_token_id = 248044	'<|endoftext|>'
+qwen4exp.ple.image_token_id = 248056	'<|image_pad|>'

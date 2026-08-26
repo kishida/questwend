@@ -27,6 +27,7 @@ enum class Arch {
     QWEN35,       // dense + Gated DeltaNet hybrid
     QWEN35MOE,    // MoE  + Gated DeltaNet hybrid
     QWEN3NEXT,    // GDN + MoE hybrid
+    QWEN4EXP,     // Qwen3.8-Flash-Next: GDN + MoE + hyper-connections + QSA + PLE
 };
 
 const char * arch_name(Arch a);
@@ -65,6 +66,55 @@ struct HParams {
     uint32_t ssm_dt_rank    = 0;     // H_v (number of GDN value heads)
     uint32_t full_attn_interval = 4; // attention every `interval` layers ((il+1)%interval==0)
     uint32_t nextn_predict_layers = 0;
+
+    // ---- qwen4exp: hyper-connections ----
+    // The residual stream carries hc_count identical-width copies ("streams")
+    // instead of one, so it is hc_count * n_embd wide everywhere between layers.
+    // A low-rank gate mixes them down to n_embd for each block and scatters the
+    // block output back across the streams. 0 = ordinary single-stream residual.
+    uint32_t hc_count    = 0;
+    uint32_t hc_low_rank = 0;
+    bool     has_hc() const { return hc_count > 0; }
+    uint32_t n_embd_hc() const { return has_hc() ? hc_count * n_embd : n_embd; }
+
+    // ---- qwen4exp: QSA (query-sparse attention) ----
+    // Full-attention layers score whole blocks of compress_ratio tokens with a
+    // small indexer head and attend to the best indexer_top_k of them (plus the
+    // incomplete tail). Below indexer_top_k + compress_ratio - 1 cached tokens
+    // this is exactly dense attention, so a short-context run needs none of it.
+    uint32_t indexer_n_head   = 0;
+    uint32_t indexer_head_dim = 0;
+    uint32_t indexer_top_k    = 0;
+    std::vector<uint32_t> compress_ratios;   // per layer; 0 = plain dense attention
+    uint32_t compress_ratio(uint32_t il) const {
+        return il < compress_ratios.size() ? compress_ratios[il] : 0;
+    }
+    bool has_qsa() const { return indexer_top_k > 0; }
+
+    // ---- qwen4exp: PLE (per-layer n-gram hash embedding) ----
+    // One designated layer gathers ple_n_heads rows of a shared hash table,
+    // indexed by a 64-bit hash of the token and its predecessors. The table is
+    // enormous (26.8 GiB in the IQ1_S quant) and is never a resident weight --
+    // see NgramTable. Every field is 0 when the model has no PLE.
+    uint32_t ple_ngram_size      = 0;
+    uint32_t ple_heads_per_ngram = 0;
+    uint32_t ple_conv_kernel     = 0;
+    uint32_t ple_n_heads         = 0;  // (ngram_size - 1) * heads_per_ngram
+    uint32_t ple_head_dim        = 0;  // embedding_length_per_layer_input
+    uint32_t ple_eos_token_id    = 0;  // segment boundary -- NOT the chat EOS
+    uint32_t ple_image_token_id  = 0;  // 0 = file predates the key, falls back to EOS
+    std::vector<uint8_t>  ple_layers;            // per-layer flag
+    std::vector<uint64_t> ple_layer_multipliers; // [ngram_size]
+    std::vector<uint64_t> ple_head_offsets;      // [ple_n_heads]
+    std::vector<uint64_t> ple_head_vocab_sizes;  // [ple_n_heads]
+    bool has_ple() const { return ple_n_heads > 0; }
+    bool is_ple(uint32_t il) const {
+        return il < ple_layers.size() && ple_layers[il] != 0;
+    }
+    // Rows of conv history the PLE module adds to the recurrent state row.
+    uint32_t ple_conv_state() const {
+        return has_ple() ? (ple_conv_kernel - 1) * ple_ngram_size : 0;
+    }
 
     // GGUF metadata (display / identification)
     std::string  general_name;  // general.name
@@ -228,6 +278,7 @@ private:
     ggml_tensor *         tok_embd_rows_ = nullptr;
 
     void load_hparams();
+    void load_qwen4exp_hparams(const std::string & arch);
     void load_vocab();
 
     // Read nb bytes of tensor `name` from its (possibly sharded) source file into

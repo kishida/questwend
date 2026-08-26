@@ -86,4 +86,15 @@ std::vector<int32_t> gguf_i32_array(const gguf_context * ctx, const std::string 
     return out;
 }
 
+std::vector<uint64_t> gguf_u64_array(const gguf_context * ctx, const std::string & key) {
+    std::vector<uint64_t> out;
+    const int64_t id = gguf_find_key(ctx, key.c_str());
+    if (id < 0 || gguf_get_kv_type(ctx, id) != GGUF_TYPE_ARRAY) return out;
+    if (gguf_get_arr_type(ctx, id) != GGUF_TYPE_UINT64) return out;
+    const size_t n = gguf_get_arr_n(ctx, id);
+    out.resize(n);
+    std::memcpy(out.data(), gguf_get_arr_data(ctx, id), n * sizeof(uint64_t));
+    return out;
+}
+
 } // namespace questwend

@@ -23,6 +23,7 @@ const char * arch_name(Arch a) {
         case Arch::QWEN35:    return "qwen35";
         case Arch::QWEN35MOE: return "qwen35moe";
         case Arch::QWEN3NEXT: return "qwen3next";
+        case Arch::QWEN4EXP:  return "qwen4exp";
         default:              return "unknown";
     }
 }
@@ -33,6 +34,7 @@ static Arch arch_from_string(const std::string & s) {
     if (s == "qwen35")    return Arch::QWEN35;
     if (s == "qwen35moe") return Arch::QWEN35MOE;
     if (s == "qwen3next") return Arch::QWEN3NEXT;
+    if (s == "qwen4exp")  return Arch::QWEN4EXP;
     return Arch::UNKNOWN;
 }
 
@@ -677,13 +679,65 @@ void Model::load_hparams() {
     hp_.full_attn_interval   = gguf_u32(gguf_, k("full_attention_interval"), 4);
     hp_.nextn_predict_layers = gguf_u32(gguf_, k("nextn_predict_layers"), 0);
     hp_.has_gdn = (hp_.arch == Arch::QWEN35 || hp_.arch == Arch::QWEN35MOE ||
-                   hp_.arch == Arch::QWEN3NEXT) && hp_.ssm_d_inner > 0;
+                   hp_.arch == Arch::QWEN3NEXT || hp_.arch == Arch::QWEN4EXP) &&
+                  hp_.ssm_d_inner > 0;
+
+    if (hp_.arch == Arch::QWEN4EXP) load_qwen4exp_hparams(arch);
 
     // vocab size: prefer output.weight rows, else token_embd
     if (auto * t = tensor("output.weight")) {
         hp_.n_vocab = (uint32_t) t->ne[1];
     } else if (auto * t = tensor("token_embd.weight")) {
         hp_.n_vocab = (uint32_t) t->ne[1];
+    }
+}
+
+// qwen4exp-only hyper-parameters: hyper-connections, QSA and the PLE n-gram table.
+void Model::load_qwen4exp_hparams(const std::string & arch) {
+    auto k = [&](const char * suffix) { return arch + "." + suffix; };
+
+    hp_.hc_count    = gguf_u32(gguf_, k("hyper_connection.count"), 0);
+    hp_.hc_low_rank = gguf_u32(gguf_, k("hyper_connection.low_rank"), 0);
+    if (hp_.hc_count == 0 || hp_.hc_low_rank == 0) {
+        throw std::runtime_error("qwen4exp: missing hyper_connection.count / .low_rank");
+    }
+
+    hp_.indexer_n_head   = gguf_u32(gguf_, k("attention.indexer.head_count"), 0);
+    hp_.indexer_head_dim = gguf_u32(gguf_, k("attention.indexer.key_length"), 0);
+    hp_.indexer_top_k    = gguf_u32(gguf_, k("attention.indexer.top_k"), 0);
+    for (int32_t r : gguf_i32_array(gguf_, k("attention.compress_ratios"))) {
+        hp_.compress_ratios.push_back((uint32_t) (r < 0 ? 0 : r));
+    }
+
+    // PLE. Absent key group -> every field stays 0 and has_ple() is false.
+    auto ple_layers = gguf_i32_array(gguf_, k("ple.layers"));
+    if (ple_layers.empty()) return;
+
+    hp_.ple_layers.assign(hp_.n_layer, 0);
+    for (int32_t il : ple_layers) {
+        if (il < 0 || (uint32_t) il >= hp_.n_layer) {
+            throw std::runtime_error("qwen4exp: ple.layers out of range");
+        }
+        hp_.ple_layers[il] = 1;
+    }
+
+    hp_.ple_ngram_size      = gguf_u32(gguf_, k("ple.ngram_size"));
+    hp_.ple_heads_per_ngram = gguf_u32(gguf_, k("ple.heads_per_ngram"));
+    hp_.ple_conv_kernel     = gguf_u32(gguf_, k("ple.conv_kernel"));
+    hp_.ple_eos_token_id    = gguf_u32(gguf_, k("ple.eos_token_id"));
+    hp_.ple_image_token_id  = gguf_u32(gguf_, k("ple.image_token_id"), 0);
+    hp_.ple_head_dim        = gguf_u32(gguf_, k("embedding_length_per_layer_input"));
+    hp_.ple_n_heads         = (hp_.ple_ngram_size - 1) * hp_.ple_heads_per_ngram;
+
+    hp_.ple_layer_multipliers = gguf_u64_array(gguf_, k("ple.layer_multipliers"));
+    hp_.ple_head_offsets      = gguf_u64_array(gguf_, k("ple.head_offsets"));
+    hp_.ple_head_vocab_sizes  = gguf_u64_array(gguf_, k("ple.head_vocab_sizes"));
+
+    if (hp_.ple_ngram_size < 2 || hp_.ple_n_heads == 0 || hp_.ple_head_dim == 0 ||
+        hp_.ple_layer_multipliers.size() != hp_.ple_ngram_size ||
+        hp_.ple_head_offsets.size()      != hp_.ple_n_heads ||
+        hp_.ple_head_vocab_sizes.size()  != hp_.ple_n_heads) {
+        throw std::runtime_error("qwen4exp: inconsistent ple.* metadata");
     }
 }
 
@@ -753,6 +807,27 @@ std::string Model::summary() const {
     if (hp_.has_gdn) {
         os << "GDN: d_inner=" << hp_.ssm_d_inner << " n_group=" << hp_.ssm_n_group
            << " d_state=" << hp_.ssm_d_state << " d_conv=" << hp_.ssm_d_conv << "\n";
+    }
+    if (hp_.has_hc()) {
+        os << "hyper-conn    = " << hp_.hc_count << " streams (low_rank="
+           << hp_.hc_low_rank << ", residual width=" << hp_.n_embd_hc() << ")\n";
+    }
+    if (hp_.has_qsa()) {
+        os << "QSA           = top_k " << hp_.indexer_top_k << ", indexer "
+           << hp_.indexer_n_head << "x" << hp_.indexer_head_dim
+           << ", dense below " << (hp_.indexer_top_k + hp_.compress_ratio(3) - 1)
+           << " cached tokens\n";
+    }
+    if (hp_.has_ple()) {
+        uint32_t ple_il = 0;
+        for (uint32_t i = 0; i < hp_.ple_layers.size(); ++i) {
+            if (hp_.ple_layers[i]) { ple_il = i; break; }
+        }
+        uint64_t rows = 0;
+        for (uint64_t v : hp_.ple_head_vocab_sizes) rows += v;
+        os << "PLE n-gram    = layer " << ple_il << ", " << hp_.ple_ngram_size
+           << "-gram, " << hp_.ple_n_heads << " heads x " << hp_.ple_head_dim
+           << " dim, " << rows << " table rows\n";
     }
     os << "tensors       = " << tensors_.size() << "\n"
        << "vocab tokens  = " << vocab_.tokens.size() << "\n"

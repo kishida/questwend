@@ -37,3 +37,6 @@ Thumbs.db
 
 # AI instruction logs (local only)
 /memory/
+
+# python bytecode from the test helpers
+__pycache__/
