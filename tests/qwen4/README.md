@@ -186,6 +186,41 @@ Windows 側では IQ1_S で層 0〜28 まで健全に動作することを確認
 **ただしこれは「破綻しない」であって「参照実装と一致する」ではない。** 実重みでの
 QSA の数値比較はまだ取っていない。極小モデルでは ratio 1 で厳密一致を確認済み。
 
+### `--ngram` 3 モードの実測（IQ1_S / 4060 Ti 16GB / HDD / `--experts-ssd`）
+
+プロンプト "The capital of France is"、`-n 32 --temp 0 --vram-budget 14`。
+
+| モード | 常駐 | 出力 |
+|---|---|---|
+| `off` | 0 | `Paris. Paris is the capital of France. This is a tautology.` |
+| `disk` | 255 MB | `Paris. Given a list of countries and their capitals, answer the question 'Is the capital of France correct?'` |
+| `ram` | 27465 MB | **`disk` と 1 バイト違わず同一** |
+
+**`disk` と `ram` は出力もエキスパートのルーティングも完全に一致する**
+（expert cache stats が 53280 accesses / 69.0% hit / 16539 misses まで同じ）。
+ルーティングは hidden state から決まるので、全 48 層の活性が一致しているということ。
+テーブルの置き場所が 2 通りあっても計算は同じ、という保証になる。
+
+`off` は出力が変わる。PLE は実際にモデルの挙動を変えているので、スイッチは
+「効いていない機能を切っている」わけではない。
+
+### HDD では `--ngram ram` は逆効果
+
+同じ 3 回の実行の速度（ページキャッシュの温まり具合に完全に支配されているので
+モード間の比較としては読めないが、`ram` だけは構造的に遅い）:
+
+| モード | prefill | gen | expert fetch |
+|---|---|---|---|
+| `disk` | 1.1 tok/s | 0.8 tok/s | 8523 MB / 37 s |
+| `ram` | 0.1 tok/s | 0.2 tok/s | 8523 MB / 232 s |
+
+同じ 8523 MB のエキスパート転送に 6 倍かかっている。テーブルの 26.8 GiB が
+**エキスパートのページキャッシュを追い出すから**。PLE が要求するのは 1 トークン
+あたり 1.4 KB、エキスパートは 742 MiB。RAM をどちらに使うべきかは明らか。
+
+**エキスパートがディスクにあるうちは `--ngram disk` を使うこと。** `ram` が効くのは
+エキスパートも全部メモリに載る機械（512GB Mac など）。
+
 ### まだ検証していないこと
 
 **実重みでの数値比較（llama.cpp との logits 突き合わせ）はまだ。** 512GB Mac なら
