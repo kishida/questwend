@@ -19,6 +19,7 @@ qwencpp に `qwen4exp` アーキテクチャを実装するための、llama.cpp
 | `make_tiny_model.py` | 同じ構造の**極小 qwen4exp を乱数生成**（8層 / d=128 / 7 MiB、全 F32）。`--no-ple` で PLE 抜き版 |
 | `check_tiny.py` | 極小モデルを qw-cli に通し、記録済みの llama.cpp 参照と比較する |
 | `check_weights.py` | GGUF の重みが壊れていないか、ロードせずに数秒で確認する |
+| `top_logits.py` | `--dump-logits` の出力を要約（非有限の有無・分布の広さ・上位トークン） |
 | `compare_logits.py` | `index: value` 形式の logits ダンプ 2 本を比較（最大差・argmax・top-k 順序） |
 | `01-tiny/` | 極小モデルの参照 logits。`.gguf` は seed 固定で再生成できるのでコミットしない |
 
