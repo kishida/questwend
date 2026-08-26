@@ -106,10 +106,15 @@ static void usage(const char * prog) {
     printf("  --vram-budget <GB>  offload expert weights to CPU; keep non-expert on GPU\n");
     printf("                      GB, fractions ok (13.5); suffix M/G to be explicit (13500M)\n");
     printf("                      one value per GPU to use several (e.g. 13.5,5)\n");
+    printf("                      auto = that GPU uses all its free VRAM and does not\n");
+    printf("                      offload; 0 = that GPU is not used at all\n");
+    printf("                      (13.5,auto and 5g,0 are both valid); the default is\n");
+    printf("                      the same as --vram-budget auto\n");
     printf("  --gpus <list>       GPU device indices, primary first (e.g. 1, or 1,0).\n");
     printf("                      Naming two devices -- here or via --vram-budget --\n");
     printf("                      is what asks for two GPUs; without a --vram-budget\n");
-    printf("                      each one uses all the VRAM it has free.\n");
+    printf("                      each one uses all the VRAM it has free. --gpus and\n");
+    printf("                      --vram-budget must name the same number of devices.\n");
     printf("  --gpu-split <spec>  each GPU's share of the layers (default: by\n");
     printf("                      --vram-budget, or by free VRAM when that is omitted)\n");
     printf("                      0.9,0.1 / 9,1 / 18,2  all mean the same ratio, and\n");
@@ -187,11 +192,14 @@ int main(int argc, char ** argv) {
             const std::string v = next();
             bool legacy = false;
             if (!parse_vram_budget_list(v, vram_list, &legacy)) {
-                fprintf(stderr, "error: bad --vram-budget value: %s (expected e.g. 14, 13.5, 14G, 13500M, or one per GPU: 13.5,5)\n", v.c_str());
+                fprintf(stderr, "error: bad --vram-budget value: %s (expected auto, or e.g. 14, 13.5, 14G, 13500M, or one per GPU: 13.5,auto)\n", v.c_str());
                 return 1;
             }
+            // AUTO and 0 contribute nothing: the total only gates expert
+            // offload, which an explicit numeric budget is what asks for.
             vram_budget_mb = 0;
-            for (size_t k = 0; k < vram_list.size(); ++k) vram_budget_mb += vram_list[k];
+            for (size_t k = 0; k < vram_list.size(); ++k)
+                if (vram_list[k] != VRAM_BUDGET_AUTO) vram_budget_mb += vram_list[k];
             if (legacy)
                 fprintf(stderr, "note: --vram-budget %s read as %zu MB (%.1f GB); the unit is now GB, "
                                 "write %.1f or %sM to be explicit\n",
@@ -354,7 +362,8 @@ int main(int argc, char ** argv) {
         // Across GPUs vram_budget_mb only gates offload (each device's own budget
         // comes from the plan), but on one GPU it IS the budget -- so it has to be
         // that GPU's value, never the total of a list whose tail is being ignored.
-        if (cfg.gpus.size() <= 1 && !vram_list.empty()) cfg.vram_budget_mb = vram_list[0];
+        if (cfg.gpus.size() <= 1 && !vram_list.empty() && vram_list[0] != VRAM_BUDGET_AUTO)
+            cfg.vram_budget_mb = vram_list[0];
         cfg.cache_profile  = cache_profile;
         cfg.experts_ssd    = experts_ssd;
         // MTP needs the nextn block kept VRAM-resident (also the dev MTP test mode).

@@ -523,11 +523,14 @@ int main(int argc, char ** argv) {
             const std::string v = argv[++i];
             bool legacy = false;
             if (!parse_vram_budget_list(v, vram_list, &legacy)) {
-                fprintf(stderr, "error: bad --vram-budget value: %s (expected e.g. 14, 13.5, 14G, 13500M, or one per GPU: 13.5,5)\n", v.c_str());
+                fprintf(stderr, "error: bad --vram-budget value: %s (expected auto, or e.g. 14, 13.5, 14G, 13500M, or one per GPU: 13.5,auto)\n", v.c_str());
                 return 1;
             }
+            // AUTO and 0 contribute nothing: the total only gates expert
+            // offload, which an explicit numeric budget is what asks for.
             vram_budget_mb = 0;
-            for (size_t k = 0; k < vram_list.size(); ++k) vram_budget_mb += vram_list[k];
+            for (size_t k = 0; k < vram_list.size(); ++k)
+                if (vram_list[k] != VRAM_BUDGET_AUTO) vram_budget_mb += vram_list[k];
             if (legacy)
                 fprintf(stderr, "note: --vram-budget %s read as %zu MB (%.1f GB); the unit is now GB, "
                                 "write %.1f or %sM to be explicit\n",
@@ -583,6 +586,10 @@ int main(int argc, char ** argv) {
             "  --vram-budget <GB>  offload expert weights; keep non-expert on GPU\n"
             "                      GB, fractions ok (13.5); suffix M/G to be explicit (13500M)\n"
             "                      one value per GPU to use several (e.g. 13.5,5)\n"
+            "                      auto = that GPU uses all its free VRAM and does not\n"
+            "                      offload; 0 = that GPU is not used at all\n"
+            "                      (13.5,auto and 5g,0 are both valid); the default is\n"
+            "                      the same as --vram-budget auto\n"
             "  --gpus <list>       GPU device indices, primary first (e.g. 1, or 1,0).\n"
             "                      Naming two devices -- here or via --vram-budget --\n"
             "                      is what asks for two GPUs; without a --vram-budget\n"
@@ -705,7 +712,8 @@ int main(int argc, char ** argv) {
         if (!build_gpu_plan(gpu_ids, gpu_split, gpu_split_given, vram_list, cfg.gpus)) return 1;
         // Across GPUs vram_budget_mb only gates offload (each device's own budget
         // comes from the plan), but on one GPU it IS the budget.
-        if (cfg.gpus.size() <= 1 && !vram_list.empty()) cfg.vram_budget_mb = vram_list[0];
+        if (cfg.gpus.size() <= 1 && !vram_list.empty() && vram_list[0] != VRAM_BUDGET_AUTO)
+            cfg.vram_budget_mb = vram_list[0];
         cfg.cache_profile      = cache_profile;
         cfg.cache_profile_save = false;   // server only reads the profile, never overwrites it
         cfg.experts_ssd        = experts_ssd;

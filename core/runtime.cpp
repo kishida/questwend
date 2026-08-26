@@ -614,13 +614,14 @@ void Runtime::Impl::init() {
                 // the device actually has free, so a resident (non-offload)
                 // split lands layers in proportion to real capacity instead of
                 // piling them all onto the primary.
-                size_t budget = p.budget_mb * 1024ull * 1024ull;
-                bool from_free = false;
-                if (budget == 0) {
+                const bool from_free = (p.budget_mb == VRAM_BUDGET_AUTO);
+                size_t budget;
+                if (from_free) {
                     size_t dev_free = 0, dev_total = 0;
                     ggml_backend_dev_memory(devs[(size_t) p.device], &dev_free, &dev_total);
                     budget = dev_free;
-                    from_free = true;
+                } else {
+                    budget = p.budget_mb * 1024ull * 1024ull;
                 }
                 fprintf(stderr, "backend: GPU%d [%s] %s (%s %zu MB, split %.3g)\n",
                         p.device, ggml_backend_dev_name(devs[(size_t) p.device]),
@@ -4109,6 +4110,25 @@ bool parse_vram_budget_list(const std::string & arg, std::vector<size_t> & out, 
     if (legacy_mb) *legacy_mb = false;
     std::vector<size_t> v;
     for (const auto & f : split_csv(arg)) {
+        std::string lower;
+        for (char c : f) lower += (char) tolower((unsigned char) c);
+        // "auto" = all the VRAM this device has free.
+        if (lower == "auto") { v.push_back(VRAM_BUDGET_AUTO); continue; }
+        // An explicit 0 turns the device off; build_gpu_plan drops it.
+        {
+            char * end = nullptr;
+            const double d = strtod(f.c_str(), &end);
+            if (end != f.c_str() && d == 0.0) {
+                std::string suf;
+                for (const char * p = end; *p; ++p)
+                    if (!isspace((unsigned char) *p)) suf += (char) tolower((unsigned char) *p);
+                if (suf.empty() || suf == "m" || suf == "mb" || suf == "g" || suf == "gb") {
+                    v.push_back(0);
+                    continue;
+                }
+                return false;
+            }
+        }
         bool legacy = false;
         const size_t mb = parse_vram_budget_mb(f, &legacy);
         if (mb == 0) return false;
@@ -4198,9 +4218,24 @@ bool build_gpu_plan(const std::vector<int> & gpu_ids,
     for (size_t i = 0; i < n; ++i) {
         GpuPlan p;
         p.device    = gpu_ids.empty()   ? (int) i : gpu_ids[i];
-        p.budget_mb = vram_mb.empty()   ? 0       : vram_mb[i];
+        p.budget_mb = vram_mb.empty()   ? VRAM_BUDGET_AUTO : vram_mb[i];
         p.split     = gpu_split.empty() ? -1.0f   : gpu_split[i];
+        // A budget of 0 turns the device off. Asking --gpu-split to put layers
+        // on it anyway is a contradiction, not something to silently resolve.
+        if (p.budget_mb == 0) {
+            if (p.split > 0.0f) {
+                fprintf(stderr, "error: --vram-budget 0 turns GPU%d off, but --gpu-split gives it "
+                                "a share of %g; use 0 in both, or leave the device out of --gpus\n",
+                        p.device, p.split);
+                return false;
+            }
+            continue;   // dropped: not part of the plan at all
+        }
         out.push_back(p);
+    }
+    if (out.empty()) {
+        fprintf(stderr, "error: --vram-budget turns every GPU off; leave at least one non-zero\n");
+        return false;
     }
     return true;
 }

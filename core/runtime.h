@@ -32,10 +32,14 @@ std::vector<ggml_backend_dev_t> gpu_devices();
 // a device split == 0 and it holds no layers, so its whole budget is surplus
 // and it acts as a pure expert pool for the devices that do compute. A single
 // device with split == 1 is the original single-GPU behavior.
+// A --vram-budget element of "auto" (or an omitted budget): give the device all
+// the VRAM it has free. Distinct from a budget of 0, which turns the device off.
+static const size_t VRAM_BUDGET_AUTO = (size_t) -1;
+
 struct GpuPlan {
-    int    device    = 0;      // index into gpu_devices()
-    size_t budget_mb = 0;      // VRAM budget for this device (0 = unspecified)
-    float  split     = -1.0f;  // compute-layer share; < 0 = auto (by budget)
+    int    device    = 0;                  // index into gpu_devices()
+    size_t budget_mb = VRAM_BUDGET_AUTO;   // VRAM budget, or AUTO for "all free"
+    float  split     = -1.0f;              // compute-layer share; < 0 = auto (by budget)
 };
 
 struct RuntimeConfig {
@@ -65,7 +69,13 @@ size_t parse_vram_budget_mb(const std::string & arg, bool * legacy_mb = nullptr)
 // Comma-separated multi-GPU arguments. Each returns false (leaving `out`
 // untouched) when a field does not parse, so the caller can print the offending
 // argument and exit.
-//   --vram-budget "13.5,5"  -> one budget per device, each parsed as above
+//   --vram-budget "13.5,5"  -> one budget per device, each parsed as above.
+//                              "auto" gives that device all its free VRAM and,
+//                              contributing nothing to the total that gates
+//                              expert offload, makes "auto" alone identical to
+//                              passing nothing. "0" instead turns the device
+//                              OFF: "--gpus 1,0 --vram-budget 5g,0" is the same
+//                              as "--gpus 1 --vram-budget 5g".
 //   --gpus        "1,0"     -> device indices into gpu_devices(), primary first
 //   --gpu-split   "0.8,0"   -> compute-layer share per device (0 = expert pool)
 //                  "auto"   -> share by --vram-budget, or by free VRAM without it
