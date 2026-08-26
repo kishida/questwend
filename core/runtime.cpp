@@ -23,12 +23,60 @@ namespace questwend {
 
 static const int GRAPH_SIZE = 16384;
 
+// Allocate exactly `ts` into one fresh buffer on `buft`. ggml_backend_alloc_ctx_tensors
+// cannot be used where tensors from a single context are spread over several
+// devices: it claims every unallocated tensor in the context for one buffer.
+static ggml_backend_buffer_t alloc_tensor_list(ggml_backend_buffer_type_t buft,
+                                               const std::vector<ggml_tensor *> & ts,
+                                               const char * what) {
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    size_t sz = 0;
+    for (auto * t : ts) sz += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
+    ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft, sz > 0 ? sz : 1);
+    if (!b) throw std::runtime_error(std::string("failed to allocate ") + what);
+    ggml_tallocr ta = ggml_tallocr_new(b);
+    for (auto * t : ts)
+        if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error(std::string("alloc failed for ") + ggml_get_name(t));
+    return b;
+}
+
 struct Runtime::Impl {
     Model & model;
     RuntimeConfig cfg;
 
     // Primary compute backend (GPU or CPU).
     ggml_backend_t        backend     = nullptr;
+
+    // ---- Multi-GPU (layer split) ----
+    // Every GPU backend in the plan; gpus[0] == backend, the primary device that
+    // owns everything not tied to a transformer layer (embeddings, output head,
+    // final norm) and runs the sampling tail. A layer's weights, KV/recurrent
+    // state and expert pool all live on the same device, so the only traffic
+    // crossing the PCIe bus is the hidden state at a device boundary (~n_embd
+    // floats per token). With one device this vector has a single entry and
+    // multi_gpu() is false, which keeps every path below on its original code.
+    std::vector<ggml_backend_t> gpus;
+    std::vector<int>            layer_dev;      // layer -> index into gpus
+    std::vector<size_t>         dev_budget;     // per-device VRAM budget, bytes (0 = unset)
+    std::vector<size_t>         dev_weight_bytes;  // per-device weight bytes actually allocated
+    std::vector<size_t>         dev_kv_bytes;      // per-device KV/state bytes
+
+    bool multi_gpu() const { return gpus.size() > 1; }
+    int  dev_of(int il) const {
+        return layer_dev.empty() ? 0 : layer_dev[(size_t) il];
+    }
+    ggml_backend_t be_of(int il) const {
+        return gpus.empty() ? backend : gpus[(size_t) dev_of(il)];
+    }
+    // Placement plan handed to the weight loaders.
+    DevicePlan device_plan() const {
+        DevicePlan p;
+        for (ggml_backend_t be : gpus) p.bufts.push_back(ggml_backend_get_default_buffer_type(be));
+        p.layer_dev = layer_dev;
+        return p;
+    }
+
     // GPU weights, split across buffers when the backend caps a single one.
     std::vector<ggml_backend_buffer_t> weights_bufs;
     bool weights_buf_owned = false;   // split/ssd: ours; single-backend: Model frees it
@@ -48,7 +96,72 @@ struct Runtime::Impl {
     // When active, decode runs layer-by-layer on GPU: each layer's router is
     // computed, its selected experts are made resident in the cache (streaming
     // misses from CPU/SSD), then the expert matmuls run on GPU slot tensors.
-    std::unique_ptr<ExpertCache> ecache;
+    // One expert cache per GPU (a device with no layers gets a null entry).
+    // `ecache` aliases the primary's and doubles as the "offload is on" flag,
+    // so single-GPU code reads exactly as it did before the split.
+    std::vector<std::unique_ptr<ExpertCache>> ecaches;
+    ExpertCache *         ecache = nullptr;
+    // The cache holding `il`'s experts: the one on the device that computes it.
+    ExpertCache * ec_of(int il) const {
+        if (ecaches.size() <= 1) return ecache;
+        const size_t d = (size_t) dev_of(il);
+        return d < ecaches.size() ? ecaches[d].get() : nullptr;
+    }
+    // Every live cache, for the whole-model operations (stats, quota mode).
+    std::vector<ExpertCache *> all_ecaches() const {
+        std::vector<ExpertCache *> v;
+        for (const auto & c : ecaches) if (c) v.push_back(c.get());
+        return v;
+    }
+    // Model-wide cache counters. fetch_ms adds up per-device fetch time, which
+    // on a split runs partly in parallel -- it is a cost total, not a wall time.
+    ExpertCache::Stats ec_stats_sum() const {
+        ExpertCache::Stats t;
+        for (const auto & c : ecaches) {
+            if (!c) continue;
+            const auto & s = c->stats();
+            t.hits += s.hits; t.misses += s.misses; t.evictions += s.evictions;
+            t.fetch_ms += s.fetch_ms; t.fetch_bytes += s.fetch_bytes;
+        }
+        return t;
+    }
+    // ---- graph allocation / execution ----
+    // With one GPU these stay on the historical gallocr + direct-compute path,
+    // which is what makes reuse_graph and the CUDA-graph-friendly fused decode
+    // possible. A layer split makes every graph span devices, so it goes to the
+    // scheduler instead: sched assigns each op to the backend that owns its
+    // weights (layer weights, KV rows and expert slots all sit on the layer's
+    // device) and inserts the copies where the hidden state crosses a boundary.
+    bool alloc_graph(ggml_gallocr_t ga, ggml_cgraph * gf) {
+        if (!multi_gpu()) return ggml_gallocr_alloc_graph(ga, gf);
+        ggml_backend_sched_reset(sched);
+        return ggml_backend_sched_alloc_graph(sched, gf);
+    }
+    ggml_status compute_graph(ggml_cgraph * gf) {
+        return multi_gpu() ? ggml_backend_sched_graph_compute(sched, gf)
+                           : ggml_backend_graph_compute(backend, gf);
+    }
+    // A scheduler over every GPU in the plan plus the CPU. ggml requires the
+    // last backend to be a CPU device: it is the fallback for ops no
+    // accelerator claims.
+    ggml_backend_sched_t make_sched() {
+        std::vector<ggml_backend_t> be(gpus.begin(), gpus.end());
+        std::vector<ggml_backend_buffer_type_t> bt;
+        for (ggml_backend_t b : gpus) bt.push_back(ggml_backend_get_default_buffer_type(b));
+        be.push_back(cpu_backend);
+        bt.push_back(ggml_backend_get_default_buffer_type(cpu_backend));
+        ggml_backend_sched_t s = ggml_backend_sched_new(be.data(), bt.data(), (int) be.size(),
+                                                        GRAPH_SIZE, false, false);
+        if (!s) throw std::runtime_error("failed to create backend scheduler");
+        return s;
+    }
+
+    // Smallest pool across devices: what bounds a batch that must fit every layer.
+    int ec_min_slots() const {
+        int m = INT32_MAX;
+        for (const auto & c : ecaches) if (c) m = std::min(m, c->min_slots());
+        return m == INT32_MAX ? 0 : m;
+    }
     bool                  ssd_mode = false;     // experts streamed from SSD (no RAM copy)
     ggml_gallocr_t        cache_galloc = nullptr;
     // persistent "carry" tensors that bridge the per-layer graph segments
@@ -99,6 +212,9 @@ struct Runtime::Impl {
     ggml_context *        f_ctx    = nullptr;
     ggml_cgraph *         f_gf     = nullptr;
     ggml_gallocr_t        f_galloc = nullptr;
+    // Multi-GPU only: the fused graph's own scheduler, so that a reset from any
+    // other graph cannot invalidate its one-time allocation.
+    ggml_backend_sched_t  f_sched  = nullptr;
     int                   f_nkv    = 0;
     std::vector<int32_t>  g2s_host;
     std::vector<int32_t>  sel_host;
@@ -109,7 +225,9 @@ struct Runtime::Impl {
 
     // recurrent / KV state (persistent across decode steps)
     ggml_context *        st_ctx = nullptr;
-    ggml_backend_buffer_t st_buf = nullptr;
+    // KV / recurrent state, one buffer per GPU: a layer's state must sit on the
+    // device that computes the layer. Single-GPU leaves exactly one entry.
+    std::vector<ggml_backend_buffer_t> st_bufs;
     std::vector<ggml_tensor *> k_cache;     // [n_embd_gqa, n_ctx]  (attention layers)
     std::vector<ggml_tensor *> v_cache;     // [n_embd_gqa, n_ctx]  (attention layers, non-transposed)
     std::vector<ggml_tensor *> conv_state;  // [d_conv-1, conv_ch]  (GDN layers)
@@ -208,10 +326,10 @@ struct Runtime::Impl {
     Impl(Model & m, const RuntimeConfig & c) : model(m), cfg(c) {}
     ~Impl() {
         if (ecache) {
-            if (getenv("QWEN_LAYER_STATS")) ecache->dump_layer_stats("decode");
+            if (getenv("QWEN_LAYER_STATS")) for (auto * c : all_ecaches()) c->dump_layer_stats("decode");
             // What quota would the generation's own routing have asked for?
-            if (getenv("QWEN_LAYER_QUOTA_DRIFT")) ecache->dump_quota_plan("decode-fit");
-            const auto & s = ecache->stats();
+            if (getenv("QWEN_LAYER_QUOTA_DRIFT")) for (auto * c : all_ecaches()) c->dump_quota_plan("decode-fit");
+            const auto & s = ec_stats_sum();
             const uint64_t acc = s.hits + s.misses;
             fprintf(stderr,
                     "expert cache stats: %llu accesses, %.1f%% hit, %llu misses, %llu evictions\n",
@@ -232,10 +350,22 @@ struct Runtime::Impl {
             else if (s.fetch_bytes)
                 fprintf(stderr, "expert cache fetch: %.1f MB (async H2D)\n",
                     s.fetch_bytes / 1024.0 / 1024.0);
-            if (cfg.cache_profile_save && !cfg.cache_profile.empty() && ecache->save_profile(cfg.cache_profile))
-                fprintf(stderr, "expert cache: saved profile to '%s'\n", cfg.cache_profile.c_str());
+            // Each device profiles only its own layers, so a split writes one
+            // file per device (".gpu<N>") rather than having them clobber each
+            // other; a single GPU keeps the plain filename it always had.
+            if (cfg.cache_profile_save && !cfg.cache_profile.empty()) {
+                for (size_t d = 0; d < ecaches.size(); ++d) {
+                    if (!ecaches[d]) continue;
+                    const std::string path = multi_gpu()
+                        ? cfg.cache_profile + ".gpu" + std::to_string(d)
+                        : cfg.cache_profile;
+                    if (ecaches[d]->save_profile(path))
+                        fprintf(stderr, "expert cache: saved profile to '%s'\n", path.c_str());
+                }
+            }
         }
-        ecache.reset();
+        ecaches.clear();
+        ecache = nullptr;
         if (m_galloc)       ggml_gallocr_free(m_galloc);
         if (m_ctx)          ggml_free(m_ctx);
         if (r_galloc)       ggml_gallocr_free(r_galloc);
@@ -247,6 +377,7 @@ struct Runtime::Impl {
         if (backend_mtp && backend_mtp != backend) ggml_backend_free(backend_mtp);
         if (mtp_galloc)     ggml_gallocr_free(mtp_galloc);
         if (f_galloc)       ggml_gallocr_free(f_galloc);
+        if (f_sched)        ggml_backend_sched_free(f_sched);
         if (f_ctx)          ggml_free(f_ctx);
         if (bak_buf)        ggml_backend_buffer_free(bak_buf);
         if (bak_ctx)        ggml_free(bak_ctx);
@@ -257,7 +388,7 @@ struct Runtime::Impl {
         if (galloc)         ggml_gallocr_free(galloc);
         if (dgalloc)        ggml_gallocr_free(dgalloc);
         if (dctx)           ggml_free(dctx);
-        if (st_buf)         ggml_backend_buffer_free(st_buf);
+        for (auto b : st_bufs) if (b) ggml_backend_buffer_free(b);
         if (st_ctx)         ggml_free(st_ctx);
         // expert_cpu_bufs and weights_bufs are owned here (not by Model) in
         // split/ssd mode; in single-backend mode Model owns and frees the weights.
@@ -265,6 +396,9 @@ struct Runtime::Impl {
         if (cpu_backend)    ggml_backend_free(cpu_backend);
         if (weights_buf_owned)
             for (auto b : weights_bufs) if (b) ggml_backend_buffer_free(b);
+        // gpus[0] aliases `backend`; free the secondaries first, then it.
+        for (size_t i = 1; i < gpus.size(); ++i)
+            if (gpus[i]) ggml_backend_free(gpus[i]);
         if (backend)        ggml_backend_free(backend);
     }
 
@@ -282,6 +416,7 @@ struct Runtime::Impl {
     }
 
     void init();
+    void plan_layers();   // fill layer_dev from the --gpu-split shares
     void zero_states();
     // logits_all=false computes the output head for the LAST token only. The
     // head is [n_embd, n_vocab] -- on a large vocabulary it is the single most
@@ -397,13 +532,40 @@ std::vector<ggml_backend_dev_t> gpu_devices() {
 void Runtime::Impl::init() {
     // Prefer a GPU device (CUDA/Metal/etc.) when requested and available.
     if (cfg.use_cuda) {
-        for (ggml_backend_dev_t dev : gpu_devices()) {
-            backend = ggml_backend_dev_init(dev, nullptr);
-            if (backend) {
-                fprintf(stderr, "backend: GPU [%s] %s\n",
-                        ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
-                break;
+        const std::vector<ggml_backend_dev_t> devs = gpu_devices();
+        // Without an explicit plan, take the first device that initializes --
+        // the historical behavior. With one, honor the requested order and
+        // treat a device that fails to init as fatal: silently dropping it
+        // would shift every layer's placement away from what was measured.
+        if (cfg.gpus.empty()) {
+            for (ggml_backend_dev_t dev : devs) {
+                backend = ggml_backend_dev_init(dev, nullptr);
+                if (backend) {
+                    fprintf(stderr, "backend: GPU [%s] %s\n",
+                            ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+                    gpus.push_back(backend);
+                    dev_budget.push_back(cfg.vram_budget_mb * 1024ull * 1024ull);
+                    break;
+                }
             }
+        } else {
+            for (const GpuPlan & p : cfg.gpus) {
+                if (p.device < 0 || (size_t) p.device >= devs.size())
+                    throw std::runtime_error("--gpus: no GPU device with index "
+                                             + std::to_string(p.device) + " (found "
+                                             + std::to_string(devs.size()) + ")");
+                ggml_backend_t be = ggml_backend_dev_init(devs[(size_t) p.device], nullptr);
+                if (!be)
+                    throw std::runtime_error("failed to init GPU device "
+                                             + std::to_string(p.device));
+                fprintf(stderr, "backend: GPU%d [%s] %s (budget %zu MB, split %.3g)\n",
+                        p.device, ggml_backend_dev_name(devs[(size_t) p.device]),
+                        ggml_backend_dev_description(devs[(size_t) p.device]),
+                        p.budget_mb, p.split);
+                gpus.push_back(be);
+                dev_budget.push_back(p.budget_mb * 1024ull * 1024ull);
+            }
+            backend = gpus[0];
         }
         if (!backend) fprintf(stderr, "backend: no GPU device found, falling back to CPU\n");
     }
@@ -414,7 +576,12 @@ void Runtime::Impl::init() {
         if (nth <= 0) nth = 4;
         ggml_backend_cpu_set_n_threads(backend, nth);
         fprintf(stderr, "backend: CPU (%d threads)\n", nth);
+        gpus.assign(1, backend);          // "device 0" is the CPU here
+        dev_budget.assign(1, 0);
     }
+
+    // Decide which device computes which layer before any weight is placed.
+    plan_layers();
 
     // ---- Phase B: Expert weight offload via CPU backend + sched ----
     const bool use_expert_offload =
@@ -430,8 +597,31 @@ void Runtime::Impl::init() {
         // ---- SSD tier: experts stay on disk; non-expert weights -> GPU ----
         ssd_mode = true;
         weights_buf_owned = true;   // set first: a throw mid-load still frees what was allocated
-        model.load_weights_ssd(backend, weights_bufs);
+        DevicePlan ssd_plan = device_plan();
+        model.load_weights_ssd(backend, weights_bufs, &ssd_plan, &dev_weight_bytes);
         reuse_graph = false;   // every token goes through the per-token cache path
+        // The SSD tier has no CPU backend to fall back to, so it normally runs
+        // without a scheduler at all. A layer split still needs one to route
+        // each op to the device holding that layer's weights. ggml_backend_sched
+        // asserts that the LAST backend is a CPU device (it is the fallback for
+        // ops no accelerator claims), so one has to be created here even though
+        // this tier never runs expert matmuls on it.
+        if (multi_gpu()) {
+            cpu_backend = ggml_backend_cpu_init();
+            if (!cpu_backend) throw std::runtime_error("failed to init CPU backend (ssd tier)");
+            int nth = cfg.n_threads > 0 ? cfg.n_threads : (int) std::thread::hardware_concurrency();
+            if (nth <= 0) nth = 4;
+            ggml_backend_cpu_set_n_threads(cpu_backend, nth);
+
+            std::vector<ggml_backend_t> sb(gpus.begin(), gpus.end());
+            std::vector<ggml_backend_buffer_type_t> st;
+            for (ggml_backend_t be : gpus) st.push_back(ggml_backend_get_default_buffer_type(be));
+            sb.push_back(cpu_backend);
+            st.push_back(ggml_backend_get_default_buffer_type(cpu_backend));
+            sched = ggml_backend_sched_new(sb.data(), st.data(), (int) sb.size(),
+                                           GRAPH_SIZE, false, false);
+            if (!sched) throw std::runtime_error("failed to create backend scheduler (ssd tier)");
+        }
         fprintf(stderr, "expert offload: ON (SSD tier, decode via VRAM cache; prefill in batched chunks)\n");
     } else if (use_expert_offload) {
         // Create a CPU backend for expert weights.
@@ -451,18 +641,23 @@ void Runtime::Impl::init() {
             cpu_buft = ggml_backend_get_default_buffer_type(cpu_backend);
         }
 
-        // Load weights: non-expert → GPU, expert → CPU (pinned).
+        // Load weights: non-expert → GPU (its layer's GPU under a split),
+        // expert → CPU (pinned).
         weights_buf_owned = true;   // set first: a throw mid-load still frees what was allocated
-        model.load_weights_split(backend, cpu_buft, weights_bufs, expert_cpu_bufs);
+        DevicePlan plan = device_plan();
+        model.load_weights_split(backend, cpu_buft, weights_bufs, expert_cpu_bufs,
+                                 &plan, &dev_weight_bytes);
 
-        // Create backend scheduler: GPU first (higher priority), CPU fallback.
-        // The sched routes ops to GPU for GPU-backend tensors and CPU for CPU-backend tensors.
-        ggml_backend_t   sched_be[2]   = { backend, cpu_backend };
-        ggml_backend_buffer_type_t sched_bt[2] = {
-            ggml_backend_get_default_buffer_type(backend),
-            ggml_backend_get_default_buffer_type(cpu_backend),
-        };
-        sched = ggml_backend_sched_new(sched_be, sched_bt, 2, GRAPH_SIZE, false, false);
+        // Create backend scheduler: GPUs first (higher priority, in plan order),
+        // CPU last. The sched routes each op to the backend that owns its
+        // weights and inserts the cross-device copies at the layer boundaries.
+        std::vector<ggml_backend_t> sched_be(gpus.begin(), gpus.end());
+        std::vector<ggml_backend_buffer_type_t> sched_bt;
+        for (ggml_backend_t be : gpus) sched_bt.push_back(ggml_backend_get_default_buffer_type(be));
+        sched_be.push_back(cpu_backend);
+        sched_bt.push_back(ggml_backend_get_default_buffer_type(cpu_backend));
+        sched = ggml_backend_sched_new(sched_be.data(), sched_bt.data(),
+                                       (int) sched_be.size(), GRAPH_SIZE, false, false);
         if (!sched) throw std::runtime_error("failed to create backend scheduler");
 
         // Disable persistent reuse graph — sched alloc is incompatible with it.
@@ -471,6 +666,14 @@ void Runtime::Impl::init() {
         fprintf(stderr, "expert offload: ON (experts stream into the VRAM cache;"
                         " QWEN_CPU_PREFILL=1 runs prefill experts on CPU instead)\n");
     } else {
+        // Plain resident weights. A layer split here would need the same
+        // per-device placement plus a sched to run the graph across devices;
+        // until that is built, say so instead of silently putting every layer
+        // on the primary and reporting multi-GPU numbers that are single-GPU.
+        if (multi_gpu())
+            throw std::runtime_error(
+                "multi-GPU (--gpus with more than one device) currently requires "
+                "expert offload: pass --vram-budget with one budget per GPU");
         weights_bufs.push_back(model.load_weights(backend));
     }
 
@@ -515,8 +718,26 @@ void Runtime::Impl::init() {
             ggml_set_name(v_cache[il], ("v_" + std::to_string(il)).c_str());
         }
     }
-    st_buf = ggml_backend_alloc_ctx_tensors(st_ctx, backend);
-    if (!st_buf) throw std::runtime_error("failed to alloc state buffer");
+    // A layer's KV / recurrent state must live on the device that computes the
+    // layer, so with a split the one state buffer becomes one per device.
+    st_bufs.assign(std::max<size_t>(gpus.size(), 1), nullptr);
+    if (!multi_gpu()) {
+        st_bufs[0] = ggml_backend_alloc_ctx_tensors(st_ctx, backend);
+        if (!st_bufs[0]) throw std::runtime_error("failed to alloc state buffer");
+    } else {
+        for (size_t d = 0; d < gpus.size(); ++d) {
+            std::vector<ggml_tensor *> ts;
+            for (int il = 0; il < n_layer; ++il) {
+                if ((size_t) dev_of(il) != d) continue;
+                if (k_cache[il])    { ts.push_back(k_cache[il]);    ts.push_back(v_cache[il]); }
+                if (conv_state[il]) { ts.push_back(conv_state[il]); ts.push_back(ssm_state[il]); }
+            }
+            st_bufs[d] = alloc_tensor_list(ggml_backend_get_default_buffer_type(gpus[d]),
+                                           ts, "state buffer");
+        }
+    }
+    for (size_t d = 0; d < st_bufs.size() && d < dev_kv_bytes.size(); ++d)
+        dev_kv_bytes[d] = st_bufs[d] ? ggml_backend_buffer_get_size(st_bufs[d]) : 0;
 
     if (!sched) {
         galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -534,6 +755,69 @@ void Runtime::Impl::init() {
     zero_states();
 }
 
+// Assign each transformer layer to a GPU. Devices get contiguous ranges of the
+// main stack in plan order, sized by their --gpu-split share (or, with no
+// explicit split, by their VRAM budget). A device whose share is 0 gets no
+// layers at all -- its budget then goes entirely to the expert pool, which is
+// how a pure "expert pool" device falls out of the same knob as a layer split.
+void Runtime::Impl::plan_layers() {
+    const auto & hp = model.hparams();
+    const int n_layer = (int) hp.n_layer;
+    const int n_main  = (int) hp.n_main();
+
+    layer_dev.assign((size_t) n_layer, 0);
+    dev_weight_bytes.assign(gpus.size(), 0);
+    dev_kv_bytes.assign(gpus.size(), 0);
+    if (gpus.size() <= 1) return;
+
+    // An explicit --gpu-split on any device switches the whole plan to explicit
+    // shares; otherwise split proportionally to each device's VRAM budget.
+    bool auto_split = true;
+    for (const GpuPlan & p : cfg.gpus) if (p.split >= 0.0f) auto_split = false;
+
+    std::vector<double> share(gpus.size(), 0.0);
+    double total = 0.0;
+    for (size_t i = 0; i < gpus.size(); ++i) {
+        share[i] = auto_split ? (double) dev_budget[i]
+                              : (i < cfg.gpus.size() && cfg.gpus[i].split >= 0.0f
+                                     ? (double) cfg.gpus[i].split : 0.0);
+        total += share[i];
+    }
+    if (total <= 0.0) { share[0] = 1.0; total = 1.0; }   // nothing to go on: all on primary
+
+    // Cumulative rounding, so the ranges tile [0, n_main) exactly.
+    int start = 0;
+    double cum = 0.0;
+    for (size_t i = 0; i < gpus.size(); ++i) {
+        cum += share[i] / total;
+        int end = (i + 1 == gpus.size()) ? n_main : (int) llround(cum * n_main);
+        if (share[i] <= 0.0) end = start;            // 0 share: expert pool only
+        end = std::max(start, std::min(end, n_main));
+        for (int il = start; il < end; ++il) layer_dev[(size_t) il] = (int) i;
+        start = end;
+    }
+    for (int il = start; il < n_main; ++il) layer_dev[(size_t) il] = 0;   // rounding tail
+
+    // The trailing MTP (nextn) blocks stay on the primary device. Their graphs
+    // are built by the single-backend MTP path, and one hidden-state hop per
+    // drafted token is far cheaper than making that path span devices.
+    for (int il = n_main; il < n_layer; ++il) layer_dev[(size_t) il] = 0;
+
+    fprintf(stderr, "gpu layer split (%d main layers over %zu devices):\n", n_main, gpus.size());
+    for (size_t i = 0; i < gpus.size(); ++i) {
+        int lo = -1, hi = -1, cnt = 0;
+        for (int il = 0; il < n_main; ++il)
+            if (layer_dev[(size_t) il] == (int) i) { if (lo < 0) lo = il; hi = il; ++cnt; }
+        const int devidx = i < cfg.gpus.size() ? cfg.gpus[i].device : (int) i;
+        if (cnt == 0)
+            fprintf(stderr, "  GPU%d: no layers (expert pool only, %zu MB budget)\n",
+                    devidx, dev_budget[i] >> 20);
+        else
+            fprintf(stderr, "  GPU%d: layers %d-%d (%d, %.0f%%), %zu MB budget\n",
+                    devidx, lo, hi, cnt, 100.0 * cnt / n_main, dev_budget[i] >> 20);
+    }
+}
+
 // Allocate the VRAM slot pools and the persistent per-layer carry tensors.
 void Runtime::Impl::init_cache() {
     const auto & hp = model.hparams();
@@ -547,19 +831,53 @@ void Runtime::Impl::init_cache() {
     // On Windows the driver then silently spills allocations to shared system
     // memory (paged over PCIe), uniformly slowing prefill and decode; sizing
     // the pool against the real KV bytes keeps everything VRAM-resident.
-    const size_t budget   = cfg.vram_budget_mb * 1024ull * 1024ull;
-    size_t gpu_w = 0;
-    for (auto b : weights_bufs) gpu_w += ggml_backend_buffer_get_size(b);
-    const size_t kv_bytes = st_buf ? ggml_backend_buffer_get_size(st_buf) : 0;
-    const size_t compute  = 1024ull * 1024ull * 1024ull;   // gallocr graph buffers
-    const size_t reserve  = gpu_w + kv_bytes + compute;
-    size_t avail = budget > reserve ? budget - reserve : 0;
-    fprintf(stderr, "VRAM budget %zu MB = weights %zu + KV %zu + compute %zu + expert pool %zu MB\n",
-            cfg.vram_budget_mb, gpu_w >> 20, kv_bytes >> 20, compute >> 20, avail >> 20);
+    const size_t compute = 1024ull * 1024ull * 1024ull;   // gallocr graph buffers
 
     // Only the main stack's experts are offloaded; the trailing MTP (nextn) block
     // stays fully VRAM-resident, so the cache covers n_main() layers (not n_layer).
-    ecache = std::make_unique<ExpertCache>(backend, model, hp.n_main(), hp.n_expert, n_used, avail, ssd_mode);
+    const int n_main = (int) hp.n_main();
+
+    if (!multi_gpu()) {
+        const size_t budget = cfg.vram_budget_mb * 1024ull * 1024ull;
+        size_t gpu_w = 0;
+        for (auto b : weights_bufs) gpu_w += ggml_backend_buffer_get_size(b);
+        size_t kv_bytes = 0;
+        for (auto b : st_bufs) if (b) kv_bytes += ggml_backend_buffer_get_size(b);
+        const size_t reserve = gpu_w + kv_bytes + compute;
+        const size_t avail   = budget > reserve ? budget - reserve : 0;
+        fprintf(stderr, "VRAM budget %zu MB = weights %zu + KV %zu + compute %zu + expert pool %zu MB\n",
+                cfg.vram_budget_mb, gpu_w >> 20, kv_bytes >> 20, compute >> 20, avail >> 20);
+        ecaches.push_back(std::make_unique<ExpertCache>(
+            backend, model, n_main, hp.n_expert, n_used, avail, ssd_mode));
+    } else {
+        // One cache per device, each sized against that device's own budget and
+        // covering only the layers that device computes. A device with no layers
+        // builds no cache at all -- its budget is surplus that nothing claims yet.
+        for (size_t d = 0; d < gpus.size(); ++d) {
+            std::vector<bool> mask((size_t) n_main, false);
+            int n_owned = 0;
+            for (int il = 0; il < n_main; ++il)
+                if ((size_t) dev_of(il) == d) { mask[(size_t) il] = true; ++n_owned; }
+
+            const size_t gpu_w    = d < dev_weight_bytes.size() ? dev_weight_bytes[d] : 0;
+            const size_t kv_bytes = d < dev_kv_bytes.size()     ? dev_kv_bytes[d]     : 0;
+            const size_t budget   = dev_budget[d];
+            // A device that computes nothing still needs a graph buffer only for
+            // the splits sched routes to it, but reserving the full compute
+            // headroom on every device is the safe side of the estimate.
+            const size_t reserve = gpu_w + kv_bytes + compute;
+            const size_t avail   = budget > reserve ? budget - reserve : 0;
+            const int devidx = d < cfg.gpus.size() ? cfg.gpus[d].device : (int) d;
+            fprintf(stderr, "GPU%d budget %zu MB = weights %zu + KV %zu + compute %zu"
+                            " + expert pool %zu MB (%d layers)\n",
+                    devidx, budget >> 20, gpu_w >> 20, kv_bytes >> 20, compute >> 20,
+                    avail >> 20, n_owned);
+            if (n_owned == 0) { ecaches.push_back(nullptr); continue; }
+            ecaches.push_back(std::make_unique<ExpertCache>(
+                gpus[d], model, n_main, hp.n_expert, n_used, avail, ssd_mode, &mask));
+        }
+    }
+    ecache = ecaches[0].get();
 
     // persistent carry tensors (bridge per-layer graph segments) + fast-path
     // in-graph remap table (g2s_all) and selection readback (sel_all).
@@ -609,14 +927,37 @@ void Runtime::Impl::init_cache() {
     if (getenv("QWEN_FASTCACHE")) cache_fast_enabled = true;   // experimental single-graph path
     if (getenv("QWEN_RESIDENT_DECODE")) { cache_fast_enabled = true; resident_decode = true; }
 
+    // The per-layer cached decode builds one graph per layer segment. Under a
+    // split the scheduler cannot see past a single segment, so every layer on a
+    // secondary device costs a round trip for the carry tensors (which all live
+    // on the primary) plus a device sync -- measured at ~100x slower, not a few
+    // percent. The fused path builds one graph per token, which sched splits
+    // into one contiguous range per device with a single boundary copy.
+    if (multi_gpu() && !cache_fast_enabled)
+        fprintf(stderr,
+                "warning: multi-GPU decode without the fused graph is extremely slow "
+                "(per-layer cross-device copies). Pass --resident-decode.\n");
+
     init_state_backup();   // GDN rollback buffers (speculative miss / MTP reject)
 
-    // warm restart: pre-fill VRAM slots from a saved hot-expert profile
+    // warm restart: pre-fill VRAM slots from a saved hot-expert profile. Under a
+    // split each device reads its own ".gpu<N>" file, falling back to a
+    // single-GPU profile (load_prefetch keeps only the layers this device owns),
+    // so a profile recorded before the split still warms both devices.
     if (!cfg.cache_profile.empty()) {
-        size_t n = ecache->load_prefetch(cfg.cache_profile);
-        if (n > 0)
-            fprintf(stderr, "expert cache: prefetched %zu experts from profile '%s'\n",
-                    n, cfg.cache_profile.c_str());
+        for (size_t d = 0; d < ecaches.size(); ++d) {
+            if (!ecaches[d]) continue;
+            std::string path = multi_gpu() ? cfg.cache_profile + ".gpu" + std::to_string(d)
+                                           : cfg.cache_profile;
+            size_t n = ecaches[d]->load_prefetch(path);
+            if (n == 0 && multi_gpu()) {
+                path = cfg.cache_profile;
+                n = ecaches[d]->load_prefetch(path);
+            }
+            if (n > 0)
+                fprintf(stderr, "expert cache: prefetched %zu experts from profile '%s'\n",
+                        n, path.c_str());
+        }
     }
 }
 
@@ -931,10 +1272,10 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
         ggml_tensor * slot_d = remap(ExpertCache::DOWN);
 
         ggml_tensor * x3   = ggml_reshape_3d(ctx, x, n_embd, 1, 1);
-        ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3,  slot_u);
-        ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3,  slot_g);
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, ec_of(il)->up(il),   x3,  slot_u);
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, ec_of(il)->gate(il), x3,  slot_g);
         ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
-        ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, slot_d);
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, ec_of(il)->down(il), act, slot_d);
         ggml_tensor * et = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, experts, n_embd, n_used)));
         ggml_tensor * w  = ggml_reshape_2d(ctx, weights, n_used, 1);
         moe_out = ggml_mul_mat(ctx, et, w);   // [n_embd, 1]
@@ -1237,7 +1578,7 @@ const std::vector<float> & Runtime::Impl::mtp_draft(int32_t token) {
     ggml_tensor * logits_t = build_mtp(ctx, gf, h_in, t_in, p_in, m_in, n_kv);
     n_past = saved;
 
-    if (!ggml_gallocr_alloc_graph(mtp_galloc, gf))
+    if (!alloc_graph(mtp_galloc, gf))
         throw std::runtime_error("mtp_draft: gallocr alloc failed");
 
     ggml_backend_tensor_set(h_in, mtp_hidden.data(), 0, n_embd * sizeof(float));
@@ -1246,7 +1587,7 @@ const std::vector<float> & Runtime::Impl::mtp_draft(int32_t token) {
     std::vector<ggml_fp16_t> mask(n_kv, ggml_fp32_to_fp16(0.0f));   // all past positions visible
     ggml_backend_tensor_set(m_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
 
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+    if (compute_graph(gf) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("mtp_draft: compute failed");
 
     const int n_vocab = (int) logits_t->ne[0];
@@ -1306,7 +1647,7 @@ int32_t Runtime::Impl::mtp_draft_fast(int32_t token, bool need_hidden) {
         ggml_build_forward_expand(m_gf, am);
 
         if (!m_galloc) m_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        if (!ggml_gallocr_alloc_graph(m_galloc, m_gf))
+        if (!alloc_graph(m_galloc, m_gf))
             throw std::runtime_error("mtp_draft_fast: gallocr alloc failed");
     }
 
@@ -1393,7 +1734,7 @@ void Runtime::Impl::mtp_resync(int32_t token) {
         persistent   = false;
 
         if (!r_galloc) r_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        if (!ggml_gallocr_alloc_graph(r_galloc, r_gf))
+        if (!alloc_graph(r_galloc, r_gf))
             throw std::runtime_error("mtp_resync: gallocr alloc failed");
     }
 
@@ -1444,7 +1785,7 @@ void Runtime::Impl::mtp_prefill_batch(const int32_t * toks, const float * hidden
     n_past = saved;
 
     ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_alloc_graph(ga, gf)) {
+    if (!alloc_graph(ga, gf)) {
         ggml_gallocr_free(ga);
         ggml_free(ctx);
         throw std::runtime_error("mtp_prefill_batch: gallocr alloc failed");
@@ -1468,7 +1809,7 @@ void Runtime::Impl::mtp_prefill_batch(const int32_t * toks, const float * hidden
         if (ov) ggml_backend_tensor_set(ov, ovr[k].data, 0, ggml_nbytes(ov));
     }
 
-    const ggml_status st = ggml_backend_graph_compute(backend, gf);
+    const ggml_status st = compute_graph(gf);
     ggml_gallocr_free(ga);
     ggml_free(ctx);
     if (st != GGML_STATUS_SUCCESS)
@@ -1483,7 +1824,7 @@ void Runtime::Impl::decode_verify_cached(const std::vector<int32_t> & toks) {
     const int T = (int) toks.size();
     const int n_used = model.hparams().n_expert_used;
     const bool gdn = model.hparams().has_gdn;
-    if (ecache->min_slots() >= T * n_used) {
+    if (ec_min_slots() >= T * n_used) {
         // batched path: fills vH and vA (GPU argmax, no logits readback).
         // GDN states are checkpointed per verify token so a partial accept can
         // restore an intermediate state instead of re-decoding (same as the
@@ -1541,7 +1882,7 @@ void Runtime::Impl::decode_verify(const std::vector<int32_t> & toks) {
         ggml_set_name(am, "verify_argmax"); ggml_set_output(am);
         ggml_build_forward_expand(v_gf, am);
         if (!v_galloc) v_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        if (!ggml_gallocr_alloc_graph(v_galloc, v_gf))
+        if (!alloc_graph(v_galloc, v_gf))
             throw std::runtime_error("decode_verify: gallocr alloc failed");
     }
 
@@ -1564,7 +1905,7 @@ void Runtime::Impl::decode_verify(const std::vector<int32_t> & toks) {
     }
     ggml_backend_tensor_set(inp_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
 
-    if (ggml_backend_graph_compute(backend, v_gf) != GGML_STATUS_SUCCESS)
+    if (compute_graph(v_gf) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("decode_verify: compute failed");
 
     ggml_tensor * h  = ggml_graph_get_tensor(v_gf, "main_hidden");
@@ -1803,7 +2144,7 @@ const std::vector<float> & Runtime::Impl::decode_reuse(int32_t token) {
         dgf = build_graph(dctx, /*n_tokens=*/1, /*n_kv=*/d_nkv);
         persistent = false;
         dgalloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        if (!ggml_gallocr_alloc_graph(dgalloc, dgf))
+        if (!alloc_graph(dgalloc, dgf))
             throw std::runtime_error("persistent gallocr alloc failed");
     }
     auto pt_build = pnow();
@@ -1826,7 +2167,7 @@ const std::vector<float> & Runtime::Impl::decode_reuse(int32_t token) {
     ggml_backend_tensor_set(inp_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     auto pt_input = pnow();
 
-    if (ggml_backend_graph_compute(backend, dgf) != GGML_STATUS_SUCCESS)
+    if (compute_graph(dgf) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("persistent graph compute failed");
     auto pt_compute = pnow();
 
@@ -1881,10 +2222,10 @@ ggml_tensor * Runtime::Impl::build_moe_cached(ggml_context * ctx, ggml_cgraph * 
     const int n_used = hp.n_expert_used;
 
     ggml_tensor * x3   = ggml_reshape_3d(ctx, ffn_in, n_embd, 1, 1);
-    ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3,  slot_u);
-    ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3,  slot_g);
+    ggml_tensor * up   = ggml_mul_mat_id(ctx, ec_of(il)->up(il),   x3,  slot_u);
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, ec_of(il)->gate(il), x3,  slot_g);
     ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);              // [ff_exp,n_used,1]
-    ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, slot_d); // [n_embd,n_used,1]
+    ggml_tensor * experts = ggml_mul_mat_id(ctx, ec_of(il)->down(il), act, slot_d); // [n_embd,n_used,1]
 
     // weighted sum of the n_used experts as one GEMV
     ggml_tensor * et = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, experts, n_embd, n_used))); // [n_used,n_embd]
@@ -1952,7 +2293,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         return ggml_init(gp);
     };
     auto run = [&](ggml_context * ctx, ggml_cgraph * gf) {
-        if (!ggml_gallocr_alloc_graph(cache_galloc, gf))
+        if (!alloc_graph(cache_galloc, gf))
             throw std::runtime_error("decode_cached_batch: gallocr alloc failed");
     };
 
@@ -1966,7 +2307,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_build_forward_expand(gf, ggml_cpy(ctx, emb, h_b));
         run(ctx, gf);
         ggml_backend_tensor_set(inp, toks, 0, T * sizeof(int32_t));
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+        if (compute_graph(gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("decode_cached_batch: embed compute failed");
         ggml_free(ctx);
     }
@@ -2082,10 +2423,10 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         };
         ggml_tensor * ffn_l = tslice(carry_ffn[il & 1]);
         ggml_tensor * x3   = ggml_reshape_3d(ctx, ffn_l, n_embd, 1, len);
-        ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3, tslice(slot_u_b));
-        ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3, tslice(slot_g_b));
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, ec_of(il)->up(il),   x3, tslice(slot_u_b));
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, ec_of(il)->gate(il), x3, tslice(slot_g_b));
         ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
-        ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, tslice(slot_d_b)); // [n_embd, n_used, len]
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, ec_of(il)->down(il), act, tslice(slot_d_b)); // [n_embd, n_used, len]
         experts = ggml_mul(ctx, experts, ggml_reshape_3d(ctx, tslice(carry_wgt[il & 1]), 1, n_used, len));
         ggml_tensor * moe_out = nullptr;
         for (int i = 0; i < n_used; ++i) {
@@ -2141,10 +2482,13 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     // plan_slices() below flips quota enforcement per layer; restore whatever
     // the caller had on the way out so a batch cannot leave the mode changed.
     struct QuotaScope {
-        ExpertCache * c; bool prev;
-        explicit QuotaScope(ExpertCache * cc) : c(cc), prev(cc->quotas_active()) {}
-        ~QuotaScope() { c->set_quotas(prev); }
-    } quota_scope(ecache.get());
+        std::vector<ExpertCache *> cs;
+        std::vector<char>          prev;
+        explicit QuotaScope(std::vector<ExpertCache *> v) : cs(std::move(v)) {
+            for (auto * c : cs) prev.push_back((char) c->quotas_active());
+        }
+        ~QuotaScope() { for (size_t i = 0; i < cs.size(); ++i) cs[i]->set_quotas(prev[i] != 0); }
+    } quota_scope(all_ecaches());
 
     static const bool pf_stats = getenv("QWEN_PREFILL_STATS") != nullptr;
     static int      pf_chunk_id = 0;
@@ -2186,12 +2530,12 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         // A batch that does fit (MTP verify, T=2) keeps its quota, so it cannot
         // evict the decode palette. Deciding here rather than at the call site
         // makes prefill and verify come out right without either knowing.
-        ecache->set_quotas(plan_union <= ecache->quota_of(il) - 8);
+        ec_of(il)->set_quotas(plan_union <= ec_of(il)->quota_of(il) - 8);
 
         // Pass 2: cut the chunk so no single ensure() references more distinct
         // experts than the capacity now in force (it would evict its own slots).
         slices.clear();
-        const int cap = std::max(n_used, ecache->capacity(il) - 8);
+        const int cap = std::max(n_used, ec_of(il)->capacity(il) - 8);
         std::fill(seen.begin(), seen.end(), 0);
         int distinct = 0, t0 = 0;
         for (int t = 0; t < T; ++t) {
@@ -2218,7 +2562,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     // Make the slice's selected experts resident and upload its slot-id rows.
     auto ensure_slice = [&](int il, int t0, int len) {
         const size_t off = (size_t) t0 * n_used;
-        ecache->ensure(il, sel.data() + off, n_used * len,
+        ec_of(il)->ensure(il, sel.data() + off, n_used * len,
                        sg.data() + off, su.data() + off, sd.data() + off);
         const size_t ob = off * sizeof(int32_t), nb = (size_t) n_used * len * sizeof(int32_t);
         ggml_backend_tensor_set(slot_g_b, sg.data() + off, ob, nb);
@@ -2230,7 +2574,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
 
     auto log_layer = [&](int il, int nsl, const ExpertCache::Stats & s0) {
         if (!pf_stats) return;
-        const auto s1 = ecache->stats();
+        const auto s1 = ec_stats_sum();
         fprintf(stderr, "prefill-stats: chunk=%d T=%d layer=%d union=%d/%d slices=%d miss=%llu fetch_mb=%.1f fetch_ms=%.1f\n",
                 pf_chunk, T, il, plan_union, n_exp, nsl,
                 (unsigned long long) (s1.misses - s0.misses),
@@ -2271,9 +2615,9 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         for (int e = 0; e < n_exp; ++e) {
             if (mass[e] <= 0.0) continue;
             total += mass[e];
-            const bool res = ecache->resident(ExpertCache::GATE, il, e) &&
-                             ecache->resident(ExpertCache::UP,   il, e) &&
-                             ecache->resident(ExpertCache::DOWN, il, e);
+            const bool res = ec_of(il)->resident(ExpertCache::GATE, il, e) &&
+                             ec_of(il)->resident(ExpertCache::UP,   il, e) &&
+                             ec_of(il)->resident(ExpertCache::DOWN, il, e);
             if (!res) cands.push_back({ e, mass[e] });
         }
         std::sort(cands.begin(), cands.end(),
@@ -2346,7 +2690,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                 ggml_tensor * selected = build_segA(ctx, gf, il, tc0, tlen);
                 run(ctx, gf);
                 set_attn_inputs(gf, tc0, tlen);
-                if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+                if (compute_graph(gf) != GGML_STATUS_SUCCESS)
                     throw std::runtime_error("decode_cached_batch: seg A compute failed");
                 ggml_backend_tensor_get(selected, sel.data() + (size_t) tc0 * n_used, 0,
                                         (size_t) n_used * tlen * sizeof(int32_t));
@@ -2354,17 +2698,17 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             }
             prune_layer(il);
             plan_slices(il);
-            const auto s0 = ecache->stats();
+            const auto s0 = ec_stats_sum();
             const int nsl = (int) slices.size();
             // Prefetch the layer's whole union with one ensure() when it fits
             // the pool: the per-slice ensures below then only hit, so the SSD
             // sweep happens once per layer as one dense coalesced read instead
             // of sparse per-slice residual fetches (which re-read the tensor).
-            if (nsl > 1 && plan_union <= ecache->capacity(il) - 8) {
+            if (nsl > 1 && plan_union <= ec_of(il)->capacity(il) - 8) {
                 pre_g.resize(plan_list.size());
                 pre_u.resize(plan_list.size());
                 pre_d.resize(plan_list.size());
-                ecache->ensure(il, plan_list.data(), (int) plan_list.size(),
+                ec_of(il)->ensure(il, plan_list.data(), (int) plan_list.size(),
                                pre_g.data(), pre_u.data(), pre_d.data());
             }
             for (int k = 0; k < nsl; ++k) {
@@ -2374,7 +2718,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                 ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
                 build_segB(ctx, gf, il, st0, slen);
                 run(ctx, gf);
-                if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+                if (compute_graph(gf) != GGML_STATUS_SUCCESS)
                     throw std::runtime_error("decode_cached_batch: seg B compute failed");
                 ggml_free(ctx);
             }
@@ -2390,14 +2734,14 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_tensor * selected = build_segA(ctx, gf, 0, 0, T);
         run(ctx, gf);
         set_attn_inputs(gf, 0, T);
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+        if (compute_graph(gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("decode_cached_batch: seg A0 compute failed");
         ggml_backend_tensor_get(selected, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
         ggml_free(ctx);
     }
     for (int il = 0; il < N; ++il) {
         plan_slices(il);
-        const auto s0 = ecache->stats();
+        const auto s0 = ec_stats_sum();
         const int nsl = (int) slices.size();
         for (int k = 0; k < nsl; ++k) {
             const auto [st0, slen] = slices[k];
@@ -2408,7 +2752,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             ggml_tensor * nsel = (k == nsl - 1 && il + 1 < N) ? build_segA(ctx, gf, il + 1, 0, T) : nullptr;
             run(ctx, gf);
             set_attn_inputs(gf, 0, T);
-            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+            if (compute_graph(gf) != GGML_STATUS_SUCCESS)
                 throw std::runtime_error("decode_cached_batch: fused segB/segA compute failed");
             if (nsel)
                 ggml_backend_tensor_get(nsel, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
@@ -2448,7 +2792,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_set_name(cur, "logits");
         ggml_build_forward_expand(gf, cur);
         run(ctx, gf);
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+        if (compute_graph(gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("decode_cached_batch: output compute failed");
         const int n_vocab = (int) cur->ne[0];
         logits.resize(n_vocab);
@@ -2476,7 +2820,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_set_name(am, "verify_argmax");
         ggml_build_forward_expand(gf, am);
         run(ctx, gf);
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+        if (compute_graph(gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("decode_cached_batch: verify output compute failed");
         vA.assign(T, 0);
         ggml_backend_tensor_get(am, vA.data(), 0, T * sizeof(int32_t));
@@ -2517,14 +2861,14 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         return ggml_init(gp);
     };
     auto run = [&](ggml_context * ctx, ggml_cgraph * gf) {
-        if (!ggml_gallocr_alloc_graph(cache_galloc, gf))
+        if (!alloc_graph(cache_galloc, gf))
             throw std::runtime_error("decode_cached: gallocr alloc failed");
     };
     const bool prof_dc = getenv("QWEN_PROF_DC") != nullptr;
     auto wall0 = std::chrono::steady_clock::now();
     auto compute = [&](ggml_cgraph * gf, const char * msg) {
         auto t = std::chrono::steady_clock::now();
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+        if (compute_graph(gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error(std::string("decode_cached: ") + msg);
         if (prof_dc) dc_gpu_ms += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t).count();
@@ -2637,7 +2981,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     // Read back layer `il`'s router selection and make those experts resident.
     auto ensure_layer = [&](ggml_tensor * selected, int il) {
         ggml_backend_tensor_get(selected, sel.data(), 0, n_used * sizeof(int32_t));
-        ecache->ensure(il, sel.data(), n_used, slot_g.data(), slot_u.data(), slot_d.data());
+        ec_of(il)->ensure(il, sel.data(), n_used, slot_g.data(), slot_u.data(), slot_d.data());
         ggml_backend_tensor_set(p_slot_g, slot_g.data(), 0, n_used * sizeof(int32_t));
         ggml_backend_tensor_set(p_slot_u, slot_u.data(), 0, n_used * sizeof(int32_t));
         ggml_backend_tensor_set(p_slot_d, slot_d.data(), 0, n_used * sizeof(int32_t));
@@ -2898,8 +3242,23 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
         f_gf = build_graph(f_ctx, /*n_tokens=*/1, /*n_kv=*/f_nkv);
         cache_fast_build = false;
         persistent = false;
-        if (!ggml_gallocr_alloc_graph(f_galloc, f_gf))
+        // This graph is allocated ONCE and reused every token -- that is what
+        // makes it CUDA-graph friendly. With one GPU a gallocr owns its own
+        // buffer and nothing disturbs it. Across devices it needs a scheduler,
+        // but it must NOT be the shared one: any other graph going through that
+        // sched (the fallback decode_cached after a speculative miss, or a
+        // prefill batch) calls ggml_backend_sched_reset and invalidates this
+        // allocation, so the next compute runs on reused memory. Re-allocating
+        // per token is not an alternative -- it changes the tensor addresses the
+        // input uploads below already captured. Hence a dedicated scheduler.
+        if (multi_gpu()) {
+            if (!f_sched) f_sched = make_sched();
+            ggml_backend_sched_reset(f_sched);
+            if (!ggml_backend_sched_alloc_graph(f_sched, f_gf))
+                throw std::runtime_error("decode_cached_fast: sched alloc failed");
+        } else if (!ggml_gallocr_alloc_graph(f_galloc, f_gf)) {
             throw std::runtime_error("decode_cached_fast: gallocr alloc failed");
+        }
     }
 
     // graph inputs
@@ -2921,7 +3280,7 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     auto fill_g2s = [&]() {
         for (int il = 0; il < n_layer; ++il)
             for (int r = 0; r < 3; ++r) {
-                const int32_t * row = ecache->slot_of_row((ExpertCache::Role) r, il);
+                const int32_t * row = ec_of(il)->slot_of_row((ExpertCache::Role) r, il);
                 memcpy(&g2s_host[(size_t) (il * 3 + r) * n_exp], row, n_exp * sizeof(int32_t));
             }
         ggml_backend_tensor_set(g2s_all, g2s_host.data(), 0, g2s_host.size() * sizeof(int32_t));
@@ -2947,9 +3306,9 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
             float * row = &resmask_host[(size_t) il * n_exp];
             int n_res = 0;
             for (int e = 0; e < n_exp; ++e) {
-                const bool res = ecache->resident(ExpertCache::GATE, il, e) &&
-                                 ecache->resident(ExpertCache::UP,   il, e) &&
-                                 ecache->resident(ExpertCache::DOWN, il, e);
+                const bool res = ec_of(il)->resident(ExpertCache::GATE, il, e) &&
+                                 ec_of(il)->resident(ExpertCache::UP,   il, e) &&
+                                 ec_of(il)->resident(ExpertCache::DOWN, il, e);
                 row[e] = res ? 0.0f : -INFINITY;
                 n_res += res;
             }
@@ -2969,9 +3328,9 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
         for (int il = 0; il < n_layer; ++il)
             for (int k = 0; k < n_used; ++k) {
                 const int e = sel_host[(size_t) il * n_used + k];
-                if (!ecache->resident(ExpertCache::GATE, il, e) ||
-                    !ecache->resident(ExpertCache::UP,   il, e) ||
-                    !ecache->resident(ExpertCache::DOWN, il, e)) ok = false;
+                if (!ec_of(il)->resident(ExpertCache::GATE, il, e) ||
+                    !ec_of(il)->resident(ExpertCache::UP,   il, e) ||
+                    !ec_of(il)->resident(ExpertCache::DOWN, il, e)) ok = false;
             }
         return ok;
     };
@@ -2981,7 +3340,7 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     // and skipped while stale-free — steady-state resident decode uploads
     // nothing but token/pos/mask.
     ++fast_warm_tokens;
-    const uint64_t stamp = ecache->stats().misses + ecache->stats().evictions;
+    const uint64_t stamp = ec_stats_sum().misses + ec_stats_sum().evictions;
     if (stamp != fast_remap_stamp || floor_res != fast_last_floor) {
         fast_mask_complete = resident_decode && fill_resmask();
         fill_g2s();
@@ -2994,7 +3353,10 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     const bool masked = resident_decode && fast_mask_complete;
 
     if (!masked) backup_states();   // so a speculative miss can be rolled back
-    if (ggml_backend_graph_compute(backend, f_gf) != GGML_STATUS_SUCCESS)
+    // must run on the graph's own scheduler (see the allocation above)
+    const ggml_status f_st = multi_gpu() ? ggml_backend_sched_graph_compute(f_sched, f_gf)
+                                         : ggml_backend_graph_compute(backend, f_gf);
+    if (f_st != GGML_STATUS_SUCCESS)
         throw std::runtime_error("decode_cached_fast: compute failed");
 
     if (!masked) {
@@ -3009,9 +3371,9 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
         for (int il = 0; il < n_layer; ++il)
             for (int k = 0; k < n_used; ++k) {
                 const int e = sel_host[(size_t) il * n_used + k];
-                ecache->touch(ExpertCache::GATE, il, e);
-                ecache->touch(ExpertCache::UP,   il, e);
-                ecache->touch(ExpertCache::DOWN, il, e);
+                ec_of(il)->touch(ExpertCache::GATE, il, e);
+                ec_of(il)->touch(ExpertCache::UP,   il, e);
+                ec_of(il)->touch(ExpertCache::DOWN, il, e);
             }
     } else {
         // ---- background refill: keep the frozen palette tracking the input ----
@@ -3032,9 +3394,9 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
             for (int il = 0; il < n_layer; ++il)
                 for (int k = 0; k < n_used; ++k) {
                     const int e = sel_host[(size_t) il * n_used + k];
-                    ecache->touch(ExpertCache::GATE, il, e);
-                    ecache->touch(ExpertCache::UP,   il, e);
-                    ecache->touch(ExpertCache::DOWN, il, e);
+                    ec_of(il)->touch(ExpertCache::GATE, il, e);
+                    ec_of(il)->touch(ExpertCache::UP,   il, e);
+                    ec_of(il)->touch(ExpertCache::DOWN, il, e);
                 }
             // Instrumentation: how often the layer's frozen palette failed to
             // hold what the *unmasked* router wanted. This is the quality cost
@@ -3044,10 +3406,10 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
                 for (int il = 0; il < n_layer; ++il)
                     for (int k = 0; k < n_used; ++k) {
                         const int e = want_host[(size_t) il * n_used + k];
-                        const bool res = ecache->resident(ExpertCache::GATE, il, e) &&
-                                         ecache->resident(ExpertCache::UP,   il, e) &&
-                                         ecache->resident(ExpertCache::DOWN, il, e);
-                        ecache->note_want(il, !res);
+                        const bool res = ec_of(il)->resident(ExpertCache::GATE, il, e) &&
+                                         ec_of(il)->resident(ExpertCache::UP,   il, e) &&
+                                         ec_of(il)->resident(ExpertCache::DOWN, il, e);
+                        ec_of(il)->note_want(il, !res);
                     }
             }
             int budget = refill_budget;
@@ -3055,10 +3417,10 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
                 const int il = (refill_cursor + step) % n_layer;
                 for (int k = 0; k < n_used && budget > 0; ++k) {
                     const int e = want_host[(size_t) il * n_used + k];
-                    if (ecache->resident(ExpertCache::GATE, il, e) &&
-                        ecache->resident(ExpertCache::UP,   il, e) &&
-                        ecache->resident(ExpertCache::DOWN, il, e)) continue;
-                    ecache->ensure_resident(il, e);   // async H2D (RAM tier); joins mask next token
+                    if (ec_of(il)->resident(ExpertCache::GATE, il, e) &&
+                        ec_of(il)->resident(ExpertCache::UP,   il, e) &&
+                        ec_of(il)->resident(ExpertCache::DOWN, il, e)) continue;
+                    ec_of(il)->ensure_resident(il, e);   // async H2D (RAM tier); joins mask next token
                     --budget;
                 }
             }
@@ -3137,8 +3499,8 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
             if (progress_cb) progress_cb(i, n_tokens);
         }
         if (getenv("QWEN_LAYER_STATS")) {
-            ecache->dump_layer_stats("prefill");
-            ecache->reset_layer_stats();   // the destructor dump is decode-only
+            for (auto * c : all_ecaches()) c->dump_layer_stats("prefill");
+            for (auto * c : all_ecaches()) c->reset_layer_stats();   // the destructor dump is decode-only
         }
         // How the pool's slots are split across layers. "quota" re-shapes it
         // from the prompt's own routing (the prefill sweep otherwise leaves the
@@ -3163,13 +3525,14 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
         if (alloc_mode == 2 || (alloc_mode == 0 && resident_decode)) {
             const char * c = getenv("QWEN_QUOTA_PREFETCH");
             const long long v = c ? atoll(c) : 0;
-            ecache->rebalance(v > 0 ? (size_t) v : (size_t) -1);
+            // Each device rebalances its own pools over its own layers.
+            for (auto * c : all_ecaches()) c->rebalance(v > 0 ? (size_t) v : (size_t) -1);
             // Forget the prompt's history so the exit dump measures how far the
             // ideal shape drifts once generation takes over.
-            if (getenv("QWEN_LAYER_QUOTA_DRIFT")) ecache->clear_counts();
+            if (getenv("QWEN_LAYER_QUOTA_DRIFT")) for (auto * c : all_ecaches()) c->clear_counts();
             if (getenv("QWEN_LAYER_STATS")) {
-                ecache->dump_layer_stats("rebalanced");
-                ecache->reset_layer_stats();
+                for (auto * c : all_ecaches()) c->dump_layer_stats("rebalanced");
+                for (auto * c : all_ecaches()) c->reset_layer_stats();
             }
         }
         embd_ovr.clear();
@@ -3264,7 +3627,7 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     if (sched) {
         status = ggml_backend_sched_graph_compute(sched, gf);
     } else {
-        status = ggml_backend_graph_compute(backend, gf);
+        status = compute_graph(gf);
     }
     if (status != GGML_STATUS_SUCCESS) {
         ggml_free(ctx);
@@ -3335,7 +3698,7 @@ bool Runtime::has_expert_cache() const { return impl_->ecache != nullptr; }
 Runtime::CacheStats Runtime::cache_stats() const {
     CacheStats c;
     if (impl_->ecache) {
-        const auto & s = impl_->ecache->stats();
+        const auto & s = impl_->ec_stats_sum();
         c.hits = s.hits; c.misses = s.misses; c.fetch_ms = s.fetch_ms; c.fetch_bytes = s.fetch_bytes;
     }
     return c;
@@ -3473,6 +3836,110 @@ size_t parse_vram_budget_mb(const std::string & arg, bool * legacy_mb) {
         return 0;   // unknown suffix: caller reports it as a bad value
     }
     return (size_t) (mb + 0.5);
+}
+
+// Split "a,b,c" into its fields, trimming surrounding blanks. An empty field is
+// kept so the caller's per-field parser can reject it.
+static std::vector<std::string> split_csv(const std::string & arg) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : arg) {
+        if (c == ',') { out.push_back(cur); cur.clear(); }
+        else          { cur += c; }
+    }
+    out.push_back(cur);
+    for (auto & s : out) {
+        size_t b = s.find_first_not_of(" \t");
+        size_t e = s.find_last_not_of(" \t");
+        s = (b == std::string::npos) ? std::string() : s.substr(b, e - b + 1);
+    }
+    return out;
+}
+
+bool parse_vram_budget_list(const std::string & arg, std::vector<size_t> & out, bool * legacy_mb) {
+    if (legacy_mb) *legacy_mb = false;
+    std::vector<size_t> v;
+    for (const auto & f : split_csv(arg)) {
+        bool legacy = false;
+        const size_t mb = parse_vram_budget_mb(f, &legacy);
+        if (mb == 0) return false;
+        if (legacy && legacy_mb) *legacy_mb = true;
+        v.push_back(mb);
+    }
+    out.swap(v);
+    return true;
+}
+
+bool parse_gpu_list(const std::string & arg, std::vector<int> & out) {
+    std::vector<int> v;
+    for (const auto & f : split_csv(arg)) {
+        if (f.empty()) return false;
+        char * end = nullptr;
+        const long d = strtol(f.c_str(), &end, 10);
+        if (end == f.c_str() || *end || d < 0) return false;
+        for (int prev : v) if (prev == (int) d) return false;   // a device twice is a typo
+        v.push_back((int) d);
+    }
+    out.swap(v);
+    return true;
+}
+
+bool parse_gpu_split(const std::string & arg, std::vector<float> & out) {
+    std::vector<float> v;
+    double sum = 0.0;
+    for (const auto & f : split_csv(arg)) {
+        if (f.empty()) return false;
+        char * end = nullptr;
+        const double d = strtod(f.c_str(), &end);
+        if (end == f.c_str() || *end || d < 0.0) return false;
+        sum += d;
+        v.push_back((float) d);
+    }
+    if (sum <= 0.0) return false;   // every device an expert pool leaves nothing to compute on
+    out.swap(v);
+    return true;
+}
+
+bool build_gpu_plan(const std::vector<int> & gpu_ids,
+                    const std::vector<float> & gpu_split,
+                    const std::vector<size_t> & vram_mb,
+                    std::vector<GpuPlan> & out)
+{
+    size_t n = std::max(gpu_ids.size(), std::max(gpu_split.size(), vram_mb.size()));
+    // Nothing multi-GPU was asked for: keep the legacy path (empty plan).
+    if (n <= 1 && gpu_ids.empty() && gpu_split.empty()) { out.clear(); return true; }
+    if (n == 0) { out.clear(); return true; }
+
+    // A single budget cannot be shared across GPUs -- each device has its own
+    // VRAM, so splitting one number between them would be a guess. Likewise a
+    // split must name every device, or the unnamed ones silently get nothing.
+    if (!vram_mb.empty() && vram_mb.size() != n) {
+        fprintf(stderr, "error: --vram-budget has %zu value(s) but the plan has %zu GPU(s); "
+                        "give one budget per GPU (e.g. --vram-budget 13.5,5)\n",
+                vram_mb.size(), n);
+        return false;
+    }
+    if (!gpu_split.empty() && gpu_split.size() != n) {
+        fprintf(stderr, "error: --gpu-split has %zu value(s) but the plan has %zu GPU(s); "
+                        "give one share per GPU (e.g. --gpu-split 0.8,0)\n",
+                gpu_split.size(), n);
+        return false;
+    }
+    if (!gpu_ids.empty() && gpu_ids.size() != n) {
+        fprintf(stderr, "error: --gpus has %zu value(s) but the plan has %zu GPU(s)\n",
+                gpu_ids.size(), n);
+        return false;
+    }
+
+    out.clear();
+    for (size_t i = 0; i < n; ++i) {
+        GpuPlan p;
+        p.device    = gpu_ids.empty()   ? (int) i : gpu_ids[i];
+        p.budget_mb = vram_mb.empty()   ? 0       : vram_mb[i];
+        p.split     = gpu_split.empty() ? -1.0f   : gpu_split[i];
+        out.push_back(p);
+    }
+    return true;
 }
 
 } // namespace questwend

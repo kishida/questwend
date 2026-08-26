@@ -105,6 +105,12 @@ static void usage(const char * prog) {
     printf("  --seed <N>     RNG seed (0 = random)\n");
     printf("  --vram-budget <GB>  offload expert weights to CPU; keep non-expert on GPU\n");
     printf("                      GB, fractions ok (13.5); suffix M/G to be explicit (13500M)\n");
+    printf("                      one value per GPU with --gpus (e.g. 13.5,5)\n");
+    printf("  --gpus <list>       GPU device indices to use, primary first (e.g. 1 or 1,0)\n");
+    printf("  --gpu-split <list>  each GPU's share of the compute layers (e.g. 0.8,0.2).\n");
+    printf("                      A GPU given 0 holds no layers, so its whole budget\n");
+    printf("                      becomes expert pool for the others; default splits\n");
+    printf("                      layers in proportion to the per-GPU --vram-budget.\n");
     printf("  --cache-profile <f> persist/prefetch hot-expert profile (warm restarts)\n");
     printf("  --experts-ssd  stream experts from the GGUF on SSD (no RAM copy)\n");
     printf("  --cpu          force CPU backend\n");
@@ -131,7 +137,10 @@ int main(int argc, char ** argv) {
     std::string model_path, prompt, cache_profile, mmproj_path;
     std::vector<std::string> image_paths;
     int  max_tokens = 128, n_ctx = 0, n_draft = 1;   // n_ctx 0 = model's trained length
-    size_t vram_budget_mb = 0;
+    size_t vram_budget_mb = 0;          // total across GPUs (gates expert offload)
+    std::vector<size_t> vram_list;      // --vram-budget, one entry per GPU
+    std::vector<int>    gpu_ids;        // --gpus
+    std::vector<float>  gpu_split;      // --gpu-split
     bool interactive = false, info_only = false, chat = false, log_speed = false, force_cpu = false;
     bool experts_ssd = false, reasoning = true, use_mtp = false, embd_q8 = false, vision_test = false;
     SamplerConfig sc;
@@ -152,14 +161,29 @@ int main(int argc, char ** argv) {
         else if (a == "--seed" && i + 1 < argc)  sc.seed = (uint32_t) std::stoul(next());
         else if (a == "--repeat-penalty" && i + 1 < argc) sc.repeat_penalty = std::stof(next());
         else if (a == "--repeat-last-n" && i + 1 < argc)  sc.repeat_last_n = std::stoi(next());
+        else if (a == "--gpus" && i + 1 < argc) {
+            const std::string v = next();
+            if (!parse_gpu_list(v, gpu_ids)) {
+                fprintf(stderr, "error: bad --gpus value: %s (expected e.g. 0 or 1,0 -- distinct device indices, primary first)\n", v.c_str());
+                return 1;
+            }
+        }
+        else if (a == "--gpu-split" && i + 1 < argc) {
+            const std::string v = next();
+            if (!parse_gpu_split(v, gpu_split)) {
+                fprintf(stderr, "error: bad --gpu-split value: %s (expected e.g. 0.8,0.2 -- non-negative, not all zero)\n", v.c_str());
+                return 1;
+            }
+        }
         else if (a == "--vram-budget" && i + 1 < argc) {
             const std::string v = next();
             bool legacy = false;
-            vram_budget_mb = parse_vram_budget_mb(v, &legacy);
-            if (vram_budget_mb == 0) {
-                fprintf(stderr, "error: bad --vram-budget value: %s (expected e.g. 14, 13.5, 14G, 13500M)\n", v.c_str());
+            if (!parse_vram_budget_list(v, vram_list, &legacy)) {
+                fprintf(stderr, "error: bad --vram-budget value: %s (expected e.g. 14, 13.5, 14G, 13500M, or one per GPU: 13.5,5)\n", v.c_str());
                 return 1;
             }
+            vram_budget_mb = 0;
+            for (size_t k = 0; k < vram_list.size(); ++k) vram_budget_mb += vram_list[k];
             if (legacy)
                 fprintf(stderr, "note: --vram-budget %s read as %zu MB (%.1f GB); the unit is now GB, "
                                 "write %.1f or %sM to be explicit\n",
@@ -302,10 +326,14 @@ int main(int argc, char ** argv) {
             }
             chat = true;   // images imply chat formatting
             if (vram_budget_mb > 0) {
+                // The tower is built on the primary device, so its VRAM comes
+                // out of the primary's budget, not the multi-GPU total.
                 const size_t vmb = (venc->gpu_bytes() + 1024 * 1024 - 1) / (1024 * 1024);
-                const size_t cut = std::min(vram_budget_mb, vmb);
+                size_t & primary = vram_list.empty() ? vram_budget_mb : vram_list[0];
+                const size_t cut = std::min(primary, vmb);
                 fprintf(stderr, "vision tower: %zu MB GPU; expert cache budget %zu -> %zu MB\n",
-                        vmb, vram_budget_mb, vram_budget_mb - cut);
+                        vmb, primary, primary - cut);
+                primary        -= cut;
                 vram_budget_mb -= cut;
             }
         }
@@ -314,6 +342,7 @@ int main(int argc, char ** argv) {
         cfg.n_ctx          = n_ctx;
         cfg.use_cuda       = !force_cpu;
         cfg.vram_budget_mb = vram_budget_mb;
+        if (!build_gpu_plan(gpu_ids, gpu_split, vram_list, cfg.gpus)) return 1;
         cfg.cache_profile  = cache_profile;
         cfg.experts_ssd    = experts_ssd;
         // MTP needs the nextn block kept VRAM-resident (also the dev MTP test mode).

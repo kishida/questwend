@@ -91,8 +91,10 @@ static ggml_tensor * role_tensor(Model & m, ExpertCache::Role r, int layer) {
 
 ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
                          int n_layer, int n_expert, int n_used, size_t vram_avail_bytes,
-                         bool ssd)
+                         bool ssd, const std::vector<bool> * layer_mask)
     : model_(model), ssd_(ssd), n_layer_(n_layer), n_expert_(n_expert) {
+    // Layers this cache is responsible for (all of them without a split).
+    auto owns = [&](int il) { return !layer_mask || (*layer_mask)[(size_t) il]; };
 
     backend_ = gpu_backend;
     if (getenv("QWEN_SYNC_FETCH")) async_fetch_ = false;   // A/B: force synchronous H2D
@@ -123,6 +125,7 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
             foff_[r].assign(n_layer, 0);
             fpath_[r].assign(n_layer, std::string());
             for (int il = 0; il < n_layer; ++il) {
+                if (!owns(il)) continue;
                 char name[256];
                 snprintf(name, sizeof(name), role_fmt((Role) r), il);
                 foff_[r][il]  = model.tensor_file_offset(name);
@@ -139,6 +142,7 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
     for (int r = 0; r < N_ROLE; ++r) {
         layer_pool_[r].assign(n_layer, -1);
         for (int il = 0; il < n_layer; ++il) {
+            if (!owns(il)) continue;      // another device's layer: stays -1
             ggml_tensor * t = role_tensor(model, (Role) r, il);
             if (!t) throw std::runtime_error("ExpertCache: missing expert tensor (role " +
                                              std::to_string(r) + ", layer " + std::to_string(il) + ")");
@@ -284,6 +288,9 @@ void * ExpertCache::coal_host(size_t nbytes) {
 }
 
 ggml_tensor * ExpertCache::tensor(Role role, int layer) const {
+    if (!serves(layer))
+        throw std::runtime_error("ExpertCache::tensor on layer " + std::to_string(layer) +
+                                 " which this device does not serve");
     return pools_[layer_pool_[role][layer]].t;
 }
 
@@ -294,6 +301,7 @@ int ExpertCache::min_slots() const {
 }
 
 int ExpertCache::capacity(int layer) const {
+    if (!serves(layer)) return 0;
     int m = INT32_MAX;
     for (int r = 0; r < N_ROLE; ++r) {
         const Pool & p = pools_[layer_pool_[r][layer]];
@@ -308,6 +316,7 @@ int ExpertCache::capacity(int layer) const {
 }
 
 int ExpertCache::quota_of(int layer) const {
+    if (!serves(layer)) return 0;
     int m = INT32_MAX;
     for (int r = 0; r < N_ROLE; ++r) {
         const Pool & p = pools_[layer_pool_[r][layer]];
@@ -344,6 +353,7 @@ void ExpertCache::compute_quota(std::vector<int> & quota) const {
     std::vector<int> rem(pools_.size());
     for (size_t i = 0; i < pools_.size(); ++i) rem[i] = pools_[i].n_slots;
     auto take = [&](int il) {
+        if (!serves(il)) return false;      // layer belongs to another device
         int pi[N_ROLE];
         for (int r = 0; r < N_ROLE; ++r) {
             pi[r] = layer_pool_[r][il];
@@ -379,7 +389,7 @@ void ExpertCache::dump_quota_plan(const char * tag) const {
     std::vector<int> q;
     compute_quota(q);
     fprintf(stderr, "quota-plan[%s]:", tag);
-    for (int il = 0; il < n_layer_; ++il) fprintf(stderr, " %d", q[il]);
+    for (int il = 0; il < n_layer_; ++il) if (serves(il)) fprintf(stderr, " %d", q[il]);
     fprintf(stderr, "\n");
 }
 
@@ -399,11 +409,13 @@ void ExpertCache::rebalance(size_t fill_budget) {
     std::vector<int> seen(n_layer_, 0);
 
     size_t moved = 0;
-    for (int il = 0; il < n_layer_; ++il)
+    for (int il = 0; il < n_layer_; ++il) {
+        if (!serves(il)) continue;
         for (int r = 0; r < N_ROLE; ++r) {
             Pool & pool = pools_[layer_pool_[r][il]];
             if (pool.quota[il] != quota[il]) { pool.quota[il] = quota[il]; ++moved; }
         }
+    }
 
     // Reshape residency towards the ideal set. The quota alone only steers
     // future evictions, and after a layer-major prefill the under-quota layers
@@ -416,6 +428,7 @@ void ExpertCache::rebalance(size_t fill_budget) {
     for (const auto & e : ents) {
         if (filled >= fill_budget) break;
         const int key = e.second, il = key / n_expert_, ex = key % n_expert_;
+        if (!serves(il)) continue;
         if (seen[il] >= quota[il]) continue;
         seen[il]++;
         bool all = true;
@@ -431,7 +444,10 @@ void ExpertCache::rebalance(size_t fill_budget) {
 
     ggml_backend_synchronize(backend_);
     int qmin = n_expert_, qmax = 0;
-    for (int il = 0; il < n_layer_; ++il) { qmin = std::min(qmin, quota[il]); qmax = std::max(qmax, quota[il]); }
+    for (int il = 0; il < n_layer_; ++il) {
+        if (!serves(il)) continue;
+        qmin = std::min(qmin, quota[il]); qmax = std::max(qmax, quota[il]);
+    }
     fprintf(stderr, "expert cache: per-layer quotas on (%zu role-quotas set, range %d..%d experts), "
                     "%zu experts prefetched into the new shape\n", moved, qmin, qmax, filled);
     if (getenv("QWEN_LAYER_QUOTA_DUMP")) {
@@ -859,6 +875,7 @@ void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
 }
 
 bool ExpertCache::resident(Role role, int layer, int expert) const {
+    if (!serves(layer)) return false;   // another device's layer
     const Pool & pool = pools_[layer_pool_[role][layer]];
     return pool.key2slot.find(layer * n_expert_ + expert) != pool.key2slot.end();
 }
@@ -869,6 +886,7 @@ const int32_t * ExpertCache::slot_of_row(Role role, int layer) const {
 }
 
 void ExpertCache::touch(Role role, int layer, int expert) {
+    if (!serves(layer)) return;
     Pool & pool = pools_[layer_pool_[role][layer]];
     const int key = layer * n_expert_ + expert;
     auto it = pool.key2slot.find(key);
@@ -930,8 +948,9 @@ size_t ExpertCache::load_prefetch(const std::string & path) {
     std::vector<Ent> ents;
     int r, l, e; unsigned long long c;
     while (fscanf(f, "%d %d %d %llu", &r, &l, &e, &c) == 4) {
-        if (r >= 0 && r < N_ROLE && l >= 0 && l < n_layer_ && e >= 0 && e < n_expert_)
-            ents.push_back({ r, l, e, c });
+        if (r >= 0 && r < N_ROLE && l >= 0 && l < n_layer_ && e >= 0 && e < n_expert_ && serves(l))
+            ents.push_back({ r, l, e, c });   // a profile covers the whole model;
+                                              // take only this device's layers
     }
     fclose(f);
 
@@ -967,6 +986,7 @@ void ExpertCache::reset_layer_stats() {
 void ExpertCache::layer_stats(std::vector<LayerStat> & out) const {
     out.assign(n_layer_, LayerStat{});
     for (int il = 0; il < n_layer_; ++il) {
+        if (!serves(il)) continue;      // left zeroed: another device reports it
         LayerStat & ls = out[il];
         ls.hits      = l_hits_[il];
         ls.misses    = l_misses_[il];
@@ -995,6 +1015,7 @@ void ExpertCache::dump_layer_stats(const char * tag) const {
                     "   want  wantmiss%%\n");
     uint64_t th = 0, tm = 0, te = 0, tw = 0, twm = 0; int tr = 0;
     for (int il = 0; il < n_layer_; ++il) {
+        if (!serves(il)) continue;
         const LayerStat & s = ls[il];
         const uint64_t acc = s.hits + s.misses;
         fprintf(stderr, "%5d  %8d  %6.2f  %9llu  %6.1f  %8llu  %6llu  %6llu  %8.1f\n",
@@ -1019,6 +1040,7 @@ void ExpertCache::dump_layer_stats(const char * tag) const {
 }
 
 void ExpertCache::ensure_resident(int layer, int expert) {
+    if (!serves(layer)) return;
     for (int r = 0; r < N_ROLE; ++r) {
         Pool & pool = pools_[layer_pool_[r][layer]];
         const int key = layer * n_expert_ + expert;
@@ -1032,6 +1054,11 @@ void ExpertCache::ensure_resident(int layer, int expert) {
 
 void ExpertCache::ensure(int layer, const int32_t * expert_ids, int n,
                          int32_t * slot_gate, int32_t * slot_up, int32_t * slot_down) {
+    // Routing bug rather than a runtime condition: fail loudly instead of
+    // indexing pools_ with the -1 that marks another device's layer.
+    if (!serves(layer))
+        throw std::runtime_error("ExpertCache::ensure on layer " + std::to_string(layer) +
+                                 " which this device does not serve");
     Pool * pools3[N_ROLE] = {
         &pools_[layer_pool_[GATE][layer]],
         &pools_[layer_pool_[UP][layer]],

@@ -177,6 +177,7 @@ static void alloc_tensors_chunked(ggml_backend_buffer_type_t buft,
         const size_t mb = strtoull(e, nullptr, 10);
         if (mb > 0) cap = std::min(cap, mb * 1024 * 1024);
     }
+    const size_t first_buf = out_bufs.size();   // this call's share of a shared vector
     size_t i = 0;
     while (i < ts.size()) {
         size_t group_sz = 0, j = i;
@@ -196,21 +197,38 @@ static void alloc_tensors_chunked(ggml_backend_buffer_type_t buft,
                                          + ggml_get_name(ts[k]));
         i = j;
     }
-    if (out_bufs.size() > 1) {
+    if (out_bufs.size() - first_buf > 1) {
         size_t total = 0;
-        for (auto b : out_bufs) total += ggml_backend_buffer_get_size(b);
+        for (size_t k = first_buf; k < out_bufs.size(); ++k)
+            total += ggml_backend_buffer_get_size(out_bufs[k]);
         fprintf(stderr, "%s: %zu MB split over %zu buffers (backend caps one at %zu MB)\n",
-                what, total / 1048576, out_bufs.size(), cap / 1048576);
+                what, total / 1048576, out_bufs.size() - first_buf, cap / 1048576);
     }
+}
+
+int DevicePlan::dev_of_name(const std::string & name) const {
+    // "blk.<N>.rest"; anything else is model-global and belongs to the primary.
+    if (name.compare(0, 4, "blk.") != 0) return 0;
+    size_t p = 4;
+    int il = 0;
+    if (p >= name.size() || !isdigit((unsigned char) name[p])) return 0;
+    for (; p < name.size() && isdigit((unsigned char) name[p]); ++p)
+        il = il * 10 + (name[p] - '0');
+    if (il < 0 || (size_t) il >= layer_dev.size()) return 0;
+    const int d = layer_dev[(size_t) il];
+    return (d >= 0 && (size_t) d < bufts.size()) ? d : 0;
 }
 
 void Model::load_weights_split(
     ggml_backend_t          gpu_backend,
     ggml_backend_buffer_type_t cpu_buft,
     std::vector<ggml_backend_buffer_t> & out_gpu_bufs,
-    std::vector<ggml_backend_buffer_t> & out_cpu_bufs)
+    std::vector<ggml_backend_buffer_t> & out_cpu_bufs,
+    const DevicePlan *      plan,
+    std::vector<size_t> *   out_dev_bytes)
 {
     ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_backend);
+    const size_t n_dev = (plan && plan->n_dev() > 1) ? plan->n_dev() : 1;
 
     // ---- Prep embedding fallback copy (same as single-backend path) ----
     ggml_tensor * te = tensor("token_embd.weight");
@@ -234,18 +252,30 @@ void Model::load_weights_split(
         // will be allocated into out_gpu_bufs below
     }
 
-    // ---- GPU (non-expert) buffers: split by the backend's single-buffer limit ----
-    std::vector<ggml_tensor *> gpu_tensors;
+    // ---- GPU (non-expert) buffers: split by the backend's single-buffer limit,
+    // and, under a multi-device plan, by the device that computes the layer ----
+    std::vector<std::vector<ggml_tensor *>> gpu_tensors(n_dev);
     std::vector<ggml_tensor *> exp_tensors;     // offloaded experts (kept ordered)
     for (auto & kv : tensors_) {
         if (is_offloaded_expert(kv.first)) exp_tensors.push_back(kv.second);
-        else gpu_tensors.push_back(kv.second);
+        else gpu_tensors[n_dev > 1 ? (size_t) plan->dev_of_name(kv.first) : 0].push_back(kv.second);
     }
     // lives in out_gpu_bufs (caller-owned); embd_buf_ stays null here
-    if (need_f32_embd) gpu_tensors.push_back(tok_embd_rows_);
+    if (need_f32_embd) gpu_tensors[0].push_back(tok_embd_rows_);   // primary: no layer of its own
 
-    alloc_tensors_chunked(gpu_buft, gpu_tensors, ggml_backend_buft_get_max_size(gpu_buft),
-                          "gpu weights (split mode)", out_gpu_bufs);
+    if (out_dev_bytes) out_dev_bytes->assign(n_dev, 0);
+    for (size_t d = 0; d < n_dev; ++d) {
+        ggml_backend_buffer_type_t bt = (n_dev > 1) ? plan->bufts[d] : gpu_buft;
+        const size_t before = out_gpu_bufs.size();
+        char what[64];
+        if (n_dev > 1) snprintf(what, sizeof(what), "gpu%zu weights (split mode)", d);
+        else           snprintf(what, sizeof(what), "gpu weights (split mode)");
+        alloc_tensors_chunked(bt, gpu_tensors[d], ggml_backend_buft_get_max_size(bt),
+                              what, out_gpu_bufs);
+        if (out_dev_bytes)
+            for (size_t k = before; k < out_gpu_bufs.size(); ++k)
+                (*out_dev_bytes)[d] += ggml_backend_buffer_get_size(out_gpu_bufs[k]);
+    }
 
     // ---- CPU (expert) buffers: chunked so each stays under the single
     // cudaHostAlloc cap (~15.5 GB on WDDM) and the whole set can be page-locked ----
@@ -326,8 +356,11 @@ void Model::read_tensor_bytes(const std::string & name, void * dst, size_t nb,
 // (their meta tensors keep ne/nb but have no backing buffer — ExpertCache streams
 // them via pread). Mirrors load_weights for the non-expert subset.
 void Model::load_weights_ssd(ggml_backend_t gpu_backend,
-                             std::vector<ggml_backend_buffer_t> & out_gpu_bufs) {
+                             std::vector<ggml_backend_buffer_t> & out_gpu_bufs,
+                             const DevicePlan * plan,
+                             std::vector<size_t> * out_dev_bytes) {
     ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_backend);
+    const size_t n_dev = (plan && plan->n_dev() > 1) ? plan->n_dev() : 1;
 
     // token-embedding fallback (same as load_weights)
     ggml_tensor * te = tensor("token_embd.weight");
@@ -350,16 +383,27 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
         ggml_set_name(tok_embd_rows_, embd_q8_ ? "token_embd.q8_0" : "token_embd.f16");
     }
 
-    std::vector<ggml_tensor *> gpu_tensors;
+    std::vector<std::vector<ggml_tensor *>> gpu_tensors(n_dev);
     for (auto & kv : tensors_) {
         if (is_offloaded_expert(kv.first)) continue;   // stays on SSD
-        gpu_tensors.push_back(kv.second);
+        gpu_tensors[n_dev > 1 ? (size_t) plan->dev_of_name(kv.first) : 0].push_back(kv.second);
     }
     // lives in out_gpu_bufs (caller-owned); embd_buf_ stays null here
-    if (need_f32_embd) gpu_tensors.push_back(tok_embd_rows_);
+    if (need_f32_embd) gpu_tensors[0].push_back(tok_embd_rows_);   // primary: no layer of its own
 
-    alloc_tensors_chunked(gpu_buft, gpu_tensors, ggml_backend_buft_get_max_size(gpu_buft),
-                          "gpu weights (ssd mode)", out_gpu_bufs);
+    if (out_dev_bytes) out_dev_bytes->assign(n_dev, 0);
+    for (size_t d = 0; d < n_dev; ++d) {
+        ggml_backend_buffer_type_t bt = (n_dev > 1) ? plan->bufts[d] : gpu_buft;
+        const size_t before = out_gpu_bufs.size();
+        char what[64];
+        if (n_dev > 1) snprintf(what, sizeof(what), "gpu%zu weights (ssd mode)", d);
+        else           snprintf(what, sizeof(what), "gpu weights (ssd mode)");
+        alloc_tensors_chunked(bt, gpu_tensors[d], ggml_backend_buft_get_max_size(bt),
+                              what, out_gpu_bufs);
+        if (out_dev_bytes)
+            for (size_t k = before; k < out_gpu_bufs.size(); ++k)
+                (*out_dev_bytes)[d] += ggml_backend_buffer_get_size(out_gpu_bufs[k]);
+    }
 
     std::map<std::string, void *> files;
     std::vector<uint8_t> buf;

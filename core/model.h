@@ -81,6 +81,21 @@ struct HParams {
     }
 };
 
+// Multi-GPU weight placement. `bufts[i]` is device i's buffer type and
+// `layer_dev[il]` names the device that computes layer il, so a tensor named
+// "blk.<il>.*" is allocated on that device and its matmuls run there. Tensors
+// with no layer prefix (token embedding, output head, final norm) go to device
+// 0, the primary. A plan with one device is the ordinary single-GPU case.
+struct DevicePlan {
+    std::vector<ggml_backend_buffer_type_t> bufts;
+    std::vector<int>                        layer_dev;
+
+    size_t n_dev() const { return bufts.size(); }
+    // Device index for a GGUF tensor name; 0 when it has no "blk.<N>." prefix
+    // or the layer is out of range.
+    int dev_of_name(const std::string & name) const;
+};
+
 struct TensorInfo {
     std::string  name;
     ggml_tensor * tensor = nullptr;  // meta tensor (data lives in mmap-backed buffer)
@@ -125,16 +140,25 @@ public:
     // large MoE models when GPU VRAM is limited.
     // Both sides are lists because a backend can cap the size of one buffer
     // (Vulkan does, at 1 GiB by default) well below the weights' total.
+    // `plan`, when given with more than one device, places each layer's tensors
+    // on that layer's device instead of all of them on gpu_backend; out_gpu_bufs
+    // still collects every GPU buffer (the caller owns them all) and
+    // out_dev_bytes, if given, reports the bytes landed on each device so the
+    // caller can size that device's expert pool against its own budget.
     void load_weights_split(ggml_backend_t gpu_backend,
                             ggml_backend_buffer_type_t cpu_buft,
                             std::vector<ggml_backend_buffer_t> & out_gpu_bufs,
-                            std::vector<ggml_backend_buffer_t> & out_cpu_bufs);
+                            std::vector<ggml_backend_buffer_t> & out_cpu_bufs,
+                            const DevicePlan * plan = nullptr,
+                            std::vector<size_t> * out_dev_bytes = nullptr);
 
     // SSD-tier variant: routed expert weights are NOT loaded into memory at all
     // (they stay on disk and are streamed on demand by ExpertCache). Everything
     // else (incl. shared experts) goes to gpu_backend. Saves the experts' RAM.
     void load_weights_ssd(ggml_backend_t gpu_backend,
-                          std::vector<ggml_backend_buffer_t> & out_gpu_bufs);
+                          std::vector<ggml_backend_buffer_t> & out_gpu_bufs,
+                          const DevicePlan * plan = nullptr,
+                          std::vector<size_t> * out_dev_bytes = nullptr);
 
     // Source file + absolute byte offset of a tensor's data (for pread).
     // For sharded models these vary per tensor (different shard files).

@@ -45,10 +45,20 @@ public:
     //   derived so all experts share a uniform residency ratio).
     // ssd: if true, cache misses are streamed from the GGUF file on disk via
     //   pread (experts are not held in RAM); otherwise from the CPU expert tensors.
+    // layer_mask (multi-GPU): when given, only the layers it selects get pools
+    // here -- the others are computed on another device and cached by that
+    // device's ExpertCache. Layer indices stay global either way, so callers
+    // index every cache with the same `il`; serves() says which one owns it.
     ExpertCache(ggml_backend_t gpu_backend, Model & model,
                 int n_layer, int n_expert, int n_used, size_t vram_avail_bytes,
-                bool ssd = false);
+                bool ssd = false,
+                const std::vector<bool> * layer_mask = nullptr);
     ~ExpertCache();
+
+    // Whether this cache holds `layer`'s expert pools.
+    bool serves(int layer) const {
+        return layer >= 0 && layer < n_layer_ && layer_pool_[GATE][(size_t) layer] >= 0;
+    }
 
     // Make `layer`'s selected experts resident for all three roles, copying
     // misses into VRAM. Fills the three parallel slot-id arrays (length n each).

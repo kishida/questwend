@@ -23,12 +23,30 @@ class Model;
 // machines whose CUDA device was found and initialized just fine.
 std::vector<ggml_backend_dev_t> gpu_devices();
 
+// One GPU in a multi-GPU plan.
+//
+// `split` is the device's share of the model's *compute* layers; the VRAM its
+// layers do not consume becomes expert-cache pool on that same device. The two
+// layouts sketched in spec.md are therefore the ends of one continuum rather
+// than separate modes: give both devices a share and it is a layer split, give
+// a device split == 0 and it holds no layers, so its whole budget is surplus
+// and it acts as a pure expert pool for the devices that do compute. A single
+// device with split == 1 is the original single-GPU behavior.
+struct GpuPlan {
+    int    device    = 0;      // index into gpu_devices()
+    size_t budget_mb = 0;      // VRAM budget for this device (0 = unspecified)
+    float  split     = -1.0f;  // compute-layer share; < 0 = auto (by budget)
+};
+
 struct RuntimeConfig {
     int    n_ctx          = 4096;
     int    n_threads      = 0;       // 0 = auto
     bool   use_cuda       = true;    // try a GPU device first, fall back to CPU
     size_t vram_budget_mb = 0;       // >0: offload expert weights to CPU,
                                      //     enables running large MoE models with limited VRAM
+    // Multi-GPU plan. Empty = use the first GPU device only (single-GPU
+    // behavior, with vram_budget_mb as its budget).
+    std::vector<GpuPlan> gpus;
     std::string cache_profile;       // file to persist/prefetch the hot-expert profile
     bool   cache_profile_save = true; // false: load/prefetch only, never overwrite the profile
     bool   experts_ssd    = false;   // stream experts from the GGUF on SSD (no RAM copy)
@@ -43,6 +61,27 @@ struct RuntimeConfig {
 // switch to GB and nobody budgets 512 GB of VRAM; `legacy_mb` is set so the
 // caller can say so. Returns 0 (offloading off) for a non-positive value.
 size_t parse_vram_budget_mb(const std::string & arg, bool * legacy_mb = nullptr);
+
+// Comma-separated multi-GPU arguments. Each returns false (leaving `out`
+// untouched) when a field does not parse, so the caller can print the offending
+// argument and exit.
+//   --vram-budget "13.5,5"  -> one budget per device, each parsed as above
+//   --gpus        "1,0"     -> device indices into gpu_devices(), primary first
+//   --gpu-split   "0.8,0"   -> compute-layer share per device (0 = expert pool)
+// A single-element --vram-budget keeps the old single-GPU meaning.
+bool parse_vram_budget_list(const std::string & arg, std::vector<size_t> & out,
+                            bool * legacy_mb = nullptr);
+bool parse_gpu_list(const std::string & arg, std::vector<int> & out);
+bool parse_gpu_split(const std::string & arg, std::vector<float> & out);
+
+// Combine the three parsed lists into RuntimeConfig::gpus. `out` is left empty
+// for the plain single-GPU case (no --gpus, and at most one entry each), which
+// keeps the historical "first device that initializes" behavior. Prints what
+// disagrees and returns false when the list lengths are inconsistent.
+bool build_gpu_plan(const std::vector<int> & gpu_ids,
+                    const std::vector<float> & gpu_split,
+                    const std::vector<size_t> & vram_mb,
+                    std::vector<GpuPlan> & out);
 
 class Runtime {
 public:
