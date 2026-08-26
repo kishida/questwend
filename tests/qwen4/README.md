@@ -20,6 +20,10 @@ qwencpp に `qwen4exp` アーキテクチャを実装するための、llama.cpp
 | `check_tiny.py` | 極小モデルを qw-cli に通し、記録済みの llama.cpp 参照と比較する |
 | `compare_logits.py` | `index: value` 形式の logits ダンプ 2 本を比較（最大差・argmax・top-k 順序） |
 | `01-tiny/` | 極小モデルの参照 logits。`.gguf` は seed 固定で再生成できるのでコミットしない |
+
+`QWEN_QSA_DEBUG=1` を付けると QSA の中間テンソル（raw キー / プール / q / スコア /
+top-k / 生成したマスク）が stderr に出る。llama.cpp 側の
+`llama-debug --tensor-filter '.*indexer_.*-<層>$'` と突き合わせられる。
 | `00-arch/` | ハイパーパラメータ・テンソル一覧・トークナイザ（**シャード 1 だけで取れるので取得済み**） |
 | `03-tokenizer/` | `llama-tokenize` の出力 |
 | `04-tensors/` | `llama-debug --tensor-filter` の中間テンソルダンプ |
@@ -71,28 +75,44 @@ python tests/qwen4/check_tiny.py
 
 ### 現在の状態
 
-`python tests/qwen4/check_tiny.py` の結果:
+`python tests/qwen4/check_tiny.py` は全ケース PASS。
 
 | ケース | 内容 | 結果 |
 |---|---|---|
-| `dense-5tok` | hyper-connection / GDN / dense attention / MoE | **一致**（最大差 span の 0.022%） |
-| `ple-5tok` | PLE の n-gram ハッシュ・行 gather・dilated conv | **一致**（span の 0.007%） |
-| `dense-5tok-ngram-off` | `--ngram off` が PLE 無しモデルを再現するか | **一致** |
-| `offload` / `offload-ssd` | expert-offload 経路（segA/segB）が広い残差と PLE を運べるか | **一致**（span の 0.27%、argmax・top-10 順序とも一致） |
-| `ple-gen` / `nople-gen` / `ple-ssd-gen` | デコード間の状態引き継ぎ（GDN conv/ssm・PLE conv 履歴・n-gram 窓） | **一致**（4 プロンプト × 8 トークン貪欲生成） |
-| `qsa-36tok` | QSA | **不一致**（QSA 未実装。llama.cpp は QSA、qwencpp は dense） |
+| `dense-5tok` | hyper-connection / GDN / dense attention / MoE | 一致（span の 0.008%） |
+| `ple-5tok` | PLE の n-gram ハッシュ・行 gather・dilated conv | 一致（0.008%） |
+| `dense-5tok-ngram-off` | `--ngram off` が PLE 無しモデルを再現するか | 一致 |
+| `qsa1-20tok` | QSA（indexer キャッシュ・ブロックスコア・top-k・マスク生成） | 一致（0.011%） |
+| `qsa-20tok` | QSA（compress ratio 2、ブロック平均あり） | argmax 一致（下記の理由で数値一致は不可能） |
+| `offload` / `offload-ssd` | expert-offload 経路（segA/segB）が広い残差と PLE を運べるか | 一致（0.169%） |
+| `ple-gen` / `nople-gen` / `ple-ssd-gen` | デコード間の状態引き継ぎ | 一致（4 プロンプト × 8 トークン貪欲生成） |
 
-`qsa-36tok` は QSA を実装したら自動的に一致に変わる。36 トークンなのは
-`indexer_top_k + compress_ratio - 1 = 9` を超えさせるため。
+### QSA が ratio 2 で厳密一致しない理由（実装バグではない）
 
-offload 系の許容差が緩い（0.27%）のは GPU と CPU の数値差であって offload 経路の
-問題ではない。常駐 GPU 実行がまったく同じ数字（最大差 0.007391、同じ index）を出す。
-極小モデルの head 幅 32 は CUDA の flash-attention カーネルが受け付けないので
-`QWEN_NO_FLASH=1` を付けている（実物の head 幅は 256）。
+予算は `indexer_top_k + compress_ratio - 1` セル。これは「完全なブロック群 + 不完全な
+末尾」をちょうど覆う設計だが、**トークンがブロック境界に乗ると末尾が空になり**、予算が
+「完全なブロック n 個 + 端数 1 セル」になる。その端数がブロックのどちらのメンバーになるかは
+**同一スコアの並び替え順**で決まり、参照実装側でも定義されていない（しかも llama.cpp の
+n_kv パディング量に依存する）。
 
-生成の比較は「最後の 1 トークンを除いて一致」を基準にしている。両者の logits は
-span の 0.02% まで一致するが、貪欲デコードでは僅差の順位が入れ替わることがあり、
-実際 8 回中 2 回が最終ステップでそれを踏む。配線のバグなら最初のステップで割れる。
+`--qsa-ratio=1` の極小モデルはブロックが 1 トークン幅なので端数が存在せず、そこでは
+**厳密に一致する**。ratio 2 のケースはブロック平均そのものを見るために残してあり、
+argmax のみで判定している。
+
+実物では `top_k=2048` / `ratio=4` なので端数は最大 3 セル / 2051 セル（0.15%）。
+
+### 32 トークンを超えると GDN が分岐する（本移植とは無関係）
+
+QSA を両側で無効にした極小モデルで測ると、プロンプト長 30 → 32 で最大差が
+0.0003 → 0.088 に跳ぶ。原因は delta-net の実装差で、
+
+- qwencpp は常に融合オペ `ggml_gated_delta_net`（逐次スキャン）を使う
+- llama.cpp は既定で `build_delta_net`（グラフ構築、`build_delta_net_chunking` は `CS = 64`）を使い、
+  長さに応じて逐次形とチャンク形を切り替える
+
+数学的には等価だが丸めが違う。Qwen3.5 / 3.6 でも同じはずで（そちらは量子化誤差に埋もれて
+見えない）、qwen4exp 固有の問題ではない。**QSA の検証プロンプトを 32 トークン未満に
+してあるのはこのため。**
 
 ## `--ngram`: n-gram embedding のスイッチ
 

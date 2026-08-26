@@ -12,6 +12,12 @@ it is reported separately from the raw numbers.
 f32 CPU graph reproducing another f32 CPU graph looks like; a GPU run against a
 CPU reference needs more room (F16 KV cache, different kernels) and 5e-3 is the
 measured figure there.
+
+--pass=argmax judges on the argmax alone. That is for the one comparison where
+the reference is not itself well defined: with a QSA compress ratio above 1 the
+attention budget can cover a whole number of blocks plus one leftover cell, and
+which member of the last block that is comes down to how the sort breaks a tie
+between two identical scores. The numbers are still printed.
 """
 import sys
 
@@ -32,12 +38,14 @@ def load(path):
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
-    top, tol = 10, 1e-3
+    top, tol, judge = 10, 1e-3, 'tol'
     for a in sys.argv[1:]:
         if a.startswith('--top='):
             top = int(a.split('=', 1)[1])
         elif a.startswith('--tol='):
             tol = float(a.split('=', 1)[1])
+        elif a.startswith('--pass='):
+            judge = a.split('=', 1)[1]
     if len(args) < 2:
         raise SystemExit(__doc__)
 
@@ -65,7 +73,8 @@ def main():
         print(f'  ref  {order_ref[:top]}')
         print(f'  ours {order_our[:top]}')
 
-    sys.exit(0 if diffs[worst] < tol * max(span, 1.0) else 1)
+    ok = (order_ref[0] == order_our[0]) if judge == 'argmax'          else diffs[worst] < tol * max(span, 1.0)
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == '__main__':

@@ -44,10 +44,20 @@ CASES = [
     # weights, minus one gated additive branch.
     ('dense-5tok', 'Hello', 'nople', ['--ngram', 'off'],
      '--ngram off on a model that has no PLE at all'),
-    # 36 tokens is past indexer_top_k + compress_ratio - 1 = 9, so llama.cpp
-    # runs QSA here and qwencpp still runs dense. Expected to differ until QSA
-    # lands; kept so the day it lands the check flips to a pass on its own.
-    ('qsa-36tok', 'Hello world, this is a longer prompt', 'nople', [], 'QSA'),
+    # 20 tokens: past indexer_top_k + compress_ratio - 1 = 9, so QSA is doing
+    # real work, and short of 32, where the two delta-net implementations part
+    # ways (see QSA_ARGMAX_CASES and the README).
+    ('qsa1-20tok', 'Hello world, this is', 'qsa1', [],
+     'QSA: indexer cache, block scoring, top-k and the mask it builds'),
+]
+
+# One block per token removes the reference's own ambiguity, which is why the
+# case above can demand an exact match. At ratio 2 the budget covers four whole
+# blocks plus one leftover cell, and which member of the fifth block that is
+# comes down to a tie in the sort -- so this one asks for the argmax only. It
+# still covers what ratio 1 cannot: the pooling of a block's member keys.
+QSA_ARGMAX_CASES = [
+    ('qsa-20tok', 'Hello world, this is', 'nople', 'QSA with pooled blocks (ratio 2)'),
 ]
 
 # Logits only cover the prompt's last position, which says nothing about what
@@ -82,20 +92,29 @@ OFFLOAD_CASES = [
 OFFLOAD_TOL = '--tol=5e-3'
 
 
+# variant -> extra make_tiny_model.py arguments
+VARIANTS = {
+    'ple':   [],
+    'nople': ['--no-ple'],
+    'qsa1':  ['--no-ple', '--qsa-ratio=1'],
+}
+
+
 def gguf(variant):
-    return os.path.join(TINY, 'tiny-qwen4exp-nople.gguf' if variant == 'nople'
-                        else 'tiny-qwen4exp.gguf')
+    return os.path.join(TINY, 'tiny-' + variant + '.gguf')
 
 
 def generate_models():
-    for variant, extra in (('ple', []), ('nople', ['--no-ple'])):
+    for variant, extra in VARIANTS.items():
         subprocess.run([sys.executable, os.path.join(HERE, 'make_tiny_model.py'),
                         gguf(variant)] + extra, check=True)
 
 
 def rebuild_ref():
     seen = set()
-    for ref, prompt, variant, _args, _why in CASES:
+    cases = [(r, p, v) for r, p, v, _a, _w in CASES]
+    cases += [(r, p, v) for r, p, v, _w in QSA_ARGMAX_CASES]
+    for ref, prompt, variant in cases:
         if ref in seen:
             continue
         seen.add(ref)
@@ -113,6 +132,8 @@ def generation(exe_args, env=None):
 
 
 ANSI = re.compile(rb'\x1b\[[0-9;]*m')
+NUL  = bytes([0])
+EOT  = b' [end of text]'
 
 
 def check_generation():
@@ -138,8 +159,12 @@ def check_generation():
                               '--temp', '0', '--no-warmup'])
             ours = generation([exe, '-m', gguf(variant), '-p', prompt,
                                '-n', str(GEN_N), '--temp', '0'] + extra, env=env)
-            # llama-completion colours the echoed prompt; qw-cli does not
-            tail = lambda b: ANSI.sub(b'', b).split(prompt.encode())[-1].strip()
+            # llama-completion colours the echoed prompt and announces EOS as
+            # " [end of text]" where qw-cli just stops; NULs are dropped from
+            # both because the synthetic vocabulary has a token for byte 0 and
+            # the two CLIs render it differently. None of that is model output.
+            tail = lambda b: (ANSI.sub(b'', b).split(prompt.encode())[-1]
+                              .replace(EOT, b'').replace(NUL, b'').strip())
             a, b = tail(ref), tail(ours)
             common = 0
             while common < min(len(a), len(b)) and a[common] == b[common]:
@@ -207,6 +232,22 @@ def main():
                              os.path.join(ref_dir, ref_txt), ours]).returncode
         if rc != 0:
             failures.append(name)
+        print()
+
+    for ref, prompt, variant, why in QSA_ARGMAX_CASES:
+        ref_dir = os.path.join(TINY, 'ref', ref)
+        ref_txt = next(f for f in sorted(os.listdir(ref_dir))
+                       if f.endswith('.txt') and not f.endswith('-prompt.txt'))
+        ours = os.path.join(TINY, 'qwencpp-' + ref + '.txt')
+        subprocess.run([QW_CLI, '-m', gguf(variant), '-p', prompt, '-n', '1',
+                        '--cpu', '--dump-logits', ours],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print('==== ' + ref + '  (' + why + ') ====', flush=True)
+        rc = subprocess.run([sys.executable, os.path.join(HERE, 'compare_logits.py'),
+                             os.path.join(ref_dir, ref_txt), ours,
+                             '--pass=argmax']).returncode
+        if rc != 0:
+            failures.append(ref)
         print()
 
     failures += check_offload()

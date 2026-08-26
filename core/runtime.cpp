@@ -290,6 +290,11 @@ struct Runtime::Impl {
     // qwen4exp PLE: the module's own dilated-conv history, kept per PLE layer
     // and shaped like conv_state -- tokens on ne[0] so a batch concatenates.
     std::vector<ggml_tensor *> ple_conv_state;  // [(K-1)*ngram, hc_dim]
+    // qwen4exp QSA: raw (unnormed, unroped) indexer keys, one per cached token.
+    // Pooling happens over these, so they are stored before either transform --
+    // and in F32, because the pooled scores decide which cells are attended to
+    // at all and an F16 round trip can reorder a near tie.
+    std::vector<ggml_tensor *> idx_k_cache;     // [indexer_head_dim, n_ctx]
 
     // The n-gram table lives outside every backend buffer (see ngram_table.h).
     // ngram_hist carries the tokens preceding the current batch so a chunked
@@ -554,6 +559,20 @@ struct Runtime::Impl {
     ggml_tensor * build_ple(ggml_context * ctx, ggml_cgraph * gf, int il,
                             ggml_tensor * res_hc, ggml_tensor * emb, int n_tokens);
     void fill_ple_input(ggml_cgraph * gf, const int32_t * tokens, int n_tokens);
+
+    // qwen4exp QSA. The host-side inputs depend on the cache layout and the
+    // batch's positions but not on the layer, so one set serves every QSA layer
+    // in a graph; build_qsa_mask fills this on first use.
+    struct QsaShared {
+        ggml_tensor * cell_blk = nullptr, * blk_cells = nullptr;
+        ggml_tensor * blk_pos  = nullptr, * bias      = nullptr;
+        int n_blocks = 0, width = 0;
+    };
+    ggml_tensor * build_qsa_mask(ggml_context * ctx, ggml_cgraph * gf, int il,
+                                 ggml_tensor * cur, ggml_tensor * inp_pos,
+                                 ggml_tensor * mask, int n_tokens, int n_kv,
+                                 int kv_pos, QsaShared & shared);
+    void set_qsa_inputs(ggml_cgraph * gf, int n_tokens, int n_kv, int kv_pos);
     ggml_tensor * build_moe(ggml_context * ctx, ggml_cgraph * gf, int il,
                             ggml_tensor * x, int n_tokens);
     const std::vector<float> & decode(const std::vector<int32_t> & tokens);
@@ -833,7 +852,7 @@ void Runtime::Impl::init() {
     }
 
     ggml_init_params kp{};
-    kp.mem_size   = (size_t) ggml_tensor_overhead() * n_layer * 5 + 4096;
+    kp.mem_size   = (size_t) ggml_tensor_overhead() * n_layer * 6 + 4096;
     kp.no_alloc   = true;
     st_ctx = ggml_init(kp);
 
@@ -842,6 +861,7 @@ void Runtime::Impl::init() {
     conv_state.assign(n_layer, nullptr);
     ssm_state.assign(n_layer, nullptr);
     ple_conv_state.assign(n_layer, nullptr);
+    idx_k_cache.assign(n_layer, nullptr);
 
     for (int il = 0; il < n_layer; ++il) {
         if (hp.is_recurrent(il)) {
@@ -859,6 +879,11 @@ void Runtime::Impl::init() {
             v_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_gqa, n_ctx);
             ggml_set_name(k_cache[il], ("k_" + std::to_string(il)).c_str());
             ggml_set_name(v_cache[il], ("v_" + std::to_string(il)).c_str());
+            if (hp.has_qsa() && hp.compress_ratio(il) > 0) {
+                idx_k_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F32,
+                        hp.indexer_head_dim, n_ctx);
+                ggml_set_name(idx_k_cache[il], ("idxk_" + std::to_string(il)).c_str());
+            }
         }
         // independent of the attention/GDN split: a PLE layer can be either
         if (use_ple() && hp.is_ple(il)) {
@@ -879,6 +904,7 @@ void Runtime::Impl::init() {
             for (int il = 0; il < n_layer; ++il) {
                 if ((size_t) dev_of(il) != d) continue;
                 if (k_cache[il])    { ts.push_back(k_cache[il]);    ts.push_back(v_cache[il]); }
+                if (idx_k_cache[il]) ts.push_back(idx_k_cache[il]);
                 if (conv_state[il]) { ts.push_back(conv_state[il]); ts.push_back(ssm_state[il]); }
                 if (ple_conv_state[il]) ts.push_back(ple_conv_state[il]);
             }
@@ -1281,6 +1307,7 @@ void Runtime::Impl::zero_states() {
     for (auto * t : conv_state)     zero(t);
     for (auto * t : ssm_state)      zero(t);
     for (auto * t : ple_conv_state) zero(t);
+    for (auto * t : idx_k_cache)    zero(t);
     ngram_hist.clear();
     for (auto * t : k_cache)    zero(t);
     for (auto * t : v_cache)    zero(t);
@@ -1604,6 +1631,203 @@ void Runtime::Impl::fill_ple_input(ggml_cgraph * gf, const int32_t * tokens, int
     ggml_backend_tensor_set(t, ngram_embd.data(), 0, ggml_nbytes(t));
 }
 
+// ---- qwen4exp QSA (query-sparse attention) ----
+//
+// A full-attention layer does not attend to every cached token. The cache is cut
+// into blocks of `compress_ratio` tokens; each block is scored once, by a small
+// indexer head against the mean of its members' indexer keys; and a query attends
+// to a budget of the best blocks plus the incomplete tail it sits in.
+//
+// Only the mask changes -- the attention itself is the ordinary dense one over
+// the same K/V. Below indexer_top_k + ratio - 1 cached tokens the budget covers
+// everything, so this returns the causal mask untouched and the layer is exactly
+// dense. That is not an optimisation: it is why a short-context run can be
+// validated against the reference before any of this exists.
+//
+// `shared` caches the host-side inputs, which depend on the cache layout and the
+// batch's positions but not on the layer, so every QSA layer in one graph fills
+// them once.
+ggml_tensor * Runtime::Impl::build_qsa_mask(ggml_context * ctx, ggml_cgraph * gf, int il,
+        ggml_tensor * cur, ggml_tensor * inp_pos, ggml_tensor * mask,
+        int n_tokens, int n_kv, int kv_pos, QsaShared & shared) {
+    const auto & hp = model.hparams();
+    const int r = (int) hp.compress_ratio(il);
+    if (!hp.has_qsa() || r <= 0 || !idx_k_cache[il]) return mask;
+
+    // QWEN_QSA_DEBUG=1 exposes the indexer's intermediates so they can be diffed
+    // against llama-debug --tensor-filter '.*indexer_.*-<il>$'. Everything from
+    // the raw keys to the finished mask is reachable this way, which is how the
+    // one real difference that remains -- see set_qsa_inputs -- was pinned down.
+    const bool dbg_on = getenv("QWEN_QSA_DEBUG") != nullptr;
+    auto dbg = [&](const char * tag, ggml_tensor * t) {
+        if (!dbg_on) return;
+        ggml_tensor * c = ggml_cont(ctx, t);
+        ggml_set_name(c, (std::string("qsa_") + tag + "_" + std::to_string(il)).c_str());
+        ggml_set_output(c);
+        ggml_build_forward_expand(gf, c);
+    };
+
+    const int idx_dim = (int) hp.indexer_head_dim;
+    const int n_idx_h = (int) hp.indexer_n_head;
+    const int width   = std::min(n_kv, (int) hp.indexer_top_k + r - 1);
+    const int n_valid = kv_pos + n_tokens;      // cells 0..n_valid-1 hold tokens
+    const int n_blocks = n_valid / r;           // whole blocks only; the rest is tail
+
+    // this token's raw indexer key, straight into the cache
+    ggml_tensor * k_raw = ggml_mul_mat(ctx, W("blk.%d.indexer.k_proj.weight", il), cur);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, k_raw,
+            ggml_view_2d(ctx, idx_k_cache[il], idx_dim, n_tokens,
+                         idx_k_cache[il]->nb[1],
+                         (size_t) kv_pos * idx_k_cache[il]->nb[1])));
+
+    if (width >= n_kv || n_blocks == 0) return mask;   // the budget covers everything
+
+    // ---- host-side inputs, shared by every QSA layer in this graph ----
+    if (!shared.cell_blk) {
+        shared.n_blocks = n_blocks;
+        shared.width    = width;
+        shared.cell_blk  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+        shared.blk_cells = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, r * n_blocks);
+        shared.blk_pos   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n_blocks);
+        shared.bias      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, n_tokens);
+        ggml_set_input(shared.cell_blk);  ggml_set_name(shared.cell_blk,  "inp_qsa_cell_blk");
+        ggml_set_input(shared.blk_cells); ggml_set_name(shared.blk_cells, "inp_qsa_blk_cells");
+        ggml_set_input(shared.blk_pos);   ggml_set_name(shared.blk_pos,   "inp_qsa_blk_pos");
+        ggml_set_input(shared.bias);      ggml_set_name(shared.bias,      "inp_qsa_bias");
+    }
+    GGML_ASSERT(shared.n_blocks == n_blocks && shared.width == width &&
+                "QSA layers in one graph must share a compress ratio");
+
+    // ---- pool each block's member keys, then norm and rotate the result ----
+    ggml_tensor * k_all = ggml_view_2d(ctx, idx_k_cache[il], idx_dim, n_kv,
+                                       idx_k_cache[il]->nb[1], 0);
+    ggml_tensor * members = ggml_get_rows(ctx, k_all, shared.blk_cells);
+    members = ggml_reshape_3d(ctx, members, idx_dim, r, n_blocks);
+
+    // r is small (4 in the released model), so summing slices beats transposing
+    // the tensor to reach ggml_sum_rows
+    ggml_tensor * pooled = nullptr;
+    for (int i = 0; i < r; ++i) {
+        ggml_tensor * slice = ggml_cont(ctx,
+                ggml_view_2d(ctx, members, idx_dim, n_blocks,
+                             members->nb[2], (size_t) i * members->nb[1]));
+        pooled = pooled ? ggml_add(ctx, pooled, slice) : slice;
+    }
+    pooled = ggml_scale(ctx, pooled, 1.0f / (float) r);
+    dbg("kraw", k_raw);
+    dbg("pool0", pooled);
+    pooled = ggml_reshape_3d(ctx, pooled, idx_dim, 1, n_blocks);
+    pooled = ggml_mul(ctx, ggml_rms_norm(ctx, pooled, hp.rms_eps),
+                      W("blk.%d.indexer.k_norm.weight", il));
+    pooled = apply_rope(ctx, pooled, shared.blk_pos);
+    pooled = ggml_reshape_2d(ctx, pooled, idx_dim, n_blocks);
+
+    ggml_tensor * q = ggml_mul_mat(ctx, W("blk.%d.indexer.q_proj.weight", il), cur);
+    q = ggml_reshape_3d(ctx, q, idx_dim, n_idx_h, n_tokens);
+    q = ggml_mul(ctx, ggml_rms_norm(ctx, q, hp.rms_eps),
+                 W("blk.%d.indexer.q_norm.weight", il));
+    q = apply_rope(ctx, q, inp_pos);
+
+    // Each head's dot product is rectified before the heads are summed, as in
+    // DeepSeek's lightning indexer: there is no per-head weight, so nothing can
+    // reorder the sum.
+    ggml_tensor * score = ggml_mul_mat(ctx, pooled,
+            ggml_reshape_2d(ctx, ggml_cont(ctx, q), idx_dim, n_idx_h * n_tokens));
+    score = ggml_reshape_3d(ctx, score, n_blocks, n_idx_h, n_tokens);
+    score = ggml_relu(ctx, score);
+    score = ggml_cont(ctx, ggml_permute(ctx, score, 1, 0, 2, 3));   // [n_idx_h, n_blocks, T]
+    score = ggml_sum_rows(ctx, score);
+    score = ggml_reshape_2d(ctx, score, n_blocks, n_tokens);
+
+    // Give every cell its block's score rather than expanding block indices,
+    // which would need an integer multiply-add ggml has no op for. get_rows
+    // gathers rows, so the scores are transposed on the way in and back out.
+    ggml_tensor * expanded = ggml_get_rows(ctx,
+            ggml_cont(ctx, ggml_transpose(ctx, score)), shared.cell_blk);
+    expanded = ggml_cont(ctx, ggml_transpose(ctx,
+            ggml_reshape_2d(ctx, expanded, n_tokens, n_kv)));       // [n_kv, T]
+    expanded = ggml_add(ctx, expanded, shared.bias);
+
+    dbg("pooled", pooled);
+    dbg("q", q);
+    dbg("bias", expanded);
+    ggml_tensor * top_k = ggml_cont(ctx, ggml_top_k(ctx, expanded, width));  // [width, T]
+    dbg("topk", top_k);
+
+    // Unmask exactly the selected cells: start from all -inf and scatter zeros
+    // into the chosen rows. The rows are size 1, so set_rows writes one cell each.
+    ggml_tensor * um = ggml_fill(ctx,
+            ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_kv, n_tokens), -INFINITY);
+    ggml_tensor * zeros = ggml_fill(ctx,
+            ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, width, n_tokens), 0.0f);
+    um = ggml_set_rows(ctx, um, zeros,
+            ggml_reshape_3d(ctx, top_k, width, n_tokens, 1));
+    um = ggml_reshape_2d(ctx, um, n_kv, n_tokens);
+
+    // Re-apply the causal mask on top: when fewer than `width` cells are
+    // eligible, top_k still returns `width` indices and some of them name cells
+    // the bias had already ruled out.
+    ggml_tensor * combined = ggml_add(ctx, um, ggml_cast(ctx, mask, GGML_TYPE_F32));
+    dbg("mask", combined);
+    return ggml_cast(ctx, combined, mask->type);
+}
+
+// Fill the QSA host inputs of a graph, for a batch whose first token sits at
+// `kv_pos`. Found by name so every call site can use it without threading the
+// QsaShared through; a no-op on a graph that has no QSA layer.
+void Runtime::Impl::set_qsa_inputs(ggml_cgraph * gf, int n_tokens, int n_kv, int kv_pos) {
+    QsaShared shared;
+    shared.cell_blk  = ggml_graph_get_tensor(gf, "inp_qsa_cell_blk");
+    if (!shared.cell_blk) return;
+    shared.blk_cells = ggml_graph_get_tensor(gf, "inp_qsa_blk_cells");
+    shared.blk_pos   = ggml_graph_get_tensor(gf, "inp_qsa_blk_pos");
+    shared.bias      = ggml_graph_get_tensor(gf, "inp_qsa_bias");
+
+    const int n_blocks = (int) (shared.blk_pos->ne[0] / 4);
+    const int r        = (int) (shared.blk_cells->ne[0] / n_blocks);
+    const int n_valid  = kv_pos + n_tokens;
+
+    // block b covers [b*r, (b+1)*r), so it is rotated at the position of its
+    // first token. All four mrope sections carry the same value: exact for text.
+    std::vector<int32_t> blk_pos((size_t) 4 * n_blocks);
+    for (int sec = 0; sec < 4; ++sec)
+        for (int b = 0; b < n_blocks; ++b) blk_pos[(size_t) sec * n_blocks + b] = b * r;
+    ggml_backend_tensor_set(shared.blk_pos, blk_pos.data(), 0, blk_pos.size() * sizeof(int32_t));
+
+    std::vector<int32_t> blk_cells((size_t) r * n_blocks);
+    for (int b = 0; b < n_blocks; ++b)
+        for (int m = 0; m < r; ++m) blk_cells[(size_t) b * r + m] = b * r + m;
+    ggml_backend_tensor_set(shared.blk_cells, blk_cells.data(), 0,
+                            blk_cells.size() * sizeof(int32_t));
+
+    // cell -> block, or 0 for a cell no complete block covers (the gather has to
+    // stay in range; the bias below is what actually rules those cells in or out)
+    std::vector<int32_t> cell_blk((size_t) n_kv, 0);
+    for (int j = 0; j < n_kv && j < n_valid; ++j) {
+        const int b = j / r;
+        if (b < n_blocks) cell_blk[(size_t) j] = b;
+    }
+    ggml_backend_tensor_set(shared.cell_blk, cell_blk.data(), 0, cell_blk.size() * sizeof(int32_t));
+
+    std::vector<float> bias((size_t) n_kv * n_tokens);
+    for (int i = 0; i < n_tokens; ++i) {
+        const int q = kv_pos + i;
+        // whatever follows the last complete block is always attended to, which
+        // is what lands the selection on block boundaries like the reference
+        const int tail_start = (q + 1) / r * r;
+        float * row = bias.data() + (size_t) i * n_kv;
+        for (int j = 0; j < n_kv; ++j) {
+            float v = -INFINITY;
+            if (j < n_valid && j <= q) {
+                // finite, so it can never meet a -inf and produce a nan
+                v = (j >= tail_start) ? 1e9f : (j / r < n_blocks ? 0.0f : -INFINITY);
+            }
+            row[j] = v;
+        }
+    }
+    ggml_backend_tensor_set(shared.bias, bias.data(), 0, bias.size() * sizeof(float));
+}
+
 // ---- qwen4exp PLE: n-gram hash embedding (one designated layer) ----
 //
 // `emb` is the gathered table rows, [n_embd, n_tokens], already dequantised on
@@ -1851,6 +2075,8 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
     // The PLE rows are gathered on the host and arrive as one plain input; the
     // graph never touches the table. Sized n_embd because ple_head_dim times
     // ple_n_heads is exactly the model width.
+    QsaShared qsa;
+
     ggml_tensor * inp_ple = nullptr;
     if (use_ple()) {
         inp_ple = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -1915,7 +2141,9 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
             Q = apply_rope(ctx, Q, inp_pos);
             K = apply_rope(ctx, K, inp_pos);
 
-            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, n_tokens, n_kv);
+            ggml_tensor * m = build_qsa_mask(ctx, gf, il, cur, inp_pos, inp_mask,
+                                             n_tokens, n_kv, n_past, qsa);
+            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, m, n_tokens, n_kv);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate));
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
         }
@@ -2712,6 +2940,7 @@ const std::vector<float> & Runtime::Impl::decode_reuse(int32_t token) {
     const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
     for (int j = 0; j < d_nkv; ++j) mask[j] = (j <= n_past) ? z : ninf;
     ggml_backend_tensor_set(inp_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    set_qsa_inputs(dgf, 1, d_nkv, n_past);
     auto pt_input = pnow();
 
     if (compute_graph(dgf) != GGML_STATUS_SUCCESS)
@@ -2912,7 +3141,9 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     // lands at n_past+tc0 and the causal mask covers n_kv_c columns, so a layer's
     // sub-chunks processed in order are equivalent to one full-chunk pass (GDN
     // states likewise chain across sub-chunks).
+    // one per seg A call: each builds its own graph, so nothing is shared across them
     auto build_segA = [&](ggml_context * ctx, ggml_cgraph * gf, int il, int tc0, int tlen) -> ggml_tensor * {
+        QsaShared qsa;
         auto tslice = [&](ggml_tensor * t) {   // token-dim slice view [ne0, tlen]
             return ggml_view_2d(ctx, t, t->ne[0], tlen, t->nb[1], (size_t) tc0 * t->nb[1]);
         };
@@ -2978,7 +3209,9 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il));
             Q = apply_rope(ctx, Q, inp_pos);
             K = apply_rope(ctx, K, inp_pos);
-            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, tlen, n_kv_c, n_past + tc0);
+            ggml_tensor * m = build_qsa_mask(ctx, gf, il, cur, inp_pos, inp_mask,
+                                             tlen, n_kv_c, n_past + tc0, qsa);
+            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, m, tlen, n_kv_c, n_past + tc0);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
         }
@@ -3096,6 +3329,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             }
             ggml_backend_tensor_set(im, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
         }
+        set_qsa_inputs(gf, tlen, n_past + tc0 + tlen, n_past + tc0);
     };
 
     // QWEN_PREFILL_STATS=1 logs, per (chunk,layer), the distinct-expert union and
@@ -3557,6 +3791,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     // normed FFN input / residual / router weights into the layer's parity carry,
     // and exposes `selected` (router top-k) for host readback. Returns selected.
     auto build_segA = [&](ggml_context * ctx, ggml_cgraph * gf, int il) -> ggml_tensor * {
+        QsaShared qsa;
         const bool recurrent = hp.is_recurrent(il);
         ggml_tensor * inp_pos = nullptr, * inp_mask = nullptr;
         if (!recurrent) {
@@ -3609,7 +3844,9 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il));
             Q = apply_rope(ctx, Q, inp_pos);
             K = apply_rope(ctx, K, inp_pos);
-            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, 1, n_kv);
+            ggml_tensor * m = build_qsa_mask(ctx, gf, il, cur, inp_pos, inp_mask,
+                                             1, n_kv, n_past, qsa);
+            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, m, 1, n_kv);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
         }
@@ -3667,6 +3904,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             for (int j = 0; j < n_kv; ++j) mask[j] = (j <= n_past) ? z : ninf;
             ggml_backend_tensor_set(im, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
         }
+        set_qsa_inputs(gf, 1, n_kv, n_past);
     };
     // Read back layer `il`'s router selection and make those experts resident.
     auto ensure_layer = [&](ggml_tensor * selected, int il) {
@@ -4350,6 +4588,9 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
             mask[(size_t) i * n_kv + j] = (j <= abs_i) ? z : ninf;
     }
     ggml_backend_tensor_set(inp_mask_t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    set_qsa_inputs(gf, n_tokens, n_kv, n_past);
+
+    const bool qsa_dbg = getenv("QWEN_QSA_DEBUG") != nullptr;
 
     // vision: upload the image embeddings for each override span
     for (size_t k = 0; k < embd_ovr.size(); ++k) {
@@ -4376,6 +4617,26 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     const int row = logits_t->ne[1] == 1 ? 0 : n_tokens - 1;
     const size_t off = (size_t) row * logits_t->nb[1];
     ggml_backend_tensor_get(logits_t, logits.data(), off, n_vocab * sizeof(float));
+    if (qsa_dbg) {
+        for (int il = 0; il < (int) model.hparams().n_layer; ++il) {
+            for (const char * tag : { "qsa_kraw_", "qsa_pool0_", "qsa_pooled_", "qsa_q_", "qsa_bias_", "qsa_topk_", "qsa_mask_" }) {
+                ggml_tensor * t = ggml_graph_get_tensor(gf, (std::string(tag) + std::to_string(il)).c_str());
+                if (!t) continue;
+                const int64_t w = t->ne[0];
+                std::vector<int32_t> row((size_t) w);
+                for (int64_t r = std::max<int64_t>(0, t->ne[1] - 3); r < t->ne[1]; ++r) {
+                    ggml_backend_tensor_get(t, row.data(), (size_t) r * w * 4, (size_t) w * 4);
+                    fprintf(stderr, "%s%d[%lld]:", tag, il, (long long) r);
+                    for (int64_t k = 0; k < std::min<int64_t>(22, w); ++k) {
+                        if (t->type == GGML_TYPE_I32) fprintf(stderr, " %d", row[(size_t) k]);
+                        else fprintf(stderr, " %.4g", *(float *) &row[(size_t) k]);
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+    }
+
     capture_main_hidden(gf, n_tokens - 1);
 
     // MTP batched prefill: append every token's final hidden (pre-output-norm)

@@ -14,6 +14,12 @@ rather than after a 67 GiB load.
 
     python tests/qwen4/make_tiny_model.py tests/qwen4/01-tiny/tiny-qwen4exp.gguf
 
+--qsa-ratio=1 makes every block one token wide. That removes the one thing about
+QSA the reference leaves undefined: when a token sits on a block boundary its
+budget covers a whole number of blocks plus one leftover cell, and which member
+of the last block that is comes down to how the sort breaks a tie. At ratio 1
+there are no members to tie, so the two engines must agree exactly.
+
 Pass --no-ple to leave the ple.* keys and tensors out entirely. Both engines
 treat that as "this model has no PLE", which isolates hyper-connections, GDN,
 attention and the MoE from the n-gram module while it is being brought up --
@@ -59,7 +65,11 @@ N_EXPERT  = 8
 N_USED    = 2
 FF_EXP    = 32
 
-IDX_HEAD  = 2
+# 8 rather than 2: the block score is a sum of relu'd per-head dot products, so
+# with few heads a random model scores many blocks at exactly 0. Ties there are
+# broken by the sort, which is implementation-defined and depends on how far the
+# reference pads its cache -- it would make the check disagree over nothing.
+IDX_HEAD  = 8
 IDX_DIM   = 16
 IDX_TOPK  = 8
 RATIO     = 2
@@ -122,6 +132,12 @@ def byte_alphabet():
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     with_ple = '--no-ple' not in sys.argv
+    # compress_ratios all zero = dense attention everywhere, which isolates the
+    # rest of the stack from QSA at any prompt length
+    ratio = 0 if '--no-qsa' in sys.argv else RATIO
+    for a in sys.argv[1:]:
+        if a.startswith('--qsa-ratio='):
+            ratio = int(a.split('=', 1)[1])
     out = args[0] if args else 'tiny-qwen4exp.gguf'
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     w = GGUFWriter(out, ARCH)
@@ -158,7 +174,7 @@ def main():
     w.add_key_value(ARCH + '.attention.indexer.key_length', IDX_DIM, GGUFValueType.UINT32)
     w.add_key_value(ARCH + '.attention.indexer.top_k', IDX_TOPK, GGUFValueType.UINT32)
     w.add_key_value(ARCH + '.attention.compress_ratios',
-                    [0 if is_recurrent(i) else RATIO for i in range(N_LAYER)],
+                    [0 if is_recurrent(i) else ratio for i in range(N_LAYER)],
                     GGUFValueType.ARRAY, sub_type=GGUFValueType.INT32)
 
     offsets, acc = [], 0
