@@ -861,7 +861,10 @@ void Runtime::Impl::plan_layers() {
     }
     if (total <= 0.0) { share[0] = 1.0; total = 1.0; }   // nothing to go on: all on primary
 
-    // Cumulative rounding, so the ranges tile [0, n_main) exactly.
+    // Cumulative rounding, so the ranges tile [0, n_main) exactly. Shares are
+    // relative, which means values that happen to add up to the layer count come
+    // back out as themselves: "36,4" on a 40-layer model gives exactly 36 and 4,
+    // with no special case for it.
     int start = 0;
     double cum = 0.0;
     for (size_t i = 0; i < gpus.size(); ++i) {
@@ -957,6 +960,9 @@ void Runtime::Impl::plan_pools() {
     pool_dev.assign((size_t) n_main, 0);
     for (int il = 0; il < n_main; ++il) pool_dev[(size_t) il] = dev_of(il);
     if (gpus.size() <= 1) return;
+    // Without expert offload there are no pools to place: the weights are all
+    // resident and a layer's experts are wherever its other weights are.
+    if (cfg.vram_budget_mb == 0 || !model.has_expert_tensors()) return;
 
     // Runs before the weights are placed (their placement depends on the answer),
     // so the surplus is budget minus the KV cache and the compute headroom, with
@@ -4154,28 +4160,17 @@ bool build_gpu_plan(const std::vector<int> & gpu_ids,
 {
     out.clear();
 
-    // --gpu-split is the switch. Without it, one GPU, exactly as before.
-    if (!split_given) {
-        if (gpu_ids.size() > 1 || vram_mb.size() > 1)
-            fprintf(stderr, "note: %zu GPU(s) named but --gpu-split was not given, so only GPU%d "
-                            "is used; pass --gpu-split to spread the model over several\n",
-                    std::max(gpu_ids.size(), vram_mb.size()),
-                    gpu_ids.empty() ? 0 : gpu_ids[0]);
-        // No device named either: the historical "first device that works".
-        if (gpu_ids.empty()) return true;
-        GpuPlan p;
-        p.device    = gpu_ids[0];
-        p.budget_mb = vram_mb.empty() ? 0 : vram_mb[0];
-        p.split     = -1.0f;
-        out.push_back(p);
-        return true;
-    }
+    // Nothing that names a device: the historical "first device that works".
+    // A lone --vram-budget belongs here too -- one budget has always meant one GPU.
+    if (gpu_ids.empty() && !split_given && vram_mb.size() <= 1) return true;
 
-    // An explicit share list fixes the device count; "auto" takes it from
-    // whatever else was named, or from every GPU present.
-    size_t n = gpu_split.size();
-    if (n == 0) n = std::max(gpu_ids.size(), vram_mb.size());
-    if (n == 0) n = gpu_devices().size();
+    // How many GPUs is whatever the user actually named. Naming two devices, or
+    // two budgets, IS the request for two GPUs; --gpu-split only says how to
+    // divide them, and defaults to the budgets (or free VRAM) when omitted.
+    size_t n = std::max(gpu_ids.size(), std::max(gpu_split.size(), vram_mb.size()));
+    // "--gpu-split auto" on its own means every GPU present.
+    if (n <= 1 && split_given && gpu_split.empty() && gpu_ids.empty() && vram_mb.empty())
+        n = gpu_devices().size();
     if (n == 0) return true;   // no GPU at all: caller falls back to the CPU
 
     // A single budget cannot be shared across GPUs -- each device has its own

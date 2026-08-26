@@ -478,7 +478,11 @@ int main(int argc, char ** argv) {
     int  n_ctx = 0;   // 0 = the model's trained context length (resolved after load)
     bool force_cpu = false;
     std::string host = "127.0.0.1";
-    size_t vram_budget_mb = 0;
+    size_t vram_budget_mb = 0;          // total across GPUs (gates expert offload)
+    std::vector<size_t> vram_list;      // --vram-budget, one entry per GPU
+    std::vector<int>    gpu_ids;        // --gpus
+    std::vector<float>  gpu_split;      // --gpu-split ("auto" leaves this empty)
+    bool gpu_split_given = false;
     std::string cache_profile;
     bool experts_ssd = false;
     bool reasoning_default = true;
@@ -500,14 +504,30 @@ int main(int argc, char ** argv) {
         else if (a == "--port" && i + 1 < argc) port = std::stoi(argv[++i]);
         else if (a == "--host" && i + 1 < argc) host = argv[++i];
         else if (a == "--n-ctx" && i + 1 < argc) n_ctx = std::stoi(argv[++i]);
+        else if (a == "--gpus" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (!parse_gpu_list(v, gpu_ids)) {
+                fprintf(stderr, "error: bad --gpus value: %s (expected e.g. 0 or 1,0 -- distinct device indices, primary first)\n", v.c_str());
+                return 1;
+            }
+        }
+        else if (a == "--gpu-split" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (!parse_gpu_split(v, gpu_split)) {
+                fprintf(stderr, "error: bad --gpu-split value: %s (expected auto, exact layer counts like 36,4, or a ratio like 0.9,0.1)\n", v.c_str());
+                return 1;
+            }
+            gpu_split_given = true;
+        }
         else if (a == "--vram-budget" && i + 1 < argc) {
             const std::string v = argv[++i];
             bool legacy = false;
-            vram_budget_mb = parse_vram_budget_mb(v, &legacy);
-            if (vram_budget_mb == 0) {
-                fprintf(stderr, "error: bad --vram-budget value: %s (expected e.g. 14, 13.5, 14G, 13500M)\n", v.c_str());
+            if (!parse_vram_budget_list(v, vram_list, &legacy)) {
+                fprintf(stderr, "error: bad --vram-budget value: %s (expected e.g. 14, 13.5, 14G, 13500M, or one per GPU: 13.5,5)\n", v.c_str());
                 return 1;
             }
+            vram_budget_mb = 0;
+            for (size_t k = 0; k < vram_list.size(); ++k) vram_budget_mb += vram_list[k];
             if (legacy)
                 fprintf(stderr, "note: --vram-budget %s read as %zu MB (%.1f GB); the unit is now GB, "
                                 "write %.1f or %sM to be explicit\n",
@@ -562,6 +582,17 @@ int main(int argc, char ** argv) {
             "  --n-ctx <N>         context length (default: the model's trained length)\n"
             "  --vram-budget <GB>  offload expert weights; keep non-expert on GPU\n"
             "                      GB, fractions ok (13.5); suffix M/G to be explicit (13500M)\n"
+            "                      one value per GPU to use several (e.g. 13.5,5)\n"
+            "  --gpus <list>       GPU device indices, primary first (e.g. 1, or 1,0).\n"
+            "                      Naming two devices -- here or via --vram-budget --\n"
+            "                      is what asks for two GPUs; without a --vram-budget\n"
+            "                      each one uses all the VRAM it has free.\n"
+            "  --gpu-split <spec>  each GPU's share of the layers (default: by\n"
+            "                      --vram-budget, or by free VRAM when that is omitted)\n"
+            "                      0.9,0.1 / 9,1 / 18,2 all mean the same ratio, and\n"
+            "                      36,4 gives exactly 36 and 4 on a 40-layer model.\n"
+            "                      A GPU given 0 holds no layers and becomes an\n"
+            "                      expert pool. auto = every GPU, share by free VRAM\n"
             "  --cache-profile <f> prefetch hot-expert profile (read-only on the server)\n"
             "  --experts-ssd       stream experts from the GGUF on SSD (no RAM copy)\n"
             "  --reasoning <on|off> default thinking mode (per-request override: \"reasoning\")\n"
@@ -654,11 +685,15 @@ int main(int argc, char ** argv) {
                 }
             }
             if (venc && vram_budget_mb > 0) {
+                // The tower is built on the primary device, so its VRAM comes
+                // out of the primary's budget, not the multi-GPU total.
                 const size_t vmb = (venc->gpu_bytes() + 1024 * 1024 - 1) / (1024 * 1024);
-                const size_t cut = std::min(vram_budget_mb, vmb);
+                size_t & primary = vram_list.empty() ? vram_budget_mb : vram_list[0];
+                const size_t cut = std::min(primary, vmb);
                 fprintf(stderr, "vision tower: %zu MB GPU; expert cache budget %zu -> %zu MB"
                                 " (--no-mmproj reclaims it for text-only runs)\n",
-                        vmb, vram_budget_mb, vram_budget_mb - cut);
+                        vmb, primary, primary - cut);
+                primary        -= cut;
                 vram_budget_mb -= cut;
             }
         }
@@ -667,6 +702,10 @@ int main(int argc, char ** argv) {
         cfg.n_ctx              = n_ctx;
         cfg.use_cuda           = !force_cpu;
         cfg.vram_budget_mb     = vram_budget_mb;
+        if (!build_gpu_plan(gpu_ids, gpu_split, gpu_split_given, vram_list, cfg.gpus)) return 1;
+        // Across GPUs vram_budget_mb only gates offload (each device's own budget
+        // comes from the plan), but on one GPU it IS the budget.
+        if (cfg.gpus.size() <= 1 && !vram_list.empty()) cfg.vram_budget_mb = vram_list[0];
         cfg.cache_profile      = cache_profile;
         cfg.cache_profile_save = false;   // server only reads the profile, never overwrites it
         cfg.experts_ssd        = experts_ssd;
