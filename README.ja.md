@@ -136,6 +136,7 @@ qw-cli -m model.gguf --info                  # モデル情報を表示して終
 | `--mmproj <gguf>` | vision tower の GGUF（省略時はモデルと同じフォルダの `mmproj-*.gguf` を自動発見） |
 | `--vision-test` | 画像を vision tower だけでエンコードして統計表示（数値検証用; LLM 不要） |
 | `--log-tokens-per-sec` | prefill / 生成の tok/s を表示 |
+| `--gpus <list>` / `--gpu-split <list>` | 複数 GPU を使う（[複数 GPU](#複数-gpu) 参照） |
 | `--cpu` | CPU バックエンドを強制 |
 
 ### エキスパート・オフロード（大きい MoE を限られた VRAM で）
@@ -177,6 +178,47 @@ prefill は **layer-major 実行**（層ごとにエキスパートを一度だ�
 - `--ssd-direct`: SSD 読みで OS のページキャッシュをバイパス（Windows, unbuffered I/O）。
   モデルが RAM に収まらない場合の実性能を測るとき・二重キャッシュを避けたいときに。
 
+### 複数 GPU
+
+**デバイスを複数指定すること自体が「複数 GPU を使う」という指示**になる。`--gpus` で並べても、
+`--vram-budget` を GPU ごとに与えてもよい。レイヤーは連続した範囲でデバイスに割り当てられ、
+あるレイヤーの重み・KV キャッシュ・エキスパートプールはすべて同じデバイスに置かれるので、
+バスをまたぐのはデバイス境界の隠れ状態だけ（1 トークンあたり数 KB）。
+
+```bash
+# 1 枚に載らないモデルを 2 枚で動かす（各 GPU の空き VRAM を全部使う）
+qw-cli -m big.gguf -p "..." --gpus 0,1
+
+# GPU ごとに予算を与えてエキスパート・オフロード
+qw-cli -m moe.gguf -p "..." --vram-budget 13.5,5
+
+# GPU1 はレイヤーを持たず、予算まるごとが GPU0 用のエキスパートプールになる
+qw-cli -m moe.gguf -p "..." --gpus 0,1 --vram-budget 8,5 --gpu-split 1,0
+```
+
+- `--gpus <list>`: デバイス番号を primary から順に（`1` や `1,0`）。**順序は ggml のもの、つまり
+  CUDA 既定の「速い順」で、`nvidia-smi` の PCI 順とは逆**。多くの場合 `--gpus 0` が速いカードになる。
+  起動ログに各デバイス名が出るのでそこで確認すること。
+- `--vram-budget <list>`: GPU ごとに 1 値。`auto` はそのデバイスの空き VRAM を全部使い、オフロード
+  しない。`0` はそのデバイスをプランから外すので、`--gpus 1,0 --vram-budget 5g,0` は
+  `--gpus 1 --vram-budget 5g` と同じ。フラグ自体を省略した場合は `auto` と同じ。
+- `--gpu-split <list>`: 各 GPU が持つレイヤーの割合。既定は `--vram-budget` の比、予算が無ければ
+  空き VRAM の比。値は相対比なので `0.9,0.1` / `9,1` / `18,2` はすべて同じ意味で、40 レイヤーの
+  モデルなら `36,4` はちょうど 36 と 4 になる。`0` を与えた GPU はレイヤーを持たないが、予算は
+  他 GPU 用の**エキスパートプール**として使われ、そのレイヤーのエキスパート行列積はそこで走る。
+  `auto` は存在する GPU をすべて使う。
+
+`--gpus` と `--vram-budget` の指定個数は一致していなければならず、`--vram-budget 0` で切った
+デバイスに `--gpu-split` で 0 以外の割り当てをすることもできない。どちらも推測せずエラーにする。
+同じフラグは `qw-server` でも使える。
+
+2 枚目の GPU は万能ではなくトレードオフである。VRAM は増える（常駐率が律速しているときはこれが
+効く）が、バッチ 1 では一度に 1 デバイスしか計算しないので、遅い 2 枚目は速い 1 枚目を待たせる。
+RTX 4060 Ti + RTX 3050、35B-A3B MoE での実測: エキスパートプールが本当に不足する予算では 2 枚が
+デコードで **+15%**（16.6 → 19.1 tok/s、ミス −64%）、プールが既に足りている予算では **−6%**。
+prefill は計算律速なのでどちらの場合も遅くなる。数値と考察は
+[issue #4](https://github.com/kishida/questwend/issues/4)。
+
 ### MTP 自己推測デコード（nextn ブロックを持つモデル）
 
 ```bash
@@ -208,6 +250,7 @@ qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15
 | `--port <N>` | ポート（既定 8080） |
 | `--n-ctx <N>` | コンテキスト長 |
 | `--vram-budget <GB>` / `--experts-ssd` | エキスパート・オフロード（GB、小数可。`M`/`G` で明示指定） |
+| `--gpus <list>` / `--gpu-split <list>` | 複数 GPU を使う（[複数 GPU](#複数-gpu) 参照） |
 | `--cache-profile <file>` | 常駐プロファイル（**サーバーは読み込みのみ**, 上書きしない） |
 | `--reasoning <on\|off>` | thinking モードの既定（UI のチェックにも反映） |
 | `--mtp` | MTP 自己推測デコード（nextn ブロックを持つモデル; 起動時に有効化） |

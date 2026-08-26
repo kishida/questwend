@@ -139,6 +139,7 @@ qw-cli -m model.gguf --info                  # print model info and exit
 | `--mmproj <gguf>` | vision tower GGUF (defaults to `mmproj-*.gguf` next to the model) |
 | `--vision-test` | encode the image with the vision tower only and print statistics (numerical checks; no LLM) |
 | `--log-tokens-per-sec` | print prefill / generation tok/s |
+| `--gpus <list>` / `--gpu-split <list>` | use several GPUs (see [Multiple GPUs](#multiple-gpus)) |
 | `--cpu` | force the CPU backend |
 
 ### Expert offloading (large MoE on limited VRAM)
@@ -184,6 +185,48 @@ knobs, all either lossy or behavior-changing (measurements in
 - `--ssd-direct`: bypass the OS page cache for SSD reads (Windows, unbuffered I/O). Use it to measure
   real performance when the model does not fit in RAM, or to avoid double caching.
 
+### Multiple GPUs
+
+Naming more than one device is what asks for more than one GPU — either with `--gpus`, or by
+giving `--vram-budget` one value per device. Layers are assigned in contiguous ranges, and a
+layer's weights, KV cache and expert pool all live on the same device, so the only traffic
+crossing the bus is the hidden state at a device boundary (a few KB per token).
+
+```bash
+# run a model that does not fit one card: both GPUs, all their free VRAM
+qw-cli -m big.gguf -p "..." --gpus 0,1
+
+# expert offloading with a budget per GPU
+qw-cli -m moe.gguf -p "..." --vram-budget 13.5,5
+
+# GPU1 holds no layers: its whole budget becomes expert pool for GPU0
+qw-cli -m moe.gguf -p "..." --gpus 0,1 --vram-budget 8,5 --gpu-split 1,0
+```
+
+- `--gpus <list>`: device indices, primary first (`1`, or `1,0`). **The order is ggml's, which is
+  CUDA's default "fastest first" — the reverse of `nvidia-smi`'s PCI order**, so `--gpus 0` is
+  usually the faster card. The startup log prints each device's name; check it there.
+- `--vram-budget <list>`: one value per GPU. `auto` gives that device all its free VRAM and does not
+  offload; `0` removes the device from the plan entirely, so `--gpus 1,0 --vram-budget 5g,0` is the
+  same as `--gpus 1 --vram-budget 5g`. Omitting the flag is the same as `auto`.
+- `--gpu-split <list>`: each GPU's share of the layers; defaults to the `--vram-budget` ratio, or to
+  free VRAM when no budget is given. Shares are relative, so `0.9,0.1`, `9,1` and `18,2` all mean the
+  same thing, and on a 40-layer model `36,4` gives exactly 36 and 4. A GPU given `0` holds no layers
+  but keeps its budget as **expert pool** for the others, and runs those layers' expert matmuls.
+  `auto` uses every GPU present.
+
+`--gpus` and `--vram-budget` must name the same number of devices, and a device switched off with
+`--vram-budget 0` cannot be given a non-zero `--gpu-split` share; both are errors rather than
+guesses. The same flags work on `qw-server`.
+
+A second GPU is a trade, not a free win. It adds VRAM — which is what matters when residency is the
+bottleneck — but at batch 1 only one device computes at a time, so a slower second card holds the
+faster one up. Measured on an RTX 4060 Ti + RTX 3050 with a 35B-A3B MoE: with a tight budget where
+the expert pool is genuinely binding, two GPUs are **+15%** on decode (16.6 → 19.1 tok/s, misses
+−64%); with a budget where the pool already fits the working set they are **−6%**, and prefill is
+slower in both cases because it is compute-bound. Numbers and analysis in
+[issue #4](https://github.com/kishida/questwend/issues/4).
+
 ### MTP self-speculative decoding (models with a nextn block)
 
 ```bash
@@ -215,6 +258,7 @@ Open `http://<host>:<port>/` for the chat UI (shows TTFT / tok/s / prefill tok/s
 | `--port <N>` | port (default 8080) |
 | `--n-ctx <N>` | context length |
 | `--vram-budget <GB>` / `--experts-ssd` | expert offloading (GB, fractions ok; `M`/`G` suffix to be explicit) |
+| `--gpus <list>` / `--gpu-split <list>` | use several GPUs (see [Multiple GPUs](#multiple-gpus)) |
 | `--cache-profile <file>` | residency profile (**the server only reads it**, never overwrites) |
 | `--reasoning <on\|off>` | default thinking mode (also reflected in the UI checkbox) |
 | `--mtp` | MTP self-speculative decoding (models with a nextn block; enabled at startup) |
