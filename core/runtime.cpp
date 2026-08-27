@@ -1670,15 +1670,32 @@ ggml_tensor * Runtime::Impl::build_qsa_mask(ggml_context * ctx, ggml_cgraph * gf
     const int idx_dim = (int) hp.indexer_head_dim;
     const int n_idx_h = (int) hp.indexer_n_head;
     const int width   = std::min(n_kv, (int) hp.indexer_top_k + r - 1);
-    const int n_valid = kv_pos + n_tokens;      // cells 0..n_valid-1 hold tokens
-    const int n_blocks = n_valid / r;           // whole blocks only; the rest is tail
+    // Blocks cover the graph's whole cache width, not just what is cached right
+    // now. A persistent decode graph is built once per KV bucket and reused for
+    // up to KV_BUCKET more tokens, so a count frozen at build time would leave
+    // every later cell in no block at all -- including the token being decoded,
+    // whose own row would then be selected from stale blocks only. Cells that
+    // hold nothing yet are ruled out by the host-side bias instead, and their
+    // keys read as zero because the indexer cache is cleared with the KV cache.
+    // For a one-shot graph n_kv is exactly what is cached, so this is the same
+    // count as before.
+    const int n_blocks = n_kv / r;              // whole blocks only; the rest is tail
 
     // this token's raw indexer key, straight into the cache
     ggml_tensor * k_raw = ggml_mul_mat(ctx, W("blk.%d.indexer.k_proj.weight", il), cur);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, k_raw,
-            ggml_view_2d(ctx, idx_k_cache[il], idx_dim, n_tokens,
-                         idx_k_cache[il]->nb[1],
-                         (size_t) kv_pos * idx_k_cache[il]->nb[1])));
+    if (persistent) {
+        // Same reason build_attn writes K/V through an index input: this graph is
+        // built once per KV bucket and replayed, so a write offset baked in at
+        // build time would send every token of the bucket to the first token's
+        // cell -- losing their keys and corrupting the block they pool into.
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, idx_k_cache[il],
+                ggml_reshape_2d(ctx, k_raw, idx_dim, n_tokens), d_kvidx));
+    } else {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, k_raw,
+                ggml_view_2d(ctx, idx_k_cache[il], idx_dim, n_tokens,
+                             idx_k_cache[il]->nb[1],
+                             (size_t) kv_pos * idx_k_cache[il]->nb[1])));
+    }
 
     if (width >= n_kv || n_blocks == 0) return mask;   // the budget covers everything
 
@@ -2678,6 +2695,11 @@ void Runtime::Impl::decode_verify(const std::vector<int32_t> & toks) {
         for (int j = 0; j < v_nkv; ++j) mask[(size_t) i * v_nkv + j] = (j <= abs_i) ? z : ninf;
     }
     ggml_backend_tensor_set(inp_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    // No released model has both an MTP block and QSA, so this graph has never
+    // had QSA nodes in it -- but leaving the inputs unfilled is what made the
+    // fast decode graph read a garbage cell -> block table and crash, so fill
+    // them here too rather than leave the same hole open.
+    set_qsa_inputs(v_gf, n_tokens, v_nkv, n_past);
 
     if (compute_graph(v_gf) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("decode_verify: compute failed");
@@ -4277,6 +4299,11 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
     for (int j = 0; j < f_nkv; ++j) mask[j] = (j <= n_past) ? z : ninf;
     ggml_backend_tensor_set(inp_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    // QSA selection inputs. Not optional: once the cache passes
+    // indexer_top_k + ratio - 1 the graph grows the indexer nodes, and they read
+    // whatever the buffer held -- a garbage cell -> block table indexes the
+    // gather out of bounds and the run dies in ggml_get_rows.
+    set_qsa_inputs(f_gf, 1, f_nkv, n_past);
 
     // refresh the in-graph remap table from current residency
     auto fill_g2s = [&]() {

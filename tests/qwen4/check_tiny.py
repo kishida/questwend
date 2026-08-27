@@ -208,6 +208,66 @@ def check_offload():
     return failures
 
 
+# QSA past its dense threshold, through the graphs that are built once and then
+# replayed. This one needs no llama.cpp reference: qwencpp's own per-token graph
+# is the reference, because it is rebuilt at the current cache length and so can
+# hold neither a stale block count nor a stale write offset. Every graph that is
+# reused has to land on the same bytes.
+#
+# The prompt is longer than indexer_top_k + compress_ratio - 1 = 9, so the
+# selection is live from the first generated token, and the run is long enough to
+# cross several KV buckets (KV_BUCKET = 32) -- a graph built at one cache length
+# being asked to serve another is exactly what these paths get wrong.
+QSA_DECODE_PROMPT = 'Hello world, this is'
+QSA_DECODE_N = 64
+
+
+def check_qsa_decode():
+    """Reused decode graphs must match the per-token graph while QSA is sparse."""
+    base = ['-m', gguf('nople'), '-p', QSA_DECODE_PROMPT,
+            '-n', str(QSA_DECODE_N), '--temp', '0', '--n-ctx', '512']
+    cuda_env = dict(os.environ, QWEN_NO_FLASH='1')
+    # (label, exe, extra args, env for the per-token reference, candidates)
+    #
+    # --resident-decode is lossy on a model whose experts do not all fit in VRAM;
+    # this one's do, so its mask excludes nothing and it must match exactly too.
+    groups = [
+        ('cpu', QW_CLI, ['--cpu'],
+         dict(os.environ, QWEN_NO_REUSE='1'),
+         [('reuse-graph', dict(os.environ))]),
+    ]
+    if os.path.exists(QW_CLI_CUDA):
+        groups.append(
+            ('offload', QW_CLI_CUDA, ['--gpus', '0', '--vram-budget', '2', '--experts-ssd'],
+             cuda_env,
+             [('fastcache',       dict(cuda_env, QWEN_FASTCACHE='1')),
+              ('resident-decode', dict(cuda_env, QWEN_RESIDENT_DECODE='1'))]))
+
+    failures = []
+    for label, exe, extra, ref_env, cands in groups:
+        print('==== qsa-decode-' + label +
+              '  (reused decode graph vs the per-token graph, QSA sparse) ====',
+              flush=True)
+        ref = generation([exe] + base + extra, env=ref_env)
+        for name, env in cands:
+            # not check=True: the failure this covers used to be a crash (an
+            # unwritten cell -> block table sends the indexer gather out of
+            # bounds), and a crash should read as FAIL, not stop the suite
+            r = subprocess.run([exe] + base + extra, env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            ours = r.stdout
+            ok = r.returncode == 0 and ours == ref
+            print('  %-16s %s%s' % (name, 'ok' if ok else 'FAIL',
+                                    '' if r.returncode == 0 else
+                                    '  (exit %d)' % r.returncode))
+            if not ok:
+                print('    ref  ' + repr(ref[-QSA_DECODE_N:]))
+                print('    ours ' + repr(ours[-QSA_DECODE_N:]))
+                failures.append('qsa-decode-' + label + ':' + name)
+        print()
+    return failures
+
+
 def main():
     generate_models()
     if '--rebuild-ref' in sys.argv:
@@ -251,6 +311,7 @@ def main():
         print()
 
     failures += check_offload()
+    failures += check_qsa_decode()
     failures += check_generation()
 
     if failures:

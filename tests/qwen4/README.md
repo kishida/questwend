@@ -88,6 +88,7 @@ python tests/qwen4/check_tiny.py
 | `qsa-20tok` | QSA（compress ratio 2、ブロック平均あり） | argmax 一致（下記の理由で数値一致は不可能） |
 | `offload` / `offload-ssd` | expert-offload 経路（segA/segB）が広い残差と PLE を運べるか | 一致（0.169%） |
 | `ple-gen` / `nople-gen` / `ple-ssd-gen` | デコード間の状態引き継ぎ | 一致（4 プロンプト × 8 トークン貪欲生成） |
+| `qsa-decode-cpu` / `qsa-decode-offload` | 使い回すデコードグラフが QSA sparse で毎トークン再構築グラフと一致するか | 一致（64 トークン、バイト単位） |
 
 ### QSA が ratio 2 で厳密一致しない理由（実装バグではない）
 
@@ -304,6 +305,36 @@ python tests/qwen4/check_weights.py ~/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001
 |---|---|
 | logits が NaN / 出力が同じトークンの連打 | `QWEN_NAN_CHECK=1`（オフロード経路のみ）と `check_weights.py` |
 | 2051 トークンを超えると出力が崩れる | QSA。`.*indexer_.*` を `QWEN_QSA_DEBUG=1` と突き合わせる |
+
+### 永続デコードグラフと QSA（issue #5）
+
+デコードのグラフは KV バケット（32 トークン）ごとにしか作り直さない。QSA が
+sparse に入るとこれが 3 通りに壊れていた（2026-08-28 修正、`check_qsa_decode`）:
+
+- `decode_cached_fast()`（`--resident-decode` / `QWEN_FASTCACHE`）が
+  `set_qsa_inputs()` を呼んでいなかった。cell→block テーブルが未初期化のまま
+  gather に入り、**アクセス違反で落ちる**。dense の間はそのノードが存在しないので
+  閾値（実物なら 2051 トークン）を越えた瞬間に出る。
+- ブロック数がビルド時のキャッシュ長で固定されていた。バケットの残り 31 トークンが
+  どのブロックにも属さず、**デコード中のトークン自身まで選択から外れる**。
+- indexer キーの書き込み先がビルド時の位置で固定されていた。K/V は `inp_kvidx` で
+  動的に書いているのに QSA だけ静的 view で、バケット内の全トークンが同じセルを
+  上書きしていた。
+
+後ろ 2 つは `--resident-decode` を使わない常駐パス（`decode_reuse`）にもあった。
+落ちないので気付きにくい。`QWEN_NO_REUSE=1` を付けると毎トークン組み直すグラフに
+なるので、**永続グラフを疑ったらまずこれと出力を比べる**（一致するのが正しい）。
+
+実重み（IQ1_S / 4060 Ti / HDD / `--experts-ssd --ngram disk --resident-decode`）でも
+2138 トークン（閾値 2051 の直上）のプロンプトで確認:
+
+```
+[prefill: 2138 tok in 936.130s = 2.3 tok/s | gen: 24 tok in 2.913s = 8.2 tok/s]
+expert cache stats: 3172311 accesses, 98.1% hit, 59031 misses, 54982 evictions
+```
+
+デコードは全トークンが閾値の上（`n_past` 2138→2162）、つまり修正前に落ちていた
+まさにその領域で、破綻せず README の続きを書いた。
 | 起動が遅い | 常駐パスは全重みを読む。Q4_K_XL なら 100 GB 超 |
 
 ## 参照キャプチャ手順
