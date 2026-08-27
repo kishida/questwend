@@ -1,0 +1,243 @@
+name: release
+
+on:
+  push:
+    tags:
+      # Build numbers, not versions: b001, b002, ...
+      - 'b[0-9]*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Windows: version string that Jimver/cuda-toolkit knows about.
+  CUDA_WIN_VERSION: '12.9.2'
+  # Linux: NVIDIA apt package suffix, and where those packages land.
+  CUDA_APT_VERSION: '12-9'
+  CUDA_APT_DIR: '/usr/local/cuda-12.9'
+  # 75-virtual keeps a PTX fallback, so A100 (8.0), Hopper (9.0) and anything
+  # newer than what we list still run via driver JIT. The -real entries are the
+  # GPUs we ship SASS for. 121a is GB10 (DGX Spark) and needs CUDA >= 12.9.
+  CUDA_ARCHS: '75-virtual;86-real;89-real;120a-real;121a-real'
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # windows-latest is windows-2025-vs2026 now, and CUDA's host_config.h
+          # only accepts Visual Studio 2017..2022 -- nvcc refuses MSVC 14.5x
+          # before it compiles a single line. Pin to the VS 2022 image, which is
+          # also what llama.cpp does for its CUDA release builds. Vulkan and CPU
+          # do not need it, but sharing one MSVC keeps every Windows artifact on
+          # the same VC++ redistributable.
+          - name: win-cuda-x64
+            runner: windows-2022
+            backend: cuda
+            flags: -DQW_CUDA=ON
+          - name: win-vulkan-x64
+            runner: windows-2022
+            backend: vulkan
+            flags: -DQW_VULKAN=ON
+          - name: win-cpu-x64
+            runner: windows-2022
+            backend: cpu
+            flags: ''
+
+          - name: linux-cuda-x64
+            runner: ubuntu-22.04
+            backend: cuda
+            flags: -DQW_CUDA=ON -DBUILD_SHARED_LIBS=OFF
+          - name: linux-vulkan-x64
+            runner: ubuntu-22.04
+            backend: vulkan
+            flags: -DQW_VULKAN=ON -DBUILD_SHARED_LIBS=OFF
+          - name: linux-cpu-x64
+            runner: ubuntu-22.04
+            backend: cpu
+            flags: -DBUILD_SHARED_LIBS=OFF
+
+          # GB10 / DGX Spark is aarch64, so an x86_64 CUDA build never reaches
+          # it. sm_121 is the only NVIDIA GPU shipping in an arm64 box worth
+          # targeting, hence the trimmed arch list.
+          - name: linux-cuda-arm64
+            runner: ubuntu-22.04-arm
+            backend: cuda
+            flags: -DQW_CUDA=ON -DBUILD_SHARED_LIBS=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
+            cuda_archs: '121a-real'
+          - name: linux-cpu-arm64
+            runner: ubuntu-22.04-arm
+            backend: cpu
+            flags: -DBUILD_SHARED_LIBS=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
+
+          - name: macos-metal-arm64
+            runner: macos-14
+            backend: metal
+            flags: -DQW_METAL=ON -DBUILD_SHARED_LIBS=OFF
+          - name: macos-cpu-arm64
+            runner: macos-14
+            backend: cpu
+            flags: -DBUILD_SHARED_LIBS=OFF
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # ccache-action installs ccache with brew on macOS, and the runner image
+      # ships an aws/tap that Homebrew no longer trusts -- every brew command
+      # then prints a wall of trust warnings. We use nothing from that tap.
+      - name: Drop untrusted Homebrew taps
+        if: runner.os == 'macOS'
+        run: brew untap aws/tap || true
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.23
+        with:
+          key: ${{ matrix.name }}
+          max-size: 2G
+
+      # ---- toolchains -----------------------------------------------------
+
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Ninja (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ninja -y --no-progress
+
+      - name: Install CUDA (Windows)
+        if: runner.os == 'Windows' && matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: ${{ env.CUDA_WIN_VERSION }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
+
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows' && matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          curl.exe -L -o "$env:RUNNER_TEMP\vulkan_sdk.exe" https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe
+          & "$env:RUNNER_TEMP\vulkan_sdk.exe" --root C:\VulkanSDK --accept-licenses --default-answer --confirm-command install
+          "VULKAN_SDK=C:\VulkanSDK" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "C:\VulkanSDK\Bin"        | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install CUDA (Linux)
+        if: runner.os == 'Linux' && matrix.backend == 'cuda'
+        run: |
+          # sbsa is the aarch64 flavour of the CUDA repo.
+          if [ "${{ runner.arch }}" = "ARM64" ]; then repo=sbsa; else repo=x86_64; fi
+          curl -fsSLO "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${repo}/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          # ggml-cuda needs nvcc, the cudart headers and cuBLAS -- nothing else.
+          sudo apt-get install -y --no-install-recommends \
+            "cuda-nvcc-${CUDA_APT_VERSION}" \
+            "cuda-cudart-dev-${CUDA_APT_VERSION}" \
+            "libcublas-dev-${CUDA_APT_VERSION}"
+          echo "CUDA_PATH=${CUDA_APT_DIR}" >> "$GITHUB_ENV"
+          echo "${CUDA_APT_DIR}/bin"       >> "$GITHUB_PATH"
+
+      - name: Install Vulkan SDK (Linux)
+        if: runner.os == 'Linux' && matrix.backend == 'vulkan'
+        run: |
+          curl -fsSL https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
+          sudo curl -fsSL -o /etc/apt/sources.list.d/lunarg-vulkan-jammy.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
+
+      # ---- build ----------------------------------------------------------
+
+      - name: Configure
+        run: |
+          archs="${{ matrix.cuda_archs || env.CUDA_ARCHS }}"
+          # GGML_NATIVE=OFF is not optional: the runners are AVX-512 Xeons and
+          # a native build would crash on every older CPU.
+          args=(-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF ${{ matrix.flags }})
+          if [ "${{ matrix.backend }}" = "cuda" ]; then
+            args+=("-DCMAKE_CUDA_ARCHITECTURES=${archs}")
+          fi
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            args+=(-G Ninja)
+          fi
+          cmake -B build "${args[@]}"
+
+      - name: Build
+        run: |
+          jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+          cmake --build build --config Release -j "$jobs" --target qw-cli qw-server
+
+      # ---- package --------------------------------------------------------
+
+      - name: Package
+        run: |
+          out="questwend-${{ matrix.name }}-${GITHUB_REF_NAME}"
+          mkdir -p "dist/${out}"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # ggml is built shared on Windows; the CMakeLists copies its DLLs
+            # next to the executables after linking, so take them from there.
+            cp build/qw-cli.exe build/qw-server.exe build/*.dll "dist/${out}/"
+          else
+            cp build/qw-cli build/qw-server "dist/${out}/"
+          fi
+          cp README.md README.ja.md "dist/${out}/"
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "${out}.zip" "${out}" > /dev/null
+          else
+            tar czf "${out}.tar.gz" "${out}"
+          fi
+
+      # Shipped once, separately: ~750 MB uncompressed, and it does not change
+      # between questwend releases. Only needed by people without a CUDA
+      # install; the NVIDIA driver is still required either way.
+      - name: Package CUDA runtime DLLs
+        if: matrix.name == 'win-cuda-x64'
+        run: |
+          cuda=$(cygpath -u "$CUDA_PATH")
+          mkdir -p dist/cudart-win-x64
+          # CUDA 12 keeps these in bin/, CUDA 13 moved them to bin/x64.
+          for d in "$cuda/bin" "$cuda/bin/x64"; do
+            for f in cudart64_*.dll cublas64_*.dll cublasLt64_*.dll; do
+              cp "$d"/$f dist/cudart-win-x64/ 2>/dev/null || true
+            done
+          done
+          # fail loudly rather than shipping an empty zip
+          ls dist/cudart-win-x64/cudart64_*.dll > /dev/null
+          cd dist
+          7z a "cudart-win-x64-cu${CUDA_WIN_VERSION}.zip" cudart-win-x64 > /dev/null
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          name: QuestWend ${{ github.ref_name }}
+          # Flip to false once a tag has been through this end to end.
+          draft: true
+          generate_release_notes: true
+          files: dist/*
