@@ -46,6 +46,7 @@ add_subdirectory(third_party/ggml)
 
 # ---- core engine library ----
 add_library(questwend_core STATIC
+    core/args.cpp
     core/gguf_util.cpp
     core/model.cpp
     core/tokenizer.cpp

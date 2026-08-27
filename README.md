@@ -144,23 +144,36 @@ qw-cli -m model.gguf --info                  # print model info and exit
 
 ### Expert offloading (large MoE on limited VRAM)
 
-```bash
-# RAM tier: non-expert weights on the GPU, experts in pinned host RAM,
-#           streamed through the dynamic VRAM cache (PCIe)
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15
+**Automatic by default.** With no options at all the runtime measures what the device has
+free and streams whatever does not fit -- the routed experts -- straight from the GGUF on
+disk. The typical case, a model larger than the machine's memory, needs no flags.
 
-# SSD tier: experts read straight from the GGUF on disk (no RAM copy)
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 12 --experts-ssd
+```bash
+# automatic: resident if the weights fit the free VRAM, SSD tier if they do not
+qw-cli -m moe.gguf -p "..." -n 128
+
+# an explicit budget (leave VRAM for other processes, divide it across GPUs, ...)
+qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 12
+
+# RAM tier: experts in pinned host RAM, streamed through the VRAM cache (PCIe)
+qw-cli -m moe.gguf -p "..." -n 128 --experts-ram
 
 # residency profile: saved on the first run, then hot experts are preloaded at startup
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15 --cache-profile hot.prof
+qw-cli -m moe.gguf -p "..." -n 128 --cache-profile hot.prof
 ```
 
-- `--vram-budget <GB>`: VRAM budget for the slot pools (offloading is enabled when > 0).
+- `--vram-budget <GB>`: VRAM the model may use. **Omit it and the device's free memory is
+  measured instead.** Weights + KV cache + compute headroom that fit inside the budget stay
+  fully resident; only what does not fit moves to the expert tier (the decision is logged
+  at startup).
   The unit is **GB** and fractions work (`13.5`); an explicit `M`/`G` suffix always wins
   (`13500M`, `14G`). A bare number of 512 or more is read as MB, so command lines written
   before the unit changed keep working (with a note pointing at the GB spelling).
-- `--experts-ssd`: stream experts from disk (for models too large for RAM).
+- `--experts-ssd`: read the experts straight from the GGUF on disk (no RAM copy). **The
+  default tier**, so it rarely needs passing: the pages a run touches end up in the OS page
+  cache anyway, which makes a separate RAM copy of them mostly redundant.
+- `--experts-ram`: hold them in pinned host RAM instead. Worth it when they fit and the
+  drive is slow. Passing it together with `--experts-ssd` is an error.
 - `--ngram <off|disk|ram>`: where qwen4exp keeps its n-gram embedding table (default `disk`).
   It is 26.8 GB in Qwen3.8-Flash-Next and **never goes on the GPU in any mode**.
   `off` skips the module entirely -- it is a gated additive branch onto the residual,
@@ -210,8 +223,8 @@ qw-cli -m moe.gguf -p "..." --gpus 0,1 --vram-budget 8,5 --gpu-split 1,0
 - `--gpus <list>`: device indices, primary first (`1`, or `1,0`). **The order is ggml's, which is
   CUDA's default "fastest first" — the reverse of `nvidia-smi`'s PCI order**, so `--gpus 0` is
   usually the faster card. The startup log prints each device's name; check it there.
-- `--vram-budget <list>`: one value per GPU. `auto` gives that device all its free VRAM and does not
-  offload; `0` removes the device from the plan entirely, so `--gpus 1,0 --vram-budget 5g,0` is the
+- `--vram-budget <list>`: one value per GPU. `auto` gives that device all its free VRAM (what
+  omitting the flag already does); `0` removes the device from the plan entirely, so `--gpus 1,0 --vram-budget 5g,0` is the
   same as `--gpus 1 --vram-budget 5g`. Omitting the flag is the same as `auto`.
 - `--gpu-split <list>`: each GPU's share of the layers; defaults to the `--vram-budget` ratio, or to
   free VRAM when no budget is given. Shares are relative, so `0.9,0.1`, `9,1` and `18,2` all mean the
@@ -261,7 +274,8 @@ Open `http://<host>:<port>/` for the chat UI (shows TTFT / tok/s / prefill tok/s
 | `--host <addr>` | bind address (default `127.0.0.1`; use `0.0.0.0` to expose on the LAN) |
 | `--port <N>` | port (default 8080) |
 | `--n-ctx <N>` | context length |
-| `--vram-budget <GB>` / `--experts-ssd` | expert offloading (GB, fractions ok; `M`/`G` suffix to be explicit) |
+| `--vram-budget <GB>` | VRAM the model may use (default: whatever the device has free; GB, fractions ok, `M`/`G` suffix to be explicit) |
+| `--experts-ssd` / `--experts-ram` | where offloaded experts live (SSD by default; passing both is an error) |
 | `--gpus <list>` / `--gpu-split <list>` | use several GPUs (see [Multiple GPUs](#multiple-gpus)) |
 | `--cache-profile <file>` | residency profile (**the server only reads it**, never overwrites) |
 | `--reasoning <on\|off>` | default thinking mode (also reflected in the UI checkbox) |
@@ -343,7 +357,7 @@ For models split as `model-00001-of-00003.gguf`, pass the **first shard** to `-m
 shards are discovered and merged automatically (5-digit zero-padded naming, starting at 00001).
 
 ```bash
-qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40 --experts-ssd
+qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40
 ```
 
 ---

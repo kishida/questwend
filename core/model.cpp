@@ -65,6 +65,13 @@ bool Model::is_offloaded_expert(const std::string & name) const {
     return true;
 }
 
+size_t Model::offloaded_expert_bytes() const {
+    size_t n = 0;
+    for (auto & kv : tensors_)
+        if (is_offloaded_expert(kv.first)) n += ggml_nbytes(kv.second);
+    return n;
+}
+
 Model::~Model() {
     if (embd_buf_)    ggml_backend_buffer_free(embd_buf_);
     if (embd_ctx_)    ggml_free(embd_ctx_);
@@ -91,15 +98,30 @@ static bool backend_supports_get_rows(ggml_backend_t backend, const ggml_tensor 
 }
 
 // Quantized token embedding needs a get_rows-friendly copy only when the
-// backend has no native kernel for the stored type.
-static bool need_embd_fallback(ggml_backend_t backend, const ggml_tensor * te) {
+// backend has no native kernel for the stored type. `verbose` is off for the
+// weight_bytes() estimate, which asks the same question before loading and
+// should not narrate the answer a second time.
+static bool need_embd_fallback(ggml_backend_t backend, const ggml_tensor * te,
+                               bool verbose = true) {
     if (!te || te->type == GGML_TYPE_F32 || te->type == GGML_TYPE_F16) return false;
     if (backend_supports_get_rows(backend, te)) {
-        fprintf(stderr, "token_embd: %s natively supported by backend get_rows (no fallback copy)\n",
-                ggml_type_name(te->type));
+        if (verbose)
+            fprintf(stderr, "token_embd: %s natively supported by backend get_rows (no fallback copy)\n",
+                    ggml_type_name(te->type));
         return false;
     }
     return true;
+}
+
+size_t Model::weight_bytes(ggml_backend_t backend) const {
+    size_t n = 0;
+    for (auto & kv : tensors_) n += ggml_nbytes(kv.second);
+    // The get_rows fallback copy is an extra resident tensor, not a replacement:
+    // load_weights_* keeps the quantized original for the output head.
+    ggml_tensor * te = tensor("token_embd.weight");
+    if (backend && need_embd_fallback(backend, te, /*verbose=*/false))
+        n += ggml_row_size(embd_q8_ ? GGML_TYPE_Q8_0 : GGML_TYPE_F16, te->ne[0]) * te->ne[1];
+    return n;
 }
 
 ggml_backend_buffer * Model::load_weights(ggml_backend_t backend) {

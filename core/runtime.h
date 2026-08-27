@@ -42,18 +42,29 @@ struct GpuPlan {
     float  split     = -1.0f;              // compute-layer share; < 0 = auto (by budget)
 };
 
+// Where a MoE model's routed experts live once they no longer fit in VRAM.
+// SSD is the default tier: the pages the run actually touches end up in the
+// OS page cache anyway, so a RAM copy of the same weights mostly buys a second
+// copy of them -- and it is the tier that lets a model larger than memory run
+// at all. RAM is worth asking for when the experts do fit in host memory and
+// the drive is slow (see docs/, --experts-ram).
+enum class ExpertTier { Ssd, Ram };
+
 struct RuntimeConfig {
     int    n_ctx          = 4096;
     int    n_threads      = 0;       // 0 = auto
     bool   use_cuda       = true;    // try a GPU device first, fall back to CPU
-    size_t vram_budget_mb = 0;       // >0: offload expert weights to CPU,
-                                     //     enables running large MoE models with limited VRAM
+    // VRAM the model may use, in MB. 0 = auto: ask each device what it has
+    // free. Either way it is a capacity, not a mode switch -- a model whose
+    // weights fit inside it stays fully resident, and one that does not
+    // offloads its routed experts to `expert_tier`.
+    size_t vram_budget_mb = 0;
     // Multi-GPU plan. Empty = use the first GPU device only (single-GPU
     // behavior, with vram_budget_mb as its budget).
     std::vector<GpuPlan> gpus;
     std::string cache_profile;       // file to persist/prefetch the hot-expert profile
     bool   cache_profile_save = true; // false: load/prefetch only, never overwrite the profile
-    bool   experts_ssd    = false;   // stream experts from the GGUF on SSD (no RAM copy)
+    ExpertTier expert_tier = ExpertTier::Ssd;   // tier used when the experts must leave VRAM
     bool   use_mtp        = false;   // MTP self-speculative decode (keeps nextn block VRAM-resident)
     bool   embd_q8        = false;   // use Q8_0 (not F16) for token embedding fallback (saves VRAM)
 
@@ -83,12 +94,12 @@ size_t parse_vram_budget_mb(const std::string & arg, bool * legacy_mb = nullptr)
 // untouched) when a field does not parse, so the caller can print the offending
 // argument and exit.
 //   --vram-budget "13.5,5"  -> one budget per device, each parsed as above.
-//                              "auto" gives that device all its free VRAM and,
-//                              contributing nothing to the total that gates
-//                              expert offload, makes "auto" alone identical to
-//                              passing nothing. "0" instead turns the device
-//                              OFF: "--gpus 1,0 --vram-budget 5g,0" is the same
-//                              as "--gpus 1 --vram-budget 5g".
+//                              "auto" gives that device all its free VRAM,
+//                              which is what the flag's absence already means,
+//                              so "auto" alone is identical to passing nothing.
+//                              "0" instead turns the device OFF: "--gpus 1,0
+//                              --vram-budget 5g,0" is the same as "--gpus 1
+//                              --vram-budget 5g".
 //   --gpus        "1,0"     -> device indices into gpu_devices(), primary first
 //   --gpu-split   "0.8,0"   -> compute-layer share per device (0 = expert pool)
 //                  "auto"   -> share by --vram-budget, or by free VRAM without it

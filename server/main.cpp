@@ -9,6 +9,7 @@
 #include "sampler.h"
 #include "chat.h"
 #include "vision.h"
+#include "args.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -462,182 +463,72 @@ function showStats(el, t){
 </html>
 )HTML";
 
-// CLI aliases for the offload tuning knobs (the runtime reads them as QWEN_*
-// env vars; the flag and the env var are equivalent, the flag wins if both).
-static void set_knob(const char * env, const char * val) {
-#ifdef _WIN32
-    _putenv_s(env, val);
-#else
-    setenv(env, val, /*overwrite=*/1);
-#endif
-}
-
 int main(int argc, char ** argv) {
-    std::string model_path;
+    CommonOptions opt;      // -m, --n-ctx, GPU/offload, ... (core/args.h)
     int  port  = 8080;
-    int  n_ctx = 0;   // 0 = the model's trained context length (resolved after load)
-    bool force_cpu = false;
     std::string host = "127.0.0.1";
-    size_t vram_budget_mb = 0;          // total across GPUs (gates expert offload)
-    std::vector<size_t> vram_list;      // --vram-budget, one entry per GPU
-    std::vector<int>    gpu_ids;        // --gpus
-    std::vector<float>  gpu_split;      // --gpu-split ("auto" leaves this empty)
-    bool gpu_split_given = false;
-    std::string cache_profile;
-    bool experts_ssd = false;
-    std::string ngram_mode = "disk";    // --ngram off|disk|ram (qwen4exp PLE table)
-    size_t      ngram_cache_mb = 256;   // --ngram-cache <MB>
-    bool reasoning_default = true;
-    bool use_mtp = false;
-    bool embd_q8 = false;
-    int  n_draft = 1;
-    std::string mmproj_path;
     bool no_mmproj = false;
     int  cache_slots = 0;
     std::string cache_slots_dir;
     int  time_slice = 64;   // generation tokens per turn when requests contend
                             // (needs --cache-slots to park state; 0 = back-to-back)
-    float repeat_penalty_default = 1.0f;   // used when the request sends none
     bool want_help = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if      (a == "-m" && i + 1 < argc) model_path = argv[++i];
-        else if (a == "--port" && i + 1 < argc) port = std::stoi(argv[++i]);
+        if      (a == "--port" && i + 1 < argc) port = std::stoi(argv[++i]);
         else if (a == "--host" && i + 1 < argc) host = argv[++i];
-        else if (a == "--n-ctx" && i + 1 < argc) n_ctx = std::stoi(argv[++i]);
-        else if (a == "--gpus" && i + 1 < argc) {
-            const std::string v = argv[++i];
-            if (!parse_gpu_list(v, gpu_ids)) {
-                fprintf(stderr, "error: bad --gpus value: %s (expected e.g. 0 or 1,0 -- distinct device indices, primary first)\n", v.c_str());
-                return 1;
-            }
-        }
-        else if (a == "--gpu-split" && i + 1 < argc) {
-            const std::string v = argv[++i];
-            if (!parse_gpu_split(v, gpu_split)) {
-                fprintf(stderr, "error: bad --gpu-split value: %s (expected auto, exact layer counts like 36,4, or a ratio like 0.9,0.1)\n", v.c_str());
-                return 1;
-            }
-            gpu_split_given = true;
-        }
-        else if (a == "--vram-budget" && i + 1 < argc) {
-            const std::string v = argv[++i];
-            bool legacy = false;
-            if (!parse_vram_budget_list(v, vram_list, &legacy)) {
-                fprintf(stderr, "error: bad --vram-budget value: %s (expected auto, or e.g. 14, 13.5, 14G, 13500M, or one per GPU: 13.5,auto)\n", v.c_str());
-                return 1;
-            }
-            // AUTO and 0 contribute nothing: the total only gates expert
-            // offload, which an explicit numeric budget is what asks for.
-            vram_budget_mb = 0;
-            for (size_t k = 0; k < vram_list.size(); ++k)
-                if (vram_list[k] != VRAM_BUDGET_AUTO) vram_budget_mb += vram_list[k];
-            if (legacy)
-                fprintf(stderr, "note: --vram-budget %s read as %zu MB (%.1f GB); the unit is now GB, "
-                                "write %.1f or %sM to be explicit\n",
-                        v.c_str(), vram_budget_mb, vram_budget_mb / 1024.0, vram_budget_mb / 1024.0, v.c_str());
-        }
-        else if (a == "--cache-profile" && i + 1 < argc) cache_profile = argv[++i];
-        else if (a == "--experts-ssd")      experts_ssd = true;
-        else if (a == "--ngram" && i + 1 < argc)       ngram_mode = argv[++i];
-        else if (a == "--ngram-cache" && i + 1 < argc) ngram_cache_mb = (size_t) std::stoul(argv[++i]);
-        else if (a == "--reasoning" && i + 1 < argc) { std::string v = argv[++i]; reasoning_default = (v != "off" && v != "0" && v != "false"); }
-        else if (a == "--mtp")              use_mtp = true;
-        else if (a == "--draft" && i + 1 < argc) n_draft = std::stoi(argv[++i]);
-        else if (a == "--embd-q8")          embd_q8 = true;
-        else if (a == "--mmproj" && i + 1 < argc) mmproj_path = argv[++i];
         else if (a == "--no-mmproj")        no_mmproj = true;
         else if (a == "--cache-slots" && i + 1 < argc) cache_slots = std::stoi(argv[++i]);
         else if (a == "--cache-slots-dir" && i + 1 < argc) cache_slots_dir = argv[++i];
         else if (a == "--time-slice" && i + 1 < argc) time_slice = std::stoi(argv[++i]);
         else if (a == "--heartbeat" && i + 1 < argc) set_knob("QWEN_HEARTBEAT", argv[++i]);
-        else if (a == "--repeat-penalty" && i + 1 < argc) repeat_penalty_default = std::stof(argv[++i]);
-        else if (a == "--cpu")              force_cpu = true;
-        else if (a == "--resident-decode")  set_knob("QWEN_RESIDENT_DECODE", "1");
-        else if (a == "--expert-alloc" && i + 1 < argc) {
-            const std::string v = argv[++i];
-            if (v != "lru" && v != "quota" && v != "auto") {
-                fprintf(stderr, "error: bad --expert-alloc value: %s (expected lru, quota or auto)\n", v.c_str());
-                return 1;
-            }
-            set_knob("QWEN_EXPERT_ALLOC", v.c_str());
-        }
-        else if (a == "--resident-refill" && i + 1 < argc) set_knob("QWEN_RESIDENT_REFILL", argv[++i]);
-        else if (a == "--resident-warmup" && i + 1 < argc) set_knob("QWEN_RESIDENT_WARMUP", argv[++i]);
-        else if (a == "--prefill-prune" && i + 1 < argc)   set_knob("QWEN_PREFILL_PRUNE", argv[++i]);
-        else if (a == "--batch-chunk" && i + 1 < argc)     set_knob("QWEN_BATCH_CHUNK", argv[++i]);
-        else if (a == "--pf-chunk" && i + 1 < argc)        set_knob("QWEN_PF_CHUNK", argv[++i]);
-        else if (a == "--ssd-direct")       set_knob("QWEN_SSD_DIRECT", "1");
+        else if (a == "--pf-chunk" && i + 1 < argc)  set_knob("QWEN_PF_CHUNK", argv[++i]);
         else if (a == "-h" || a == "--help") want_help = true;
         else {
+            const ArgResult r = parse_common_arg(argc, argv, i, opt);
+            if (r == ArgResult::Error) return 1;
             // unknown flag, or a known flag missing its value (e.g. a typo like
             // --time-clice): fail loudly instead of silently ignoring it
-            fprintf(stderr, "error: unknown or malformed argument: %s\n"
-                            "run with --help to see usage\n", a.c_str());
-            return 1;
+            if (r == ArgResult::Unknown) {
+                fprintf(stderr, "error: unknown or malformed argument: %s\n"
+                                "run with --help to see usage\n", a.c_str());
+                return 1;
+            }
         }
     }
+    if (!want_help && !validate_common_options(opt)) return 1;
     if (!cache_slots_dir.empty() && cache_slots <= 0) cache_slots = 4;   // dir implies slots
+
+    // Mirrors of the common options the request handlers below capture by value.
+    const std::string & model_path = opt.model_path;
+    const bool  force_cpu              = opt.force_cpu;
+    const bool  use_mtp                = opt.use_mtp;
+    const int   n_draft                = opt.n_draft;
+    const bool  reasoning_default      = opt.reasoning;
+    const float repeat_penalty_default = opt.repeat_penalty;   // when the request sends none
+    std::string mmproj_path            = opt.mmproj_path;      // may be auto-discovered below
+    int         n_ctx                  = opt.n_ctx;            // 0 = the model's trained length
+
     if (want_help || model_path.empty()) {
         // --help goes to stdout and succeeds; a missing -m is an error
         FILE * out = want_help ? stdout : stderr;
         fprintf(out,
             "usage: %s -m <model.gguf> [options]\n"
+            "server:\n"
             "  --port <N>          listen port (default 8080)\n"
             "  --host <addr>       bind address (default 127.0.0.1)\n"
-            "  --n-ctx <N>         context length (default: the model's trained length)\n"
-            "  --vram-budget <GB>  offload expert weights; keep non-expert on GPU\n"
-            "                      GB, fractions ok (13.5); suffix M/G to be explicit (13500M)\n"
-            "                      one value per GPU to use several (e.g. 13.5,5)\n"
-            "                      auto = that GPU uses all its free VRAM and does not\n"
-            "                      offload; 0 = that GPU is not used at all\n"
-            "                      (13.5,auto and 5g,0 are both valid); the default is\n"
-            "                      the same as --vram-budget auto\n"
-            "  --gpus <list>       GPU device indices, primary first (e.g. 1, or 1,0).\n"
-            "                      Naming two devices -- here or via --vram-budget --\n"
-            "                      is what asks for two GPUs; without a --vram-budget\n"
-            "                      each one uses all the VRAM it has free.\n"
-            "  --gpu-split <spec>  each GPU's share of the layers (default: by\n"
-            "                      --vram-budget, or by free VRAM when that is omitted)\n"
-            "                      0.9,0.1 / 9,1 / 18,2 all mean the same ratio, and\n"
-            "                      36,4 gives exactly 36 and 4 on a 40-layer model.\n"
-            "                      A GPU given 0 holds no layers and becomes an\n"
-            "                      expert pool. auto = every GPU, share by free VRAM\n"
-            "  --cache-profile <f> prefetch hot-expert profile (read-only on the server)\n"
-            "  --experts-ssd       stream experts from the GGUF on SSD (no RAM copy)\n"
-            "  --ngram <mode>      qwen4exp n-gram embedding: disk (default), ram or off.\n"
-            "                      The table is 26.8 GB in Qwen3.8-Flash-Next and\n"
-            "                      never goes on the GPU; off skips the module\n"
-            "  --ngram-cache <MB>  host cache for --ngram disk (default 256)\n"
-            "  --reasoning <on|off> default thinking mode (per-request override: \"reasoning\")\n"
-            "  --mtp               MTP self-speculative decode (models with a nextn block)\n"
-            "  --draft <N>         MTP draft length (default 1)\n"
-            "  --embd-q8           use Q8_0 (not F16) for embedding fallback (saves ~45%% VRAM)\n"
-            "  --mmproj <gguf>     vision tower for image input (default: mmproj-*.gguf next to the model)\n"
             "  --no-mmproj         disable image input even if an mmproj file is present\n"
             "  --cache-slots <N>   extra prompt-cache slots for interleaved conversations (default 0)\n"
             "  --cache-slots-dir <dir>  store the slots on disk instead of RAM (persists across restarts)\n"
             "  --time-slice <N>    interleave concurrent streaming requests every N generated tokens\n"
             "                      (default 64; takes effect with --cache-slots; 0 = run back-to-back)\n"
             "  --heartbeat <on|off>  SSE keepalive chunks while queued / between prefill chunks (default on)\n"
-            "  --repeat-penalty <f>  default repetition penalty when the request sends none\n"
-            "                      (plain decode only, MTP is greedy; default 1 = off)\n"
-            "  --cpu               force CPU backend\n"
-            "offload tuning (equivalent to the QWEN_* env vars; flag wins):\n"
-            "  --resident-decode   resident-only routing decode: fused graph, no per-token miss\n"
-            "                      (lossy; auto-warmup + background refill keep quality)\n"
-            "  --resident-refill <N>  refilled experts per token while masked, all layers combined (default 8; 0 = frozen)\n"
-            "  --expert-alloc <m>  how decode splits the VRAM expert pool across layers:\n"
-            "                      lru | quota (per-layer, from the prompt's routing) |\n"
-            "                      auto = quota with --resident-decode, lru without (default)\n"
-            "                      (prefill always uses the whole pool as one LRU stream)\n"
-            "  --resident-warmup <N>  decode tokens before the mask locks in (default 32)\n"
-            "  --prefill-prune <eps>  skip fetching low-router-mass experts in prefill (lossy; e.g. 0.05)\n"
-            "  --batch-chunk <N>   prefill chunk length in tokens (default 4096)\n"
             "  --pf-chunk <N>      server prefill slice (disconnect-abort granularity, default 4096)\n"
-            "  --ssd-direct        unbuffered SSD reads (bypass the OS page cache; with --experts-ssd)\n"
             "  -h, --help          show this help and exit\n", argv[0]);
+        // --reasoning and --repeat-penalty are per-request overrides here
+        // ("reasoning" / "repeat_penalty" in the body); the flags set the default.
+        print_common_help(out);
         return want_help ? 0 : 1;
     }
 
@@ -699,36 +590,13 @@ int main(int argc, char ** argv) {
                     venc.reset();
                 }
             }
-            if (venc && vram_budget_mb > 0) {
-                // The tower is built on the primary device, so its VRAM comes
-                // out of the primary's budget, not the multi-GPU total.
-                const size_t vmb = (venc->gpu_bytes() + 1024 * 1024 - 1) / (1024 * 1024);
-                size_t & primary = vram_list.empty() ? vram_budget_mb : vram_list[0];
-                const size_t cut = std::min(primary, vmb);
-                fprintf(stderr, "vision tower: %zu MB GPU; expert cache budget %zu -> %zu MB"
-                                " (--no-mmproj reclaims it for text-only runs)\n",
-                        vmb, primary, primary - cut);
-                primary        -= cut;
-                vram_budget_mb -= cut;
-            }
+            if (venc) reserve_vision_tower_vram(opt, venc->gpu_bytes());
         }
 
+        opt.n_ctx = n_ctx;   // resolved above from the model's trained length
         RuntimeConfig cfg;
-        cfg.n_ctx              = n_ctx;
-        cfg.use_cuda           = !force_cpu;
-        cfg.vram_budget_mb     = vram_budget_mb;
-        if (!build_gpu_plan(gpu_ids, gpu_split, gpu_split_given, vram_list, cfg.gpus)) return 1;
-        // Across GPUs vram_budget_mb only gates offload (each device's own budget
-        // comes from the plan), but on one GPU it IS the budget.
-        if (cfg.gpus.size() <= 1 && !vram_list.empty() && vram_list[0] != VRAM_BUDGET_AUTO)
-            cfg.vram_budget_mb = vram_list[0];
-        cfg.cache_profile      = cache_profile;
+        if (!apply_common_options(opt, cfg)) return 1;
         cfg.cache_profile_save = false;   // server only reads the profile, never overwrites it
-        cfg.experts_ssd        = experts_ssd;
-        cfg.ngram_mode         = ngram_mode;
-        cfg.ngram_cache_mb     = ngram_cache_mb;
-        cfg.use_mtp            = use_mtp;  // keeps the nextn block VRAM-resident
-        cfg.embd_q8            = embd_q8;
         rt = std::make_unique<Runtime>(*model, cfg);
     } catch (const std::exception & e) {
         fprintf(stderr, "load error: %s\n", e.what());

@@ -24,6 +24,11 @@ namespace questwend {
 
 static const int GRAPH_SIZE = 16384;
 
+// Graph-buffer headroom kept on every device: what gallocr / sched allocate for
+// the forward pass, before the expert pool takes what is left of the budget.
+// One constant, so the offload decision and the pool sizing cannot drift apart.
+static const size_t COMPUTE_HEADROOM = 1024ull * 1024ull * 1024ull;
+
 // Allocate exactly `ts` into one fresh buffer on `buft`. ggml_backend_alloc_ctx_tensors
 // cannot be used where tensors from a single context are spread over several
 // devices: it claims every unallocated tensor in the context for one buffer.
@@ -67,7 +72,10 @@ struct Runtime::Impl {
     // expert weights device-to-device, is PCIe-bound and pointless). Equal to
     // layer_dev unless a device is pool-only.
     std::vector<int>            pool_dev;
-    std::vector<size_t>         dev_budget;     // per-device VRAM budget, bytes (0 = unset)
+    // Per-device VRAM budget in bytes, resolved at init: --vram-budget where it
+    // named this device, otherwise what the device reports free. Never 0 once a
+    // backend is up, so plan_offload() can measure the model against it.
+    std::vector<size_t>         dev_budget;
     std::vector<size_t>         dev_weight_bytes;  // per-device weight bytes actually allocated
     std::vector<size_t>         dev_kv_bytes;      // per-device KV/state bytes
 
@@ -183,7 +191,8 @@ struct Runtime::Impl {
         for (const auto & c : ecaches) if (c) m = std::min(m, c->min_slots());
         return m == INT32_MAX ? 0 : m;
     }
-    bool                  ssd_mode = false;     // experts streamed from SSD (no RAM copy)
+    bool                  offload  = false;     // routed experts do not fit in VRAM (see plan_offload)
+    bool                  ssd_mode = false;     // ... and stream from the GGUF on SSD (no RAM copy)
     ggml_gallocr_t        cache_galloc = nullptr;
     // One graph allocator per GPU: under a layer split each per-layer segment
     // graph is allocated and run on the device that owns the layer, so this path
@@ -503,6 +512,11 @@ struct Runtime::Impl {
 
     void init();
     void plan_layers();   // fill layer_dev from the --gpu-split shares
+    void plan_offload();  // decide `offload` / `ssd_mode` from the resolved budgets
+    // Bytes of KV / recurrent state layer `il` needs at cfg.n_ctx. Computed from
+    // the hyper-parameters, so plan_offload() can charge for the state buffers
+    // before they are allocated.
+    size_t state_bytes(int il) const;
     void zero_states();
     // logits_all=false computes the output head for the LAST token only. The
     // head is [n_embd, n_vocab] -- on a large vocabulary it is the single most
@@ -660,10 +674,20 @@ void Runtime::Impl::init() {
             for (ggml_backend_dev_t dev : devs) {
                 backend = ggml_backend_dev_init(dev, nullptr);
                 if (backend) {
-                    fprintf(stderr, "backend: GPU [%s] %s\n",
-                            ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+                    // No --vram-budget: the budget is what the card has free
+                    // right now. Whatever the model does not fit into it goes
+                    // to the expert tier, so the common case needs no flag.
+                    size_t budget = cfg.vram_budget_mb * 1024ull * 1024ull;
+                    if (budget == 0) {
+                        size_t dev_free = 0, dev_total = 0;
+                        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+                        budget = dev_free;
+                    }
+                    fprintf(stderr, "backend: GPU [%s] %s (%s %zu MB)\n",
+                            ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                            cfg.vram_budget_mb ? "budget" : "free", budget >> 20);
                     gpus.push_back(backend);
-                    dev_budget.push_back(cfg.vram_budget_mb * 1024ull * 1024ull);
+                    dev_budget.push_back(budget);
                     break;
                 }
             }
@@ -709,25 +733,39 @@ void Runtime::Impl::init() {
         ggml_backend_cpu_set_n_threads(backend, nth);
         fprintf(stderr, "backend: CPU (%d threads)\n", nth);
         gpus.assign(1, backend);          // "device 0" is the CPU here
-        dev_budget.assign(1, 0);
+        // ... so the "VRAM" budget is host memory: what --vram-budget said, or
+        // most of what the OS reports free. Most, not all: the SSD tier wants
+        // page cache left over, and off Windows ggml reports total RAM as free.
+        size_t budget = cfg.vram_budget_mb * 1024ull * 1024ull;
+        if (budget == 0) {
+            size_t host_free = 0, host_total = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(backend), &host_free, &host_total);
+            budget = host_free / 4 * 3;
+            fprintf(stderr, "backend: CPU memory budget %zu MB (3/4 of %zu MB free)\n",
+                    budget >> 20, host_free >> 20);
+        }
+        dev_budget.assign(1, budget);
     }
+
+    // Keep the MTP (nextn) block's experts VRAM-resident only when MTP is in use;
+    // otherwise let them offload with the rest (saves VRAM). Must be set before
+    // any load_weights_* call -- and before plan_offload(), which counts the
+    // bytes these two decide.
+    model.set_keep_nextn_resident(cfg.use_mtp && model.hparams().has_mtp());
+    model.set_embd_q8(cfg.embd_q8);
+
+    // ---- Phase B: expert weight offload ----
+    // Whether the experts have to leave VRAM at all, and to which tier. Runs
+    // before plan_layers() because the layer split hands a pool-only device its
+    // whole budget, which only means something when there are pools to place.
+    plan_offload();
+    const bool use_expert_offload = offload;
 
     // Decide which device computes which layer before any weight is placed.
     plan_layers();
 
-    // ---- Phase B: Expert weight offload via CPU backend + sched ----
-    const bool use_expert_offload =
-        cfg.vram_budget_mb > 0 && model.has_expert_tensors() && cfg.use_cuda;
-
-    // Keep the MTP (nextn) block's experts VRAM-resident only when MTP is in use;
-    // otherwise let them offload with the rest (saves VRAM). Must be set before
-    // any load_weights_* call.
-    model.set_keep_nextn_resident(cfg.use_mtp && model.hparams().has_mtp());
-    model.set_embd_q8(cfg.embd_q8);
-
-    if (use_expert_offload && cfg.experts_ssd) {
+    if (use_expert_offload && ssd_mode) {
         // ---- SSD tier: experts stay on disk; non-expert weights -> GPU ----
-        ssd_mode = true;
         weights_buf_owned = true;   // set first: a throw mid-load still frees what was allocated
         DevicePlan ssd_plan = device_plan();
         model.load_weights_ssd(backend, weights_bufs, &ssd_plan, &dev_weight_bytes);
@@ -933,6 +971,70 @@ void Runtime::Impl::init() {
     zero_states();
 }
 
+size_t Runtime::Impl::state_bytes(int il) const {
+    const auto & hp = model.hparams();
+    size_t n = 0;
+    if (hp.is_recurrent(il)) {
+        const size_t conv_ch = (size_t) hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state;
+        n += (size_t) (hp.ssm_d_conv - 1) * conv_ch * 4;
+        n += (size_t) hp.ssm_d_state * hp.ssm_d_state * hp.ssm_dt_rank * 4;
+    } else {
+        const size_t n_embd_gqa = (size_t) hp.n_head_kv * hp.n_embd_head;
+        n += 2 * n_embd_gqa * (size_t) cfg.n_ctx * 2;      // F16 K and V
+        if (hp.has_qsa() && hp.compress_ratio((uint32_t) il) > 0)
+            n += (size_t) hp.indexer_head_dim * cfg.n_ctx * 4;
+    }
+    // The PLE conv state exists only when the module is in the graph, which
+    // --ngram off removes (use_ple(), but the table is not built yet here).
+    if (hp.has_ple() && cfg.ngram_mode != "off" && hp.is_ple((uint32_t) il))
+        n += (size_t) hp.ple_conv_state() * hp.n_embd_hc() * 4;
+    return n;
+}
+
+// Decide whether the routed experts have to leave VRAM, and to which tier.
+//
+// The budget is what --vram-budget asked for or, without it, what the devices
+// report free -- a capacity, not a mode switch. A model whose weights, KV cache
+// and compute headroom all fit inside it stays fully resident; one that does not
+// streams its routed experts from the tier cfg.expert_tier names. That is what
+// lets the common case -- a model bigger than the machine -- run with no flags.
+void Runtime::Impl::plan_offload() {
+    offload  = false;
+    ssd_mode = false;
+    if (!model.has_expert_tensors()) return;   // dense model: nothing to offload
+
+    size_t budget = 0;
+    for (size_t b : dev_budget) budget += b;
+    if (budget == 0) return;   // no device would say how much it has: stay resident
+
+    const auto & hp = model.hparams();
+    const size_t weights = model.weight_bytes(backend);
+    size_t kv = 0;
+    for (int il = 0; il < (int) hp.n_layer; ++il) kv += state_bytes(il);
+    const size_t compute = COMPUTE_HEADROOM * std::max<size_t>(gpus.size(), 1);
+    const size_t need    = weights + kv + compute;
+
+    if (need <= budget) {
+        fprintf(stderr, "expert offload: off (weights %zu + KV %zu + compute %zu MB"
+                        " fit the %zu MB budget)\n",
+                weights >> 20, kv >> 20, compute >> 20, budget >> 20);
+        return;
+    }
+    offload  = true;
+    ssd_mode = cfg.expert_tier == ExpertTier::Ssd;
+
+    const size_t experts  = model.offloaded_expert_bytes();
+    const size_t resident = need > experts ? need - experts : 0;
+    fprintf(stderr, "expert offload: %s tier (needs %zu MB, budget %zu MB;"
+                    " %zu MB of routed experts move out, %zu MB stays)\n",
+            ssd_mode ? "SSD" : "RAM", need >> 20, budget >> 20, experts >> 20, resident >> 20);
+    if (resident > budget)
+        fprintf(stderr, "warning: %zu MB stays resident but the budget is %zu MB -- expect an"
+                        " allocation failure or a driver spill. Lower --n-ctx, add a GPU with"
+                        " --gpus, or raise --vram-budget if the device really has more.\n",
+                resident >> 20, budget >> 20);
+}
+
 // Assign each transformer layer to a GPU. Devices get contiguous ranges of the
 // main stack in plan order, sized by their --gpu-split share (or, with no
 // explicit split, by their VRAM budget). A device whose share is 0 gets no
@@ -1068,14 +1170,14 @@ void Runtime::Impl::plan_pools() {
     if (gpus.size() <= 1) return;
     // Without expert offload there are no pools to place: the weights are all
     // resident and a layer's experts are wherever its other weights are.
-    if (cfg.vram_budget_mb == 0 || !model.has_expert_tensors()) return;
+    if (!offload) return;
 
     // Runs before the weights are placed (their placement depends on the answer),
     // so the surplus is budget minus the KV cache and the compute headroom, with
     // the non-expert weights left out. They are roughly proportional to a
     // device's layer count, so leaving them out skews the ratio a little but not
     // the shape; the placement line below makes the outcome visible.
-    const size_t compute = 1024ull * 1024ull * 1024ull;
+    const size_t compute = COMPUTE_HEADROOM;
     const int n_embd_gqa = hp.n_head_kv * hp.n_embd_head;
     const int conv_ch    = hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state;
     std::vector<double> surplus(gpus.size(), 0.0);
@@ -1133,14 +1235,14 @@ void Runtime::Impl::init_cache() {
     // On Windows the driver then silently spills allocations to shared system
     // memory (paged over PCIe), uniformly slowing prefill and decode; sizing
     // the pool against the real KV bytes keeps everything VRAM-resident.
-    const size_t compute = 1024ull * 1024ull * 1024ull;   // gallocr graph buffers
+    const size_t compute = COMPUTE_HEADROOM;   // gallocr graph buffers
 
     // Only the main stack's experts are offloaded; the trailing MTP (nextn) block
     // stays fully VRAM-resident, so the cache covers n_main() layers (not n_layer).
     const int n_main = (int) hp.n_main();
 
     if (!multi_gpu()) {
-        const size_t budget = cfg.vram_budget_mb * 1024ull * 1024ull;
+        const size_t budget = dev_budget.empty() ? 0 : dev_budget[0];
         size_t gpu_w = 0;
         for (auto b : weights_bufs) gpu_w += ggml_backend_buffer_get_size(b);
         size_t kv_bytes = 0;
@@ -1148,7 +1250,7 @@ void Runtime::Impl::init_cache() {
         const size_t reserve = gpu_w + kv_bytes + compute;
         const size_t avail   = budget > reserve ? budget - reserve : 0;
         fprintf(stderr, "VRAM budget %zu MB = weights %zu + KV %zu + compute %zu + expert pool %zu MB\n",
-                cfg.vram_budget_mb, gpu_w >> 20, kv_bytes >> 20, compute >> 20, avail >> 20);
+                budget >> 20, gpu_w >> 20, kv_bytes >> 20, compute >> 20, avail >> 20);
         ecaches.push_back(std::make_unique<ExpertCache>(
             backend, model, n_main, hp.n_expert, n_used, avail, ssd_mode));
     } else {

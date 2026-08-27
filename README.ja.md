@@ -141,23 +141,34 @@ qw-cli -m model.gguf --info                  # モデル情報を表示して終
 
 ### エキスパート・オフロード（大きい MoE を限られた VRAM で）
 
-```bash
-# RAM 階層: 非エキスパート重みを GPU、エキスパートは pinned host RAM に置き
-#           動的 VRAM キャッシュ経由でストリーミング（PCIe）
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15
+**既定で自動**。オプションなしで、デバイスの空き容量を測り、収まらないぶんのルーテッド
+エキスパートを GGUF からディスク直読でストリーミングする。メモリより大きいモデルを
+SSD オフロードで動かす、という典型的な使い方にフラグは要らない。
 
-# SSD 階層: エキスパートを GGUF からディスク直読（RAM コピーなし）
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 12 --experts-ssd
+```bash
+# 自動: 空き VRAM に収まればそのまま常駐、収まらなければ SSD 階層に落ちる
+qw-cli -m moe.gguf -p "..." -n 128
+
+# 予算を明示（他のプロセスに VRAM を残す、複数 GPU に配分する、など）
+qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 12
+
+# RAM 階層: エキスパートを pinned host RAM に置いて VRAM キャッシュへ流す
+qw-cli -m moe.gguf -p "..." -n 128 --experts-ram
 
 # 常駐プロファイル: 1回目に保存、2回目以降は起動時にホットなエキスパートを事前常駐
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15 --cache-profile hot.prof
+qw-cli -m moe.gguf -p "..." -n 128 --cache-profile hot.prof
 ```
 
-- `--vram-budget <GB>`: スロットプールに使う VRAM 予算（>0 でオフロード有効）。
+- `--vram-budget <GB>`: モデルが使ってよい VRAM 量。**未指定ならデバイスの空き容量を自動取得**する。
+  重み + KV + 計算バッファがこの予算に収まればオフロードせず全常駐、超えたぶんだけ
+  エキスパートが階層に落ちる（起動ログに判定が出る）。
   単位は **GB**、小数も可（`13.5`）。`M`/`G` サフィックスを付ければ明示指定できる（`13500M`, `14G`）。
   512 以上の裸の数値は MB として解釈するので、単位変更前に書いたコマンドはそのまま動く
   （GB 表記を促す注意書きが出る）。
-- `--experts-ssd`: エキスパートをディスクからストリーミング（RAM に載らない巨大モデル向け）。
+- `--experts-ssd`: エキスパートを GGUF からディスク直読（RAM コピーなし）。**既定の階層**なので
+  通常は指定不要。触ったページは OS のページキャッシュに乗るので、RAM コピーを別に持つ意味は薄い。
+- `--experts-ram`: 代わりに pinned host RAM に置く。エキスパートが RAM に収まり、かつドライブが
+  遅いときに効く。`--experts-ssd` と同時指定はエラー。
 - `--ngram <off|disk|ram>`: qwen4exp の n-gram 埋め込みテーブルの置き場（既定 `disk`）。
   Qwen3.8-Flash-Next では 26.8 GB あり、**どのモードでも GPU には載せない**。
   `off` はモジュールごとスキップする（残差へのゲート付き加算ブランチなので、外してもスタックは動く）。
@@ -203,8 +214,8 @@ qw-cli -m moe.gguf -p "..." --gpus 0,1 --vram-budget 8,5 --gpu-split 1,0
 - `--gpus <list>`: デバイス番号を primary から順に（`1` や `1,0`）。**順序は ggml のもの、つまり
   CUDA 既定の「速い順」で、`nvidia-smi` の PCI 順とは逆**。多くの場合 `--gpus 0` が速いカードになる。
   起動ログに各デバイス名が出るのでそこで確認すること。
-- `--vram-budget <list>`: GPU ごとに 1 値。`auto` はそのデバイスの空き VRAM を全部使い、オフロード
-  しない。`0` はそのデバイスをプランから外すので、`--gpus 1,0 --vram-budget 5g,0` は
+- `--vram-budget <list>`: GPU ごとに 1 値。`auto` はそのデバイスの空き VRAM を全部使う（フラグを
+  省略したときの既定）。`0` はそのデバイスをプランから外すので、`--gpus 1,0 --vram-budget 5g,0` は
   `--gpus 1 --vram-budget 5g` と同じ。フラグ自体を省略した場合は `auto` と同じ。
 - `--gpu-split <list>`: 各 GPU が持つレイヤーの割合。既定は `--vram-budget` の比、予算が無ければ
   空き VRAM の比。値は相対比なので `0.9,0.1` / `9,1` / `18,2` はすべて同じ意味で、40 レイヤーの
@@ -253,7 +264,8 @@ qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15
 | `--host <addr>` | バインドアドレス（既定 `127.0.0.1`; LAN 公開は `0.0.0.0`） |
 | `--port <N>` | ポート（既定 8080） |
 | `--n-ctx <N>` | コンテキスト長 |
-| `--vram-budget <GB>` / `--experts-ssd` | エキスパート・オフロード（GB、小数可。`M`/`G` で明示指定） |
+| `--vram-budget <GB>` | モデルが使ってよい VRAM（既定: 空き容量を自動取得。GB、小数可、`M`/`G` で明示指定） |
+| `--experts-ssd` / `--experts-ram` | エキスパートの退避先（既定 SSD。同時指定はエラー） |
 | `--gpus <list>` / `--gpu-split <list>` | 複数 GPU を使う（[複数 GPU](#複数-gpu) 参照） |
 | `--cache-profile <file>` | 常駐プロファイル（**サーバーは読み込みのみ**, 上書きしない） |
 | `--reasoning <on\|off>` | thinking モードの既定（UI のチェックにも反映） |
@@ -296,7 +308,7 @@ qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15
 `model-00001-of-00003.gguf` のように分割されたモデルは、**先頭シャード**を `-m` に渡すだけで自動的に全シャードを探索・統合します（命名は 5 桁ゼロ詰め、00001 開始）。
 
 ```bash
-qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40 --experts-ssd
+qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40
 ```
 
 ---
