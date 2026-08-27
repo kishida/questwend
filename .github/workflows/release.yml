@@ -234,9 +234,41 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Assets are listed at the bottom of the release page anyway, but an
+      # explicit table saves people from guessing which of eleven files they
+      # want. generate_release_notes appends the changelog after this, so the
+      # table stays at the top.
+      - name: Compose release body
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          base="${{ github.server_url }}/${{ github.repository }}/releases/download/${tag}"
+          row() { printf '| %s | %s | [`%s`](%s/%s) |\n' "$1" "$2" "$3" "$base" "$3"; }
+          {
+            echo '## Downloads'
+            echo
+            echo '| Platform | Backend | File |'
+            echo '|---|---|---|'
+            row 'Windows x64'        'CUDA'   "questwend-win-cuda-x64-${tag}.zip"
+            row 'Windows x64'        'Vulkan' "questwend-win-vulkan-x64-${tag}.zip"
+            row 'Windows x64'        'CPU'    "questwend-win-cpu-x64-${tag}.zip"
+            row 'Linux x64'          'CUDA'   "questwend-linux-cuda-x64-${tag}.tar.gz"
+            row 'Linux x64'          'Vulkan' "questwend-linux-vulkan-x64-${tag}.tar.gz"
+            row 'Linux x64'          'CPU'    "questwend-linux-cpu-x64-${tag}.tar.gz"
+            row 'Linux arm64 (GB10)' 'CUDA'   "questwend-linux-cuda-arm64-${tag}.tar.gz"
+            row 'Linux arm64'        'CPU'    "questwend-linux-cpu-arm64-${tag}.tar.gz"
+            row 'macOS arm64'        'Metal'  "questwend-macos-metal-arm64-${tag}.tar.gz"
+            row 'macOS arm64'        'CPU'    "questwend-macos-cpu-arm64-${tag}.tar.gz"
+            echo
+            cudart="cudart-win-x64-cu${CUDA_WIN_VERSION}.zip"
+            printf 'The Windows CUDA build needs `cudart` / `cublas` / `cublasLt` alongside it. If you have no CUDA Toolkit installed, unzip [`%s`](%s/%s) into the same directory as `qw-cli.exe`. An NVIDIA driver is required either way.\n' \
+              "$cudart" "$base" "$cudart"
+          } > release-body.md
+          cat release-body.md
+
       - uses: softprops/action-gh-release@v3
         with:
           name: QuestWend ${{ github.ref_name }}
+          body_path: release-body.md
           # Flip to false once a tag has been through this end to end.
           draft: true
           generate_release_notes: true
