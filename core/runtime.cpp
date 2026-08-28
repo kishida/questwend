@@ -668,6 +668,20 @@ std::vector<ggml_backend_dev_t> gpu_devices() {
 }
 
 void Runtime::Impl::init() {
+    // A context longer than the model was trained for is allowed -- it degrades
+    // rather than breaks, and seeing how much is a fair thing to want -- but it
+    // is never what someone meant to ask for by accident. There is no RoPE
+    // scaling here (no YaRN, no frequency scaling), so every position past the
+    // trained length is plain extrapolation, and the KV cache is sized for the
+    // whole thing regardless of how much of it the model can use.
+    if (cfg.n_ctx > 0 && model.hparams().n_ctx_train > 0 &&
+        (uint32_t) cfg.n_ctx > model.hparams().n_ctx_train)
+        fprintf(stderr, "warning: --n-ctx %d is past this model's trained context length of %u."
+                        " Positions beyond it are extrapolated (no RoPE scaling is implemented)"
+                        " and the output degrades there; the KV cache is sized for all %d either"
+                        " way.\n",
+                cfg.n_ctx, model.hparams().n_ctx_train, cfg.n_ctx);
+
     // Prefer a GPU device (CUDA/Metal/etc.) when requested and available.
     if (cfg.use_cuda) {
         const std::vector<ggml_backend_dev_t> devs = gpu_devices();
