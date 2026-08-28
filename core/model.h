@@ -20,6 +20,13 @@ typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
 
 namespace questwend {
 
+// Report a backend allocation failure with the numbers that explain it: what was
+// being allocated, how much it asked for, and what the device says it has. ggml's
+// allocators only return null, and "failed to allocate buffer" on its own leaves
+// exactly the question the reader has unanswered. Always throws.
+[[noreturn]] void throw_alloc_failure(ggml_backend_buffer_type_t buft, size_t bytes,
+                                      const std::string & what);
+
 enum class Arch {
     UNKNOWN,
     QWEN3,        // dense transformer, no GDN

@@ -198,7 +198,12 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
     }
 
     buf_ = ggml_backend_alloc_ctx_tensors(ctx_, gpu_backend);
-    if (!buf_) throw std::runtime_error("ExpertCache: failed to alloc VRAM slot pools");
+    if (!buf_) {
+        size_t want = 0;
+        for (int s = 0; s < (int) sigs.size(); ++s) want += sigs[s].slab * (size_t) pools_[s].n_slots;
+        throw_alloc_failure(ggml_backend_get_default_buffer_type(gpu_backend), want,
+                            "the expert slot pools");
+    }
     ggml_backend_buffer_set_usage(buf_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
 #ifdef __APPLE__

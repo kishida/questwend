@@ -169,6 +169,10 @@ qw-cli -m moe.gguf -p "..." -n 128 --cache-profile hot.prof
   The unit is **GB** and fractions work (`13.5`); an explicit `M`/`G` suffix always wins
   (`13500M`, `14G`). A bare number of 512 or more is read as MB, so command lines written
   before the unit changed keep working (with a note pointing at the GB spelling).
+- When the part that cannot be offloaded (resident weights + KV cache) does not fit, the run
+  stops before loading a single weight, naming what it needs, what is available and how much of
+  it is KV at the current `--n-ctx`. If only the budget is exceeded and the device itself has
+  room, it warns instead and says that nothing is left for the expert pool.
 - `--experts-ssd`: read the experts straight from the GGUF on disk (no RAM copy). **The
   default tier**, so it rarely needs passing: the pages a run touches end up in the OS page
   cache anyway, which makes a separate RAM copy of them mostly redundant.

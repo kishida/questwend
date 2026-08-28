@@ -39,7 +39,7 @@ static ggml_backend_buffer_t alloc_tensor_list(ggml_backend_buffer_type_t buft,
     size_t sz = 0;
     for (auto * t : ts) sz += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
     ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft, sz > 0 ? sz : 1);
-    if (!b) throw std::runtime_error(std::string("failed to allocate ") + what);
+    if (!b) throw_alloc_failure(buft, sz, what);
     ggml_tallocr ta = ggml_tallocr_new(b);
     for (auto * t : ts)
         if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS)
@@ -76,6 +76,11 @@ struct Runtime::Impl {
     // named this device, otherwise what the device reports free. Never 0 once a
     // backend is up, so plan_offload() can measure the model against it.
     std::vector<size_t>         dev_budget;
+    // What each device said it had free, kept separately: an explicit budget may
+    // be larger than that (deliberately, on Metal, where the reported total is
+    // only the recommended working set), and the two disagreeing is worth saying.
+    std::vector<size_t>         dev_free;
+    bool                        budget_from_flag = false;   // --vram-budget named it
     std::vector<size_t>         dev_weight_bytes;  // per-device weight bytes actually allocated
     std::vector<size_t>         dev_kv_bytes;      // per-device KV/state bytes
 
@@ -677,17 +682,17 @@ void Runtime::Impl::init() {
                     // No --vram-budget: the budget is what the card has free
                     // right now. Whatever the model does not fit into it goes
                     // to the expert tier, so the common case needs no flag.
-                    size_t budget = cfg.vram_budget_mb * 1024ull * 1024ull;
-                    if (budget == 0) {
-                        size_t dev_free = 0, dev_total = 0;
-                        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
-                        budget = dev_free;
-                    }
+                    size_t got_free = 0, dev_total = 0;
+                    ggml_backend_dev_memory(dev, &got_free, &dev_total);
+                    budget_from_flag = cfg.vram_budget_mb > 0;
+                    const size_t budget = budget_from_flag
+                        ? cfg.vram_budget_mb * 1024ull * 1024ull : got_free;
                     fprintf(stderr, "backend: GPU [%s] %s (%s %zu MB)\n",
                             ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
-                            cfg.vram_budget_mb ? "budget" : "free", budget >> 20);
+                            budget_from_flag ? "budget" : "free", budget >> 20);
                     gpus.push_back(backend);
                     dev_budget.push_back(budget);
+                    dev_free.push_back(got_free);
                     break;
                 }
             }
@@ -706,20 +711,17 @@ void Runtime::Impl::init() {
                 // split lands layers in proportion to real capacity instead of
                 // piling them all onto the primary.
                 const bool from_free = (p.budget_mb == VRAM_BUDGET_AUTO);
-                size_t budget;
-                if (from_free) {
-                    size_t dev_free = 0, dev_total = 0;
-                    ggml_backend_dev_memory(devs[(size_t) p.device], &dev_free, &dev_total);
-                    budget = dev_free;
-                } else {
-                    budget = p.budget_mb * 1024ull * 1024ull;
-                }
+                size_t got_free = 0, dev_total = 0;
+                ggml_backend_dev_memory(devs[(size_t) p.device], &got_free, &dev_total);
+                const size_t budget = from_free ? got_free : p.budget_mb * 1024ull * 1024ull;
+                if (!from_free) budget_from_flag = true;
                 fprintf(stderr, "backend: GPU%d [%s] %s (%s %zu MB, split %.3g)\n",
                         p.device, ggml_backend_dev_name(devs[(size_t) p.device]),
                         ggml_backend_dev_description(devs[(size_t) p.device]),
                         from_free ? "free" : "budget", budget >> 20, p.split);
                 gpus.push_back(be);
                 dev_budget.push_back(budget);
+                dev_free.push_back(got_free);
             }
             backend = gpus[0];
         }
@@ -736,15 +738,17 @@ void Runtime::Impl::init() {
         // ... so the "VRAM" budget is host memory: what --vram-budget said, or
         // most of what the OS reports free. Most, not all: the SSD tier wants
         // page cache left over, and off Windows ggml reports total RAM as free.
+        size_t host_free = 0, host_total = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(backend), &host_free, &host_total);
+        budget_from_flag = cfg.vram_budget_mb > 0;
         size_t budget = cfg.vram_budget_mb * 1024ull * 1024ull;
-        if (budget == 0) {
-            size_t host_free = 0, host_total = 0;
-            ggml_backend_dev_memory(ggml_backend_get_device(backend), &host_free, &host_total);
+        if (!budget_from_flag) {
             budget = host_free / 4 * 3;
             fprintf(stderr, "backend: CPU memory budget %zu MB (3/4 of %zu MB free)\n",
                     budget >> 20, host_free >> 20);
         }
         dev_budget.assign(1, budget);
+        dev_free.assign(1, host_free);
     }
 
     // Keep the MTP (nextn) block's experts VRAM-resident only when MTP is in use;
@@ -935,7 +939,12 @@ void Runtime::Impl::init() {
     st_bufs.assign(std::max<size_t>(gpus.size(), 1), nullptr);
     if (!multi_gpu()) {
         st_bufs[0] = ggml_backend_alloc_ctx_tensors(st_ctx, backend);
-        if (!st_bufs[0]) throw std::runtime_error("failed to alloc state buffer");
+        if (!st_bufs[0]) {
+            size_t want = 0;
+            for (int il = 0; il < n_layer; ++il) want += state_bytes(il);
+            throw_alloc_failure(ggml_backend_get_default_buffer_type(backend), want,
+                                "the KV / recurrent state cache");
+        }
     } else {
         for (size_t d = 0; d < gpus.size(); ++d) {
             std::vector<ggml_tensor *> ts;
@@ -1001,10 +1010,10 @@ size_t Runtime::Impl::state_bytes(int il) const {
 void Runtime::Impl::plan_offload() {
     offload  = false;
     ssd_mode = false;
-    if (!model.has_expert_tensors()) return;   // dense model: nothing to offload
 
-    size_t budget = 0;
+    size_t budget = 0, free_total = 0;
     for (size_t b : dev_budget) budget += b;
+    for (size_t f : dev_free)   free_total += f;
     if (budget == 0) return;   // no device would say how much it has: stay resident
 
     const auto & hp = model.hparams();
@@ -1014,25 +1023,74 @@ void Runtime::Impl::plan_offload() {
     const size_t compute = COMPUTE_HEADROOM * std::max<size_t>(gpus.size(), 1);
     const size_t need    = weights + kv + compute;
 
-    if (need <= budget) {
+    if (model.has_expert_tensors() && need > budget) {
+        offload  = true;
+        ssd_mode = cfg.expert_tier == ExpertTier::Ssd;
+    }
+
+    // What the device has to hold whatever the tier decides: the weights that
+    // stay on it plus the KV / recurrent state. The compute headroom is left out
+    // -- it is a reservation the expert pool gives way to, and a graph needing
+    // less than COMPUTE_HEADROOM still runs -- so this is the floor, not the wish.
+    const size_t experts = offload ? model.offloaded_expert_bytes() : 0;
+    const size_t must    = weights - experts + kv;
+
+    // Two independent "does not fit" answers, and they mean different things.
+    // The budget is what was asked for; free is what the device admits to. Only
+    // when both say no is the run certain to fail, and that is the one worth
+    // refusing before an hour of weight loading -- it is also the auto case,
+    // where the two are the same number. Either one alone is survivable: a
+    // deliberately stingy budget still allocates against the real device, and an
+    // explicit budget above `free` is how one asks Metal for more than its
+    // recommended working set.
+    const bool over_budget = must > budget;
+    const bool over_free   = free_total > 0 && must > free_total;
+    const size_t resident_w = weights - experts;
+    if (over_budget && over_free) {
+        char msg[768];
+        snprintf(msg, sizeof(msg),
+                 "%zu MB has to stay on the device and only %zu MB is available: "
+                 "%zu MB of weights that cannot be offloaded + %zu MB of KV/recurrent state "
+                 "at --n-ctx %d%s. Lower --n-ctx, spread the model over more devices with "
+                 "--gpus, or run on the CPU with --cpu.",
+                 must >> 20, std::min(budget, free_total) >> 20,
+                 resident_w >> 20, kv >> 20, cfg.n_ctx,
+                 model.has_expert_tensors() ? "" : " (a dense model: no experts to offload)");
+        throw std::runtime_error(msg);
+    }
+    if (over_budget && model.has_expert_tensors())
+        fprintf(stderr, "warning: %zu MB has to stay on the device (weights %zu + KV %zu at"
+                        " --n-ctx %d) but the budget is %zu MB, so nothing is left for the"
+                        " expert pool and every token will miss. Lower --n-ctx or raise"
+                        " --vram-budget.\n",
+                must >> 20, resident_w >> 20, kv >> 20, cfg.n_ctx, budget >> 20);
+    else if (over_budget)
+        fprintf(stderr, "warning: %zu MB has to stay on the device (weights %zu + KV %zu at"
+                        " --n-ctx %d) but the budget is %zu MB; a dense model has nothing to"
+                        " offload, so it is loaded over budget and may spill to system memory."
+                        " Lower --n-ctx or raise --vram-budget.\n",
+                must >> 20, resident_w >> 20, kv >> 20, cfg.n_ctx, budget >> 20);
+    else if (over_free)
+        fprintf(stderr, "warning: %zu MB has to stay on the device but it reports only %zu MB"
+                        " free; --vram-budget is above what the driver admits to having\n",
+                must >> 20, free_total >> 20);
+    else if (offload && must + compute > budget)
+        fprintf(stderr, "warning: weights %zu + KV %zu + compute %zu MB leave nothing of the"
+                        " %zu MB budget for the expert pool; it falls back to its minimum and"
+                        " every token will miss. Lower --n-ctx or raise --vram-budget.\n",
+                resident_w >> 20, kv >> 20, compute >> 20, budget >> 20);
+
+    if (!model.has_expert_tensors()) return;   // dense: there is no tier to report on
+    if (!offload) {
         fprintf(stderr, "expert offload: off (weights %zu + KV %zu + compute %zu MB"
                         " fit the %zu MB budget)\n",
                 weights >> 20, kv >> 20, compute >> 20, budget >> 20);
         return;
     }
-    offload  = true;
-    ssd_mode = cfg.expert_tier == ExpertTier::Ssd;
-
-    const size_t experts  = model.offloaded_expert_bytes();
-    const size_t resident = need > experts ? need - experts : 0;
     fprintf(stderr, "expert offload: %s tier (needs %zu MB, budget %zu MB;"
                     " %zu MB of routed experts move out, %zu MB stays)\n",
-            ssd_mode ? "SSD" : "RAM", need >> 20, budget >> 20, experts >> 20, resident >> 20);
-    if (resident > budget)
-        fprintf(stderr, "warning: %zu MB stays resident but the budget is %zu MB -- expect an"
-                        " allocation failure or a driver spill. Lower --n-ctx, add a GPU with"
-                        " --gpus, or raise --vram-budget if the device really has more.\n",
-                resident >> 20, budget >> 20);
+            ssd_mode ? "SSD" : "RAM", need >> 20, budget >> 20, experts >> 20,
+            (must + compute) >> 20);
 }
 
 // Assign each transformer layer to a GPU. Devices get contiguous ranges of the
