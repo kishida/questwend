@@ -518,6 +518,12 @@ struct Runtime::Impl {
     void init();
     void plan_layers();   // fill layer_dev from the --gpu-split shares
     void plan_offload();  // decide `offload` / `ssd_mode` from the resolved budgets
+    // What the graph allocators actually hold, against COMPUTE_HEADROOM, which
+    // is what the expert pool gave up for them. gallocr sizes its buffer on
+    // first use and grows it as bigger graphs appear, so this reports whenever
+    // the total grows -- a handful of lines that stop once prefill has run.
+    void report_compute_buffers();
+    size_t compute_reported = 0;
     // Bytes of KV / recurrent state layer `il` needs at cfg.n_ctx. Computed from
     // the hyper-parameters, so plan_offload() can charge for the state buffers
     // before they are allocated.
@@ -701,9 +707,20 @@ void Runtime::Impl::init() {
                     budget_from_flag = cfg.vram_budget_mb > 0;
                     const size_t budget = budget_from_flag
                         ? cfg.vram_budget_mb * 1024ull * 1024ull : got_free;
-                    fprintf(stderr, "backend: GPU [%s] %s (%s %zu MB)\n",
+                    // `got_free` is read after dev_init, so the CUDA context --
+                    // kernel images and all, several hundred MB of it -- is
+                    // already out of it. Printing the total next to it is what
+                    // keeps that from reading as memory gone missing.
+                    char b_s[96];
+                    if (budget_from_flag)
+                        snprintf(b_s, sizeof(b_s), "budget %zu MB of %zu free", budget >> 20,
+                                 got_free >> 20);
+                    else
+                        snprintf(b_s, sizeof(b_s), "free %zu MB", got_free >> 20);
+                    fprintf(stderr, "backend: GPU [%s] %s (%s of %zu MB, after the backend"
+                                    " context)\n",
                             ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
-                            budget_from_flag ? "budget" : "free", budget >> 20);
+                            b_s, dev_total >> 20);
                     gpus.push_back(backend);
                     dev_budget.push_back(budget);
                     dev_free.push_back(got_free);
@@ -729,10 +746,17 @@ void Runtime::Impl::init() {
                 ggml_backend_dev_memory(devs[(size_t) p.device], &got_free, &dev_total);
                 const size_t budget = from_free ? got_free : p.budget_mb * 1024ull * 1024ull;
                 if (!from_free) budget_from_flag = true;
-                fprintf(stderr, "backend: GPU%d [%s] %s (%s %zu MB, split %.3g)\n",
+                char split_s[32], b_s[96];
+                if (p.split < 0.0f) snprintf(split_s, sizeof(split_s), "auto");
+                else                snprintf(split_s, sizeof(split_s), "%.3g", p.split);
+                if (from_free) snprintf(b_s, sizeof(b_s), "free %zu MB", got_free >> 20);
+                else           snprintf(b_s, sizeof(b_s), "budget %zu MB of %zu free",
+                                        budget >> 20, got_free >> 20);
+                fprintf(stderr, "backend: GPU%d [%s] %s (%s of %zu MB, after the backend"
+                                " context; split %s)\n",
                         p.device, ggml_backend_dev_name(devs[(size_t) p.device]),
                         ggml_backend_dev_description(devs[(size_t) p.device]),
-                        from_free ? "free" : "budget", budget >> 20, p.split);
+                        b_s, dev_total >> 20, split_s);
                 gpus.push_back(be);
                 dev_budget.push_back(budget);
                 dev_free.push_back(got_free);
@@ -992,6 +1016,38 @@ void Runtime::Impl::init() {
         init_state_backup();   // MTP reject needs GDN rollback even without the cache
     }
     zero_states();
+}
+
+void Runtime::Impl::report_compute_buffers() {
+    const size_t nd = std::max<size_t>(gpus.size(), 1);
+    std::vector<size_t> per_dev(nd, 0);
+    auto add = [&](ggml_gallocr_t g, size_t d) {
+        if (g && d < nd) per_dev[d] += ggml_gallocr_get_buffer_size(g, 0);
+    };
+    // The per-device cache allocators; cache_galloc aliases cache_gallocs[0].
+    for (size_t d = 0; d < cache_gallocs.size(); ++d) add(cache_gallocs[d], d);
+    if (cache_gallocs.empty()) add(cache_galloc, 0);
+    // Everything else builds its graph on the primary device.
+    for (ggml_gallocr_t g : { galloc, mtp_galloc, m_galloc, r_galloc, v_galloc, dgalloc, f_galloc })
+        add(g, 0);
+    if (sched)
+        for (size_t d = 0; d < gpus.size() && d < nd; ++d)
+            per_dev[d] += ggml_backend_sched_get_buffer_size(sched, gpus[d]);
+
+    size_t total = 0;
+    for (size_t b : per_dev) total += b;
+    if (total <= compute_reported) return;   // no growth since the last line
+    compute_reported = total;
+
+    fprintf(stderr, "compute buffers: %zu MB", total >> 20);
+    if (nd > 1) {
+        fprintf(stderr, " (");
+        for (size_t d = 0; d < nd; ++d)
+            fprintf(stderr, "%sGPU%d %zu", d ? ", " : "",
+                    d < cfg.gpus.size() ? cfg.gpus[d].device : (int) d, per_dev[d] >> 20);
+        fprintf(stderr, " MB)");
+    }
+    fprintf(stderr, " of the %zu MB reserved per device\n", COMPUTE_HEADROOM >> 20);
 }
 
 size_t Runtime::Impl::state_bytes(int il) const {
@@ -4899,6 +4955,7 @@ Runtime::~Runtime() = default;
 const std::vector<float> & Runtime::decode(const std::vector<int32_t> & tokens) {
     const std::vector<float> & l = impl_->decode(tokens);
     impl_->kv_toks.insert(impl_->kv_toks.end(), tokens.begin(), tokens.end());
+    impl_->report_compute_buffers();
     return l;
 }
 void Runtime::set_embd_overrides(std::vector<EmbdOverride> ovr) {
@@ -4914,6 +4971,7 @@ void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int
 void Runtime::prefill(const std::vector<int32_t> & tokens, bool mtp_kv) {
     impl_->prefill(tokens, mtp_kv);
     impl_->kv_toks.insert(impl_->kv_toks.end(), tokens.begin(), tokens.end());
+    impl_->report_compute_buffers();   // the batched prefill graph is the biggest one
 }
 void Runtime::snapshot_ckpt()          { impl_->pk_snapshot(); }
 int  Runtime::best_ckpt(int n) const   { return impl_->pk_best(n); }
