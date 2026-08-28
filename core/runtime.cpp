@@ -24,10 +24,14 @@ namespace questwend {
 
 static const int GRAPH_SIZE = 16384;
 
-// Graph-buffer headroom kept on every device: what gallocr / sched allocate for
-// the forward pass, before the expert pool takes what is left of the budget.
-// One constant, so the offload decision and the pool sizing cannot drift apart.
-static const size_t COMPUTE_HEADROOM = 1024ull * 1024ull * 1024ull;
+// Prefill chunk length in tokens (--batch-chunk / QWEN_BATCH_CHUNK). The
+// batched prefill graph is the biggest one built, so this is also what bounds
+// the graph-buffer headroom below.
+static int batch_chunk() {
+    int chunk = 4096;
+    if (const char * c = getenv("QWEN_BATCH_CHUNK")) { int v = atoi(c); if (v >= 1) chunk = v; }
+    return chunk;
+}
 
 // Allocate exactly `ts` into one fresh buffer on `buft`. ggml_backend_alloc_ctx_tensors
 // cannot be used where tensors from a single context are spread over several
@@ -518,7 +522,32 @@ struct Runtime::Impl {
     void init();
     void plan_layers();   // fill layer_dev from the --gpu-split shares
     void plan_offload();  // decide `offload` / `ssd_mode` from the resolved budgets
-    // What the graph allocators actually hold, against COMPUTE_HEADROOM, which
+    // Graph-buffer headroom to keep on each device: what gallocr and sched
+    // allocate for the forward pass, before the expert pool takes what is left
+    // of the budget. Used by the offload decision and by the pool sizing, so
+    // the two cannot drift apart.
+    //
+    // This was a flat 1 GiB, which is 6% of a 16 GB card and 17% of a 6 GB one,
+    // and it ignored --batch-chunk -- the one knob that changes the size of the
+    // graph being reserved for. Measured against the batched prefill graph at
+    // chunk 4096, which is the largest one built: 112 MB for 35B-A3B (residual
+    // 2048) and 200 MB for Qwen3.8-Flash-Next (residual 10240, i.e. five times
+    // the width for under twice the buffer -- most of it is the vocabulary-sized
+    // tail, not the token dimension). Hence a fixed part plus a term in
+    // width * chunk, at a little under two times the measurements.
+    //
+    // Only the offload path spends this: without a pool there is nothing for the
+    // headroom to take memory away from, and an underestimate there merely makes
+    // "it fits" slightly more optimistic. On the offload path an underestimate
+    // fails when prefill allocates its graph -- with the numbers, since
+    // throw_alloc_failure() reports them.
+    size_t compute_headroom() const {
+        const size_t scaled = (size_t) model.hparams().n_embd_hc() * (size_t) batch_chunk() * 4;
+        const size_t want   = 192ull * 1024 * 1024 + scaled;
+        return std::min<size_t>(std::max<size_t>(want, 256ull * 1024 * 1024),
+                                1024ull * 1024 * 1024);
+    }
+    // What the graph allocators actually hold, against compute_headroom(), which
     // is what the expert pool gave up for them. gallocr sizes its buffer on
     // first use and grows it as bigger graphs appear, so this reports whenever
     // the total grows -- a handful of lines that stop once prefill has run.
@@ -1047,7 +1076,7 @@ void Runtime::Impl::report_compute_buffers() {
                     d < cfg.gpus.size() ? cfg.gpus[d].device : (int) d, per_dev[d] >> 20);
         fprintf(stderr, " MB)");
     }
-    fprintf(stderr, " of the %zu MB reserved per device\n", COMPUTE_HEADROOM >> 20);
+    fprintf(stderr, " of the %zu MB reserved per device\n", compute_headroom() >> 20);
 }
 
 size_t Runtime::Impl::state_bytes(int il) const {
@@ -1090,7 +1119,7 @@ void Runtime::Impl::plan_offload() {
     const size_t weights = model.weight_bytes(backend);
     size_t kv = 0;
     for (int il = 0; il < (int) hp.n_layer; ++il) kv += state_bytes(il);
-    const size_t compute = COMPUTE_HEADROOM * std::max<size_t>(gpus.size(), 1);
+    const size_t compute = compute_headroom() * std::max<size_t>(gpus.size(), 1);
     const size_t need    = weights + kv + compute;
 
     if (model.has_expert_tensors() && need > budget) {
@@ -1101,7 +1130,7 @@ void Runtime::Impl::plan_offload() {
     // What the device has to hold whatever the tier decides: the weights that
     // stay on it plus the KV / recurrent state. The compute headroom is left out
     // -- it is a reservation the expert pool gives way to, and a graph needing
-    // less than COMPUTE_HEADROOM still runs -- so this is the floor, not the wish.
+    // less than the headroom still runs -- so this is the floor, not the wish.
     const size_t experts = offload ? model.offloaded_expert_bytes() : 0;
     const size_t must    = weights - experts + kv;
 
@@ -1305,7 +1334,7 @@ void Runtime::Impl::plan_pools() {
     // the non-expert weights left out. They are roughly proportional to a
     // device's layer count, so leaving them out skews the ratio a little but not
     // the shape; the placement line below makes the outcome visible.
-    const size_t compute = COMPUTE_HEADROOM;
+    const size_t compute = compute_headroom();
     const int n_embd_gqa = hp.n_head_kv * hp.n_embd_head;
     const int conv_ch    = hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state;
     std::vector<double> surplus(gpus.size(), 0.0);
@@ -1363,7 +1392,7 @@ void Runtime::Impl::init_cache() {
     // On Windows the driver then silently spills allocations to shared system
     // memory (paged over PCIe), uniformly slowing prefill and decode; sizing
     // the pool against the real KV bytes keeps everything VRAM-resident.
-    const size_t compute = COMPUTE_HEADROOM;   // gallocr graph buffers
+    const size_t compute = compute_headroom();   // gallocr graph buffers
 
     // Only the main stack's experts are offloaded; the trailing MTP (nextn) block
     // stays fully VRAM-resident, so the cache covers n_main() layers (not n_layer).
@@ -4739,8 +4768,9 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
         // expert pools. Bigger chunks amortize each layer's expert fetch over
         // more tokens: expert traffic scales with the number of chunks, not T.
         // 4096 tokens ≈ 100 MB of carry tensors (7 x n_embd x T floats).
-        int chunk = 4096;
-        if (const char * c = getenv("QWEN_BATCH_CHUNK")) { int v = atoi(c); if (v >= 1) chunk = v; }
+        // Same reading as compute_headroom()'s: the headroom is reserved for
+        // exactly the graph this chunk builds, so the two must agree.
+        const int chunk = batch_chunk();
         int i = 0;
         while (i < n_tokens) {
             const int t = std::min(chunk, n_tokens - i);
