@@ -23,17 +23,63 @@ class Model;
 // machines whose CUDA device was found and initialized just fine.
 std::vector<ggml_backend_dev_t> gpu_devices();
 
+// One GPU in a multi-GPU plan.
+//
+// `split` is the device's share of the model's *compute* layers; the VRAM its
+// layers do not consume becomes expert-cache pool on that same device. The two
+// layouts sketched in spec.md are therefore the ends of one continuum rather
+// than separate modes: give both devices a share and it is a layer split, give
+// a device split == 0 and it holds no layers, so its whole budget is surplus
+// and it acts as a pure expert pool for the devices that do compute. A single
+// device with split == 1 is the original single-GPU behavior.
+// A --vram-budget element of "auto" (or an omitted budget): give the device all
+// the VRAM it has free. Distinct from a budget of 0, which turns the device off.
+static const size_t VRAM_BUDGET_AUTO = (size_t) -1;
+
+struct GpuPlan {
+    int    device    = 0;                  // index into gpu_devices()
+    size_t budget_mb = VRAM_BUDGET_AUTO;   // VRAM budget, or AUTO for "all free"
+    float  split     = -1.0f;              // compute-layer share; < 0 = auto (by budget)
+};
+
+// Where a MoE model's routed experts live once they no longer fit in VRAM.
+// SSD is the default tier: the pages the run actually touches end up in the
+// OS page cache anyway, so a RAM copy of the same weights mostly buys a second
+// copy of them -- and it is the tier that lets a model larger than memory run
+// at all. RAM is worth asking for when the experts do fit in host memory and
+// the drive is slow (see docs/, --experts-ram).
+enum class ExpertTier { Ssd, Ram };
+
 struct RuntimeConfig {
     int    n_ctx          = 4096;
     int    n_threads      = 0;       // 0 = auto
     bool   use_cuda       = true;    // try a GPU device first, fall back to CPU
-    size_t vram_budget_mb = 0;       // >0: offload expert weights to CPU,
-                                     //     enables running large MoE models with limited VRAM
+    // VRAM the model may use, in MB. 0 = auto: ask each device what it has
+    // free. Either way it is a capacity, not a mode switch -- a model whose
+    // weights fit inside it stays fully resident, and one that does not
+    // offloads its routed experts to `expert_tier`.
+    size_t vram_budget_mb = 0;
+    // Multi-GPU plan. Empty = use the first GPU device only (single-GPU
+    // behavior, with vram_budget_mb as its budget).
+    std::vector<GpuPlan> gpus;
     std::string cache_profile;       // file to persist/prefetch the hot-expert profile
     bool   cache_profile_save = true; // false: load/prefetch only, never overwrite the profile
-    bool   experts_ssd    = false;   // stream experts from the GGUF on SSD (no RAM copy)
+    ExpertTier expert_tier = ExpertTier::Ssd;   // tier used when the experts must leave VRAM
     bool   use_mtp        = false;   // MTP self-speculative decode (keeps nextn block VRAM-resident)
     bool   embd_q8        = false;   // use Q8_0 (not F16) for token embedding fallback (saves VRAM)
+
+    // PLE n-gram embedding (qwen4exp). The table is 26.8 GiB in the IQ1_S quant
+    // of Qwen3.8-Flash-Next -- larger than every other weight put together
+    // except the experts -- and it is never a GPU tensor in any mode:
+    //   "disk" streams the ~n_heads rows a token needs, keeping ngram_cache_mb
+    //          of them in host memory. Bandwidth is trivial, IOPS is not.
+    //   "ram"  holds the whole table (still quantised) in host memory.
+    //   "off"  skips the module. The n-gram branch is a gated add onto the
+    //          residual, so the stack still runs; quality is whatever the model
+    //          is without it. On a machine where the experts would otherwise
+    //          have to stay on disk, this is what buys them a place in RAM.
+    std::string ngram_mode     = "disk";
+    size_t      ngram_cache_mb = 256;
 };
 
 // Parse a --vram-budget argument into MB (the unit RuntimeConfig stores).
@@ -43,6 +89,41 @@ struct RuntimeConfig {
 // switch to GB and nobody budgets 512 GB of VRAM; `legacy_mb` is set so the
 // caller can say so. Returns 0 (offloading off) for a non-positive value.
 size_t parse_vram_budget_mb(const std::string & arg, bool * legacy_mb = nullptr);
+
+// Comma-separated multi-GPU arguments. Each returns false (leaving `out`
+// untouched) when a field does not parse, so the caller can print the offending
+// argument and exit.
+//   --vram-budget "13.5,5"  -> one budget per device, each parsed as above.
+//                              "auto" gives that device all its free VRAM,
+//                              which is what the flag's absence already means,
+//                              so "auto" alone is identical to passing nothing.
+//                              "0" instead turns the device OFF: "--gpus 1,0
+//                              --vram-budget 5g,0" is the same as "--gpus 1
+//                              --vram-budget 5g".
+//   --gpus        "1,0"     -> device indices into gpu_devices(), primary first
+//   --gpu-split   "0.8,0"   -> compute-layer share per device (0 = expert pool)
+//                  "auto"   -> share by --vram-budget, or by free VRAM without it
+// A single-element --vram-budget keeps the old single-GPU meaning.
+bool parse_vram_budget_list(const std::string & arg, std::vector<size_t> & out,
+                            bool * legacy_mb = nullptr);
+bool parse_gpu_list(const std::string & arg, std::vector<int> & out);
+// "auto" parses to an empty `out` (a valid plan, ratio decided later), so the
+// caller must track whether the flag was present separately.
+bool parse_gpu_split(const std::string & arg, std::vector<float> & out);
+
+// Combine the parsed lists into RuntimeConfig::gpus.
+//
+// `split_given` is the multi-GPU switch: without --gpu-split exactly one GPU is
+// used, whatever else was listed, which keeps every existing command line doing
+// what it always did. Naming several devices without it is a mistake worth a
+// note rather than a silent layer split. `out` is left empty for the plain
+// default (no --gpus either), preserving "first device that initializes".
+// Prints what disagrees and returns false when the list lengths are inconsistent.
+bool build_gpu_plan(const std::vector<int> & gpu_ids,
+                    const std::vector<float> & gpu_split,
+                    bool split_given,
+                    const std::vector<size_t> & vram_mb,
+                    std::vector<GpuPlan> & out);
 
 class Runtime {
 public:

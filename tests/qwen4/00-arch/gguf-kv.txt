@@ -1,0 +1,84 @@
+==== 67 KV pairs (Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf) ====
+general.architecture = 'qwen4exp'
+general.type = 'model'
+general.sampling.top_k = 20
+general.sampling.top_p = 0.949999988079071
+general.sampling.temp = 1.0
+general.name = 'Qwen3.8 Flash Next'
+general.description = 'A Preview of the Qwen4 Architecture'
+general.size_label = '512x56B'
+qwen4exp.block_count = 48
+qwen4exp.context_length = 262144
+qwen4exp.embedding_length = 2560
+qwen4exp.attention.head_count = 24
+qwen4exp.attention.head_count_kv = 2
+qwen4exp.rope.dimension_sections = [11, 11, 10, 0]  (n=4)
+qwen4exp.rope.freq_base = 10000000.0
+qwen4exp.attention.layer_norm_rms_epsilon = 9.999999974752427e-07
+qwen4exp.expert_count = 512
+qwen4exp.expert_used_count = 10
+qwen4exp.attention.key_length = 256
+qwen4exp.attention.value_length = 256
+qwen4exp.expert_feed_forward_length = 640
+qwen4exp.expert_shared_feed_forward_length = 640
+qwen4exp.ssm.conv_kernel = 4
+qwen4exp.ssm.state_size = 128
+qwen4exp.ssm.group_count = 16
+qwen4exp.ssm.time_step_rank = 48
+qwen4exp.ssm.inner_size = 6144
+qwen4exp.full_attention_interval = 4
+qwen4exp.rope.dimension_count = 64
+qwen4exp.hyper_connection.count = 4
+qwen4exp.hyper_connection.low_rank = 320
+qwen4exp.attention.indexer.head_count = 4
+qwen4exp.attention.indexer.key_length = 128
+qwen4exp.attention.indexer.top_k = 2048
+qwen4exp.attention.compress_ratios = [0, 0, 0, 4, 0, 0, ...]  (n=48)
+qwen4exp.ple.layers = [1]  (n=1)
+qwen4exp.ple.ngram_size = 3
+qwen4exp.ple.heads_per_ngram = 8
+qwen4exp.ple.conv_kernel = 4
+qwen4exp.ple.eos_token_id = 248044
+qwen4exp.embedding_length_per_layer_input = 160
+qwen4exp.ple.layer_multipliers = [23703573157769, 20109073645365, 8052911324071]  (n=3)
+qwen4exp.ple.head_offsets = [0, 20000003, 40000026, 60000059, 80000106, 100000165, ...]  (n=16)
+qwen4exp.ple.head_vocab_sizes = [20000003, 20000023, 20000033, 20000047, 20000059, 20000063, ...]  (n=16)
+tokenizer.ggml.model = 'gpt2'
+tokenizer.ggml.pre = 'qwen35'
+tokenizer.ggml.tokens = ['!', '"', '#', '$', '%', '&', ...]  (n=248320)
+tokenizer.ggml.token_type = [1, 1, 1, 1, 1, 1, ...]  (n=248320)
+tokenizer.ggml.merges = ['Ġ Ġ', 'ĠĠ ĠĠ', 'i n', 'Ġ t', 'ĠĠĠĠ ĠĠĠĠ', 'e r', ...]  (n=247587)
+tokenizer.ggml.eos_token_id = 248046
+tokenizer.ggml.padding_token_id = 248044
+tokenizer.ggml.bos_token_id = 248044
+tokenizer.ggml.add_bos_token = False
+general.quantization_version = 2
+general.file_type = 24
+quantize.imatrix.file = 'Qwen3.8-Flash-Next-GGUF/imatrix_unsloth.gguf'
+quantize.imatrix.dataset = 'unsloth_calibration_Qwen3.8-Flash-Next.txt'
+quantize.imatrix.entries_count = 926
+quantize.imatrix.chunks_count = 45
+tokenizer.chat_template = '{%- set image_count = namespace(value=0) %}\n{%- set video_count = namespace(value=0) %}\n{%- macro render_content(content, do_vision_count, is_system_content=false) %}\n    {%- if content is string %}\n ' ... (9993 chars)
+qwen4exp.ple.image_token_id = 248056
+general.quantized_by = 'Unsloth'
+general.repo_url = 'https://huggingface.co/unsloth'
+general.tags = ['unsloth']  (n=1)
+split.no = 0
+split.tensors.count = 1224
+split.count = 3
+
+==== size by category ====
+exps        37.11 GiB
+    IQ4_NL        21.09 GiB
+    IQ1_S         10.38 GiB
+    IQ2_XXS        5.64 GiB
+ple         26.82 GiB
+    IQ4_NL        26.82 GiB
+other        3.62 GiB
+    Q5_K           1.42 GiB
+    Q8_0           0.74 GiB
+    Q4_K           0.67 GiB
+    Q6_K           0.47 GiB
+    F32            0.29 GiB
+    BF16           0.04 GiB
+TOTAL       67.55 GiB   (1224 tensors)

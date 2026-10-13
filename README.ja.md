@@ -4,7 +4,7 @@
 
 Qwen3 / Qwen3.5 / Qwen3.6 をスクラッチ実装した推論エンジン（vendored ggml の上に構築）。
 
-- **対応アーキテクチャ**: `qwen3`（dense）, `qwen3moe`（MoE）, `qwen35` / `qwen35moe`（Gated DeltaNet ハイブリッド）, `qwen3next`
+- **対応アーキテクチャ**: `qwen3`（dense）, `qwen3moe`（MoE）, `qwen35` / `qwen35moe`（Gated DeltaNet ハイブリッド）, `qwen3next`, `qwen4exp`（Qwen3.8-Flash-Next: hyper-connection + QSA + PLE n-gram 埋め込み）
 - **バックエンド**: CUDA（Windows/Linux）, Metal（macOS）, HIP/ROCm（AMD, 未検証）, CPU フォールバック
 - **主な機能**:
   - MoE エキスパートのオフロード（**RAM 階層** / **SSD 階層**）＋動的 VRAM エキスパートキャッシュ
@@ -129,34 +129,53 @@ qw-cli -m model.gguf --info                  # モデル情報を表示して終
 | `-i` | 対話チャット |
 | `--chat` | `-p` を ChatML でラップ |
 | `--reasoning <on\|off>` | thinking モード（既定 on; off で `<think>\n\n</think>` 終端） |
-| `--n-ctx <N>` | コンテキスト長（既定: モデルの学習時コンテキスト長。KV キャッシュがこれで確保されるので、収まらないときは下げる） |
+| `--n-ctx <N>` | コンテキスト長（既定: モデルの学習時コンテキスト長。KV キャッシュがこれで確保されるので、収まらないときは下げる。学習長を超える値を指定すると警告する: RoPE スケーリングは未実装なので、超えた位置は外挿になり出力が劣化する） |
 | `--temp <f>` / `--top-p <f>` / `--top-k <N>` / `--seed <N>` | サンプリング（既定 greedy: temp=0） |
 | `--embd-q8` | 埋め込み get_rows フォールバックを F16 でなく Q8_0 にする（VRAM 節約; わずかな量子化誤差） |
 | `--image <path>` | 画像をプロンプトに添付（複数可。VL モデル + mmproj が必要） |
 | `--mmproj <gguf>` | vision tower の GGUF（省略時はモデルと同じフォルダの `mmproj-*.gguf` を自動発見） |
 | `--vision-test` | 画像を vision tower だけでエンコードして統計表示（数値検証用; LLM 不要） |
 | `--log-tokens-per-sec` | prefill / 生成の tok/s を表示 |
+| `--gpus <list>` / `--gpu-split <list>` | 複数 GPU を使う（[複数 GPU](#複数-gpu) 参照） |
 | `--cpu` | CPU バックエンドを強制 |
 
 ### エキスパート・オフロード（大きい MoE を限られた VRAM で）
 
-```bash
-# RAM 階層: 非エキスパート重みを GPU、エキスパートは pinned host RAM に置き
-#           動的 VRAM キャッシュ経由でストリーミング（PCIe）
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15
+**既定で自動**。オプションなしで、デバイスの空き容量を測り、収まらないぶんのルーテッド
+エキスパートを GGUF からディスク直読でストリーミングする。メモリより大きいモデルを
+SSD オフロードで動かす、という典型的な使い方にフラグは要らない。
 
-# SSD 階層: エキスパートを GGUF からディスク直読（RAM コピーなし）
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 12 --experts-ssd
+```bash
+# 自動: 空き VRAM に収まればそのまま常駐、収まらなければ SSD 階層に落ちる
+qw-cli -m moe.gguf -p "..." -n 128
+
+# 予算を明示（他のプロセスに VRAM を残す、複数 GPU に配分する、など）
+qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 12
+
+# RAM 階層: エキスパートを pinned host RAM に置いて VRAM キャッシュへ流す
+qw-cli -m moe.gguf -p "..." -n 128 --experts-ram
 
 # 常駐プロファイル: 1回目に保存、2回目以降は起動時にホットなエキスパートを事前常駐
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 15 --cache-profile hot.prof
+qw-cli -m moe.gguf -p "..." -n 128 --cache-profile hot.prof
 ```
 
-- `--vram-budget <GB>`: スロットプールに使う VRAM 予算（>0 でオフロード有効）。
+- `--vram-budget <GB>`: モデルが使ってよい VRAM 量。**未指定ならデバイスの空き容量を自動取得**する。
+  重み + KV + 計算バッファがこの予算に収まればオフロードせず全常駐、超えたぶんだけ
+  エキスパートが階層に落ちる（起動ログに判定が出る）。
   単位は **GB**、小数も可（`13.5`）。`M`/`G` サフィックスを付ければ明示指定できる（`13500M`, `14G`）。
   512 以上の裸の数値は MB として解釈するので、単位変更前に書いたコマンドはそのまま動く
   （GB 表記を促す注意書きが出る）。
-- `--experts-ssd`: エキスパートをディスクからストリーミング（RAM に載らない巨大モデル向け）。
+- 必須部分（オフロードできない重み + KV）が入らないときは、重みをロードする前に必要量・利用可能量・
+  内訳（`--n-ctx` ぶんの KV がいくらか）を挙げて止まる。予算だけを超えていてデバイスには載る場合は
+  警告のみで続行し、エキスパートプールが取れないことを明示する。
+- `--experts-ssd`: エキスパートを GGUF からディスク直読（RAM コピーなし）。**既定の階層**なので
+  通常は指定不要。触ったページは OS のページキャッシュに乗るので、RAM コピーを別に持つ意味は薄い。
+- `--experts-ram`: 代わりに pinned host RAM に置く。エキスパートが RAM に収まり、かつドライブが
+  遅いときに効く。`--experts-ssd` と同時指定はエラー。
+- `--ngram <off|disk|ram>`: qwen4exp の n-gram 埋め込みテーブルの置き場（既定 `disk`）。
+  Qwen3.8-Flash-Next では 26.8 GB あり、**どのモードでも GPU には載せない**。
+  `off` はモジュールごとスキップする（残差へのゲート付き加算ブランチなので、外してもスタックは動く）。
+  `disk` のホストキャッシュ量は `--ngram-cache <MB>`（既定 256）。
 - `--cache-profile <file>`: ホットエキスパートの頻度プロファイルを永続化。**同一/類似ワークロードで hit 率が ~100% になり、ストリーミングがほぼ消えて大幅高速化**。
 
 prefill は **layer-major 実行**（層ごとにエキスパートを一度だけ fetch して全トークンを処理）が既定で、
@@ -176,6 +195,47 @@ prefill は **layer-major 実行**（層ごとにエキスパートを一度だ�
   スキップ（例 `0.05`。SSD 階層で特に有効）。lossy。
 - `--ssd-direct`: SSD 読みで OS のページキャッシュをバイパス（Windows, unbuffered I/O）。
   モデルが RAM に収まらない場合の実性能を測るとき・二重キャッシュを避けたいときに。
+
+### 複数 GPU
+
+**デバイスを複数指定すること自体が「複数 GPU を使う」という指示**になる。`--gpus` で並べても、
+`--vram-budget` を GPU ごとに与えてもよい。レイヤーは連続した範囲でデバイスに割り当てられ、
+あるレイヤーの重み・KV キャッシュ・エキスパートプールはすべて同じデバイスに置かれるので、
+バスをまたぐのはデバイス境界の隠れ状態だけ（1 トークンあたり数 KB）。
+
+```bash
+# 1 枚に載らないモデルを 2 枚で動かす（各 GPU の空き VRAM を全部使う）
+qw-cli -m big.gguf -p "..." --gpus 0,1
+
+# GPU ごとに予算を与えてエキスパート・オフロード
+qw-cli -m moe.gguf -p "..." --vram-budget 13.5,5
+
+# GPU1 はレイヤーを持たず、予算まるごとが GPU0 用のエキスパートプールになる
+qw-cli -m moe.gguf -p "..." --gpus 0,1 --vram-budget 8,5 --gpu-split 1,0
+```
+
+- `--gpus <list>`: デバイス番号を primary から順に（`1` や `1,0`）。**順序は ggml のもの、つまり
+  CUDA 既定の「速い順」で、`nvidia-smi` の PCI 順とは逆**。多くの場合 `--gpus 0` が速いカードになる。
+  起動ログに各デバイス名が出るのでそこで確認すること。
+- `--vram-budget <list>`: GPU ごとに 1 値。`auto` はそのデバイスの空き VRAM を全部使う（フラグを
+  省略したときの既定）。`0` はそのデバイスをプランから外すので、`--gpus 1,0 --vram-budget 5g,0` は
+  `--gpus 1 --vram-budget 5g` と同じ。フラグ自体を省略した場合は `auto` と同じ。
+- `--gpu-split <list>`: 各 GPU が持つレイヤーの割合。既定は `--vram-budget` の比、予算が無ければ
+  空き VRAM の比。値は相対比なので `0.9,0.1` / `9,1` / `18,2` はすべて同じ意味で、40 レイヤーの
+  モデルなら `36,4` はちょうど 36 と 4 になる。`0` を与えた GPU はレイヤーを持たないが、予算は
+  他 GPU 用の**エキスパートプール**として使われ、そのレイヤーのエキスパート行列積はそこで走る。
+  `auto` は存在する GPU をすべて使う。
+
+`--gpus` と `--vram-budget` の指定個数は一致していなければならず、`--vram-budget 0` で切った
+デバイスに `--gpu-split` で 0 以外の割り当てをすることもできない。どちらも推測せずエラーにする。
+同じフラグは `qw-server` でも使える。
+
+2 枚目の GPU は万能ではなくトレードオフである。VRAM は増える（常駐率が律速しているときはこれが
+効く）が、バッチ 1 では一度に 1 デバイスしか計算しないので、遅い 2 枚目は速い 1 枚目を待たせる。
+RTX 4060 Ti + RTX 3050、35B-A3B MoE での実測: エキスパートプールが本当に不足する予算では 2 枚が
+デコードで **+15%**（16.6 → 19.1 tok/s、ミス −64%）、プールが既に足りている予算では **−6%**。
+prefill は計算律速なのでどちらの場合も遅くなる。数値と考察は
+[issue #4](https://github.com/kishida/questwend/issues/4)。
 
 ### MTP 自己推測デコード（nextn ブロックを持つモデル）
 
@@ -207,7 +267,9 @@ qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15
 | `--host <addr>` | バインドアドレス（既定 `127.0.0.1`; LAN 公開は `0.0.0.0`） |
 | `--port <N>` | ポート（既定 8080） |
 | `--n-ctx <N>` | コンテキスト長 |
-| `--vram-budget <GB>` / `--experts-ssd` | エキスパート・オフロード（GB、小数可。`M`/`G` で明示指定） |
+| `--vram-budget <GB>` | モデルが使ってよい VRAM（既定: 空き容量を自動取得。GB、小数可、`M`/`G` で明示指定） |
+| `--experts-ssd` / `--experts-ram` | エキスパートの退避先（既定 SSD。同時指定はエラー） |
+| `--gpus <list>` / `--gpu-split <list>` | 複数 GPU を使う（[複数 GPU](#複数-gpu) 参照） |
 | `--cache-profile <file>` | 常駐プロファイル（**サーバーは読み込みのみ**, 上書きしない） |
 | `--reasoning <on\|off>` | thinking モードの既定（UI のチェックにも反映） |
 | `--mtp` | MTP 自己推測デコード（nextn ブロックを持つモデル; 起動時に有効化） |
@@ -249,7 +311,7 @@ qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15
 `model-00001-of-00003.gguf` のように分割されたモデルは、**先頭シャード**を `-m` に渡すだけで自動的に全シャードを探索・統合します（命名は 5 桁ゼロ詰め、00001 開始）。
 
 ```bash
-qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40 --experts-ssd
+qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40
 ```
 
 ---

@@ -31,6 +31,10 @@ public:
     int32_t bos() const { return bos_; }
     // Does the model want a BOS in front of a raw prompt? (tokenizer.ggml.add_bos_token)
     bool    wants_bos() const { return add_bos_; }
+    // Does a chat conversation start with BOS? Either the model wants one on
+    // every prompt, or its chat template opens with {{ bos_token }} (lfm2 does,
+    // without setting add_bos_token).
+    bool    chat_wants_bos() const { return add_bos_ || template_bos_; }
     int32_t eos() const { return eos_; }
     int32_t token_to_id(const std::string & tok) const;
 
@@ -40,6 +44,7 @@ private:
     std::unordered_map<std::string, int>     merge_rank_;    // "A B" -> rank
     int32_t bos_ = -1, eos_ = -1;
     bool    add_bos_ = false;
+    bool    template_bos_ = false;
 
     // byte <-> unicode (GPT-2 mapping)
     std::unordered_map<uint8_t, uint32_t> byte_to_uni_;

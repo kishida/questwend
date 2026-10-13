@@ -10,11 +10,31 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
 
 namespace questwend {
+
+void throw_alloc_failure(ggml_backend_buffer_type_t buft, size_t bytes, const std::string & what) {
+    std::string dev = buft ? ggml_backend_buft_name(buft) : "the backend";
+    size_t dev_free = 0, dev_total = 0;
+    if (ggml_backend_dev_t d = buft ? ggml_backend_buft_get_device(buft) : nullptr) {
+        ggml_backend_dev_memory(d, &dev_free, &dev_total);
+        dev = ggml_backend_dev_description(d);
+    }
+    char msg[512];
+    if (dev_total)
+        snprintf(msg, sizeof(msg),
+                 "failed to allocate %zu MB for %s on %s: %zu MB free of %zu MB. "
+                 "Lower --n-ctx, add a device with --gpus, or run on the CPU with --cpu.",
+                 bytes >> 20, what.c_str(), dev.c_str(), dev_free >> 20, dev_total >> 20);
+    else
+        snprintf(msg, sizeof(msg), "failed to allocate %zu MB for %s on %s",
+                 bytes >> 20, what.c_str(), dev.c_str());
+    throw std::runtime_error(msg);
+}
 
 const char * arch_name(Arch a) {
     switch (a) {
@@ -23,6 +43,7 @@ const char * arch_name(Arch a) {
         case Arch::QWEN35:    return "qwen35";
         case Arch::QWEN35MOE: return "qwen35moe";
         case Arch::QWEN3NEXT: return "qwen3next";
+        case Arch::QWEN4EXP:  return "qwen4exp";
         case Arch::STEP35:    return "step35";
         default:              return "unknown";
     }
@@ -34,6 +55,7 @@ static Arch arch_from_string(const std::string & s) {
     if (s == "qwen35")    return Arch::QWEN35;
     if (s == "qwen35moe") return Arch::QWEN35MOE;
     if (s == "qwen3next") return Arch::QWEN3NEXT;
+    if (s == "qwen4exp")  return Arch::QWEN4EXP;
     if (s == "step35")    return Arch::STEP35;
     return Arch::UNKNOWN;
 }
@@ -64,12 +86,20 @@ bool Model::is_offloaded_expert(const std::string & name) const {
     return true;
 }
 
+size_t Model::offloaded_expert_bytes() const {
+    size_t n = 0;
+    for (auto & kv : tensors_)
+        if (is_offloaded_expert(kv.first)) n += ggml_nbytes(kv.second);
+    return n;
+}
+
 Model::~Model() {
     if (embd_buf_)    ggml_backend_buffer_free(embd_buf_);
     if (embd_ctx_)    ggml_free(embd_ctx_);
     if (weights_buf_) ggml_backend_buffer_free(weights_buf_);
     if (gguf_) gguf_free(gguf_);
-    if (meta_) ggml_free(meta_);
+    if (meta_)    ggml_free(meta_);
+    if (ple_ctx_) ggml_free(ple_ctx_);
 }
 
 // Whether `backend` can run ggml_get_rows directly on a tensor of te's type.
@@ -89,23 +119,38 @@ static bool backend_supports_get_rows(ggml_backend_t backend, const ggml_tensor 
 }
 
 // Quantized token embedding needs a get_rows-friendly copy only when the
-// backend has no native kernel for the stored type.
-static bool need_embd_fallback(ggml_backend_t backend, const ggml_tensor * te) {
+// backend has no native kernel for the stored type. `verbose` is off for the
+// weight_bytes() estimate, which asks the same question before loading and
+// should not narrate the answer a second time.
+static bool need_embd_fallback(ggml_backend_t backend, const ggml_tensor * te,
+                               bool verbose = true) {
     if (!te || te->type == GGML_TYPE_F32 || te->type == GGML_TYPE_F16) return false;
     if (backend_supports_get_rows(backend, te)) {
-        fprintf(stderr, "token_embd: %s natively supported by backend get_rows (no fallback copy)\n",
-                ggml_type_name(te->type));
+        if (verbose)
+            fprintf(stderr, "token_embd: %s natively supported by backend get_rows (no fallback copy)\n",
+                    ggml_type_name(te->type));
         return false;
     }
     return true;
 }
 
+size_t Model::weight_bytes(ggml_backend_t backend) const {
+    size_t n = 0;
+    for (auto & kv : tensors_) n += ggml_nbytes(kv.second);
+    // The get_rows fallback copy is an extra resident tensor, not a replacement:
+    // load_weights_* keeps the quantized original for the output head.
+    ggml_tensor * te = tensor("token_embd.weight");
+    if (backend && need_embd_fallback(backend, te, /*verbose=*/false))
+        n += ggml_row_size(embd_q8_ ? GGML_TYPE_Q8_0 : GGML_TYPE_F16, te->ne[0]) * te->ne[1];
+    return n;
+}
+
 ggml_backend_buffer * Model::load_weights(ggml_backend_t backend) {
     // Allocate one backend buffer holding all weight tensors.
     weights_buf_ = ggml_backend_alloc_ctx_tensors(meta_, backend);
-    if (!weights_buf_) {
-        throw std::runtime_error("failed to allocate weights buffer");
-    }
+    if (!weights_buf_)
+        throw_alloc_failure(ggml_backend_get_default_buffer_type(backend),
+                            weight_bytes(nullptr), "the model weights");
 
     // token embedding for get_rows: dequantize if the stored type has no native
     // get_rows kernel on this backend (K-quants / IQ types on CUDA).
@@ -128,7 +173,9 @@ ggml_backend_buffer * Model::load_weights(ggml_backend_t backend) {
         tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, dst_type, te->ne[0], te->ne[1]);
         ggml_set_name(tok_embd_rows_, embd_q8_ ? "token_embd.q8_0" : "token_embd.f16");
         embd_buf_ = ggml_backend_alloc_ctx_tensors(embd_ctx_, backend);
-        if (!embd_buf_) throw std::runtime_error("failed to alloc token embedding fallback");
+        if (!embd_buf_)
+            throw_alloc_failure(ggml_backend_get_default_buffer_type(backend),
+                                ggml_nbytes(tok_embd_rows_), "the token embedding fallback copy");
     }
 
     std::map<std::string, void *> files;
@@ -179,6 +226,7 @@ static void alloc_tensors_chunked(ggml_backend_buffer_type_t buft,
         const size_t mb = strtoull(e, nullptr, 10);
         if (mb > 0) cap = std::min(cap, mb * 1024 * 1024);
     }
+    const size_t first_buf = out_bufs.size();   // this call's share of a shared vector
     size_t i = 0;
     while (i < ts.size()) {
         size_t group_sz = 0, j = i;
@@ -188,7 +236,7 @@ static void alloc_tensors_chunked(ggml_backend_buffer_type_t buft,
             group_sz += sz;
         }
         ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft, group_sz > 0 ? group_sz : 1);
-        if (!b) throw std::runtime_error(std::string("failed to allocate buffer for ") + what);
+        if (!b) throw_alloc_failure(buft, group_sz, what);
         ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         out_bufs.push_back(b);
         struct ggml_tallocr ta = ggml_tallocr_new(b);
@@ -198,21 +246,115 @@ static void alloc_tensors_chunked(ggml_backend_buffer_type_t buft,
                                          + ggml_get_name(ts[k]));
         i = j;
     }
-    if (out_bufs.size() > 1) {
+    if (out_bufs.size() - first_buf > 1) {
         size_t total = 0;
-        for (auto b : out_bufs) total += ggml_backend_buffer_get_size(b);
+        for (size_t k = first_buf; k < out_bufs.size(); ++k)
+            total += ggml_backend_buffer_get_size(out_bufs[k]);
         fprintf(stderr, "%s: %zu MB split over %zu buffers (backend caps one at %zu MB)\n",
-                what, total / 1048576, out_bufs.size(), cap / 1048576);
+                what, total / 1048576, out_bufs.size() - first_buf, cap / 1048576);
     }
+}
+
+int DevicePlan::dev_of_name(const std::string & name) const {
+    // "blk.<N>.rest"; anything else is model-global and belongs to the primary.
+    if (name.compare(0, 4, "blk.") != 0) return 0;
+    size_t p = 4;
+    int il = 0;
+    if (p >= name.size() || !isdigit((unsigned char) name[p])) return 0;
+    for (; p < name.size() && isdigit((unsigned char) name[p]); ++p)
+        il = il * 10 + (name[p] - '0');
+    // Shared experts run with the routed experts, on the pool's device.
+    const bool shexp = name.find("_shexp") != std::string::npos;
+    const std::vector<int> & map = (shexp && !pool_dev.empty()) ? pool_dev : layer_dev;
+    if (il < 0 || (size_t) il >= map.size()) return 0;
+    const int d = map[(size_t) il];
+    return (d >= 0 && (size_t) d < bufts.size()) ? d : 0;
+}
+
+void Model::load_weights_multi(ggml_backend_t primary, const DevicePlan & plan,
+                               std::vector<ggml_backend_buffer_t> & out_bufs,
+                               std::vector<size_t> * out_dev_bytes)
+{
+    const size_t n_dev = plan.n_dev();
+    if (n_dev == 0) throw std::runtime_error("load_weights_multi: empty device plan");
+
+    // token embedding for get_rows: same fallback rule as load_weights, but the
+    // copy is allocated into out_bufs on the primary rather than into embd_buf_.
+    ggml_tensor * te = tensor("token_embd.weight");
+    tok_embd_rows_ = te;
+    const bool need_f32_embd = need_embd_fallback(primary, te);
+    if (need_f32_embd) {
+        const ggml_type dst_type = embd_q8_ ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+        fprintf(stderr, "token_embd: %s is not GPU get_rows compatible, re-quantizing to %s\n",
+                ggml_type_name(te->type), ggml_type_name(dst_type));
+        ggml_init_params ep{};
+        ep.mem_size = ggml_tensor_overhead() + 256;
+        ep.no_alloc = true;
+        embd_ctx_ = ggml_init(ep);
+        tok_embd_rows_ = ggml_new_tensor_2d(embd_ctx_, dst_type, te->ne[0], te->ne[1]);
+        ggml_set_name(tok_embd_rows_, embd_q8_ ? "token_embd.q8_0" : "token_embd.f16");
+    }
+
+    std::vector<std::vector<ggml_tensor *>> per_dev(n_dev);
+    for (auto & kv : tensors_) per_dev[(size_t) plan.dev_of_name(kv.first)].push_back(kv.second);
+    if (need_f32_embd) per_dev[0].push_back(tok_embd_rows_);
+
+    if (out_dev_bytes) out_dev_bytes->assign(n_dev, 0);
+    for (size_t d = 0; d < n_dev; ++d) {
+        const size_t before = out_bufs.size();
+        char what[64];
+        snprintf(what, sizeof(what), "gpu%zu weights", d);
+        alloc_tensors_chunked(plan.bufts[d], per_dev[d],
+                              ggml_backend_buft_get_max_size(plan.bufts[d]), what, out_bufs);
+        if (out_dev_bytes)
+            for (size_t k = before; k < out_bufs.size(); ++k)
+                (*out_dev_bytes)[d] += ggml_backend_buffer_get_size(out_bufs[k]);
+    }
+
+    std::map<std::string, void *> files;
+    std::vector<uint8_t> buf;
+    std::vector<float>   f32buf;
+    for (auto & kv : tensors_) {
+        ggml_tensor * t = kv.second;
+        const size_t nb = ggml_nbytes(t);
+        buf.resize(nb);
+        read_tensor_bytes(kv.first, buf.data(), nb, files);
+        ggml_backend_tensor_set(t, buf.data(), 0, nb);
+
+        if (need_f32_embd && t == te) {
+            const int64_t ne = ggml_nelements(te);
+            f32buf.resize(ne);
+            ggml_get_type_traits(te->type)->to_float(buf.data(), f32buf.data(), ne);
+            std::vector<uint8_t> qbuf(ggml_nbytes(tok_embd_rows_));
+            if (embd_q8_) {
+                ggml_quantize_chunk(GGML_TYPE_Q8_0, f32buf.data(), qbuf.data(), 0, te->ne[1], te->ne[0], nullptr);
+            } else {
+                ggml_fp32_to_fp16_row(f32buf.data(), (ggml_fp16_t *) qbuf.data(), ne);
+            }
+            ggml_backend_tensor_set(tok_embd_rows_, qbuf.data(), 0, qbuf.size());
+        }
+    }
+    for (auto & kv : files) if (kv.second) fclose((FILE *) kv.second);
+
+    size_t total = 0;
+    for (auto b : out_bufs) total += ggml_backend_buffer_get_size(b);
+    fprintf(stderr, "weights: %.1f MB resident across %zu GPU(s)", total / 1048576.0, n_dev);
+    if (out_dev_bytes)
+        for (size_t d = 0; d < n_dev; ++d)
+            fprintf(stderr, "%s GPU%zu %.1f MB", d ? "," : ":", d, (*out_dev_bytes)[d] / 1048576.0);
+    fprintf(stderr, "\n");
 }
 
 void Model::load_weights_split(
     ggml_backend_t          gpu_backend,
     ggml_backend_buffer_type_t cpu_buft,
     std::vector<ggml_backend_buffer_t> & out_gpu_bufs,
-    std::vector<ggml_backend_buffer_t> & out_cpu_bufs)
+    std::vector<ggml_backend_buffer_t> & out_cpu_bufs,
+    const DevicePlan *      plan,
+    std::vector<size_t> *   out_dev_bytes)
 {
     ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_backend);
+    const size_t n_dev = (plan && plan->n_dev() > 1) ? plan->n_dev() : 1;
 
     // ---- Prep embedding fallback copy (same as single-backend path) ----
     ggml_tensor * te = tensor("token_embd.weight");
@@ -236,18 +378,30 @@ void Model::load_weights_split(
         // will be allocated into out_gpu_bufs below
     }
 
-    // ---- GPU (non-expert) buffers: split by the backend's single-buffer limit ----
-    std::vector<ggml_tensor *> gpu_tensors;
+    // ---- GPU (non-expert) buffers: split by the backend's single-buffer limit,
+    // and, under a multi-device plan, by the device that computes the layer ----
+    std::vector<std::vector<ggml_tensor *>> gpu_tensors(n_dev);
     std::vector<ggml_tensor *> exp_tensors;     // offloaded experts (kept ordered)
     for (auto & kv : tensors_) {
         if (is_offloaded_expert(kv.first)) exp_tensors.push_back(kv.second);
-        else gpu_tensors.push_back(kv.second);
+        else gpu_tensors[n_dev > 1 ? (size_t) plan->dev_of_name(kv.first) : 0].push_back(kv.second);
     }
     // lives in out_gpu_bufs (caller-owned); embd_buf_ stays null here
-    if (need_f32_embd) gpu_tensors.push_back(tok_embd_rows_);
+    if (need_f32_embd) gpu_tensors[0].push_back(tok_embd_rows_);   // primary: no layer of its own
 
-    alloc_tensors_chunked(gpu_buft, gpu_tensors, ggml_backend_buft_get_max_size(gpu_buft),
-                          "gpu weights (split mode)", out_gpu_bufs);
+    if (out_dev_bytes) out_dev_bytes->assign(n_dev, 0);
+    for (size_t d = 0; d < n_dev; ++d) {
+        ggml_backend_buffer_type_t bt = (n_dev > 1) ? plan->bufts[d] : gpu_buft;
+        const size_t before = out_gpu_bufs.size();
+        char what[64];
+        if (n_dev > 1) snprintf(what, sizeof(what), "gpu%zu weights (split mode)", d);
+        else           snprintf(what, sizeof(what), "gpu weights (split mode)");
+        alloc_tensors_chunked(bt, gpu_tensors[d], ggml_backend_buft_get_max_size(bt),
+                              what, out_gpu_bufs);
+        if (out_dev_bytes)
+            for (size_t k = before; k < out_gpu_bufs.size(); ++k)
+                (*out_dev_bytes)[d] += ggml_backend_buffer_get_size(out_gpu_bufs[k]);
+    }
 
     // ---- CPU (expert) buffers: chunked so each stays under the single
     // cudaHostAlloc cap (~15.5 GB on WDDM) and the whole set can be page-locked ----
@@ -328,8 +482,11 @@ void Model::read_tensor_bytes(const std::string & name, void * dst, size_t nb,
 // (their meta tensors keep ne/nb but have no backing buffer — ExpertCache streams
 // them via pread). Mirrors load_weights for the non-expert subset.
 void Model::load_weights_ssd(ggml_backend_t gpu_backend,
-                             std::vector<ggml_backend_buffer_t> & out_gpu_bufs) {
+                             std::vector<ggml_backend_buffer_t> & out_gpu_bufs,
+                             const DevicePlan * plan,
+                             std::vector<size_t> * out_dev_bytes) {
     ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(gpu_backend);
+    const size_t n_dev = (plan && plan->n_dev() > 1) ? plan->n_dev() : 1;
 
     // token-embedding fallback (same as load_weights)
     ggml_tensor * te = tensor("token_embd.weight");
@@ -352,16 +509,27 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
         ggml_set_name(tok_embd_rows_, embd_q8_ ? "token_embd.q8_0" : "token_embd.f16");
     }
 
-    std::vector<ggml_tensor *> gpu_tensors;
+    std::vector<std::vector<ggml_tensor *>> gpu_tensors(n_dev);
     for (auto & kv : tensors_) {
         if (is_offloaded_expert(kv.first)) continue;   // stays on SSD
-        gpu_tensors.push_back(kv.second);
+        gpu_tensors[n_dev > 1 ? (size_t) plan->dev_of_name(kv.first) : 0].push_back(kv.second);
     }
     // lives in out_gpu_bufs (caller-owned); embd_buf_ stays null here
-    if (need_f32_embd) gpu_tensors.push_back(tok_embd_rows_);
+    if (need_f32_embd) gpu_tensors[0].push_back(tok_embd_rows_);   // primary: no layer of its own
 
-    alloc_tensors_chunked(gpu_buft, gpu_tensors, ggml_backend_buft_get_max_size(gpu_buft),
-                          "gpu weights (ssd mode)", out_gpu_bufs);
+    if (out_dev_bytes) out_dev_bytes->assign(n_dev, 0);
+    for (size_t d = 0; d < n_dev; ++d) {
+        ggml_backend_buffer_type_t bt = (n_dev > 1) ? plan->bufts[d] : gpu_buft;
+        const size_t before = out_gpu_bufs.size();
+        char what[64];
+        if (n_dev > 1) snprintf(what, sizeof(what), "gpu%zu weights (ssd mode)", d);
+        else           snprintf(what, sizeof(what), "gpu weights (ssd mode)");
+        alloc_tensors_chunked(bt, gpu_tensors[d], ggml_backend_buft_get_max_size(bt),
+                              what, out_gpu_bufs);
+        if (out_dev_bytes)
+            for (size_t k = before; k < out_gpu_bufs.size(); ++k)
+                (*out_dev_bytes)[d] += ggml_backend_buffer_get_size(out_gpu_bufs[k]);
+    }
 
     std::map<std::string, void *> files;
     std::vector<uint8_t> buf;
@@ -478,12 +646,29 @@ std::unique_ptr<Model> Model::load(const std::string & path) {
     mp.no_alloc = true;
     m->meta_ = ggml_init(mp);
 
+    // The PLE n-gram table is deliberately kept out of `meta_` and `tensors_`.
+    // Every load_weights_* path walks those to fill a backend buffer, and this
+    // one tensor is 26.8 GiB in Qwen3.8-Flash-Next -- it is streamed row by row
+    // by NgramTable instead, from the file offset recorded in `src_` like any
+    // other tensor. Keeping it in a context nothing allocates is what makes
+    // "never resident" the default rather than something each path opts into.
+    ggml_init_params pp{};
+    pp.mem_size = ggml_tensor_overhead() + 1024;
+    pp.no_alloc = true;
+    m->ple_ctx_ = ggml_init(pp);
+
     for (const auto & sh : tmp) {
         for (ggml_tensor * t = ggml_get_first_tensor(sh.meta); t; t = ggml_get_next_tensor(sh.meta, t)) {
             const char * nm = ggml_get_name(t);
-            ggml_tensor * ut = ggml_new_tensor(m->meta_, t->type, ggml_n_dims(t), t->ne);
+            const bool is_ple = strcmp(nm, "per_layer_token_embd.weight") == 0;
+            ggml_tensor * ut = ggml_new_tensor(is_ple ? m->ple_ctx_ : m->meta_,
+                                               t->type, ggml_n_dims(t), t->ne);
             ggml_set_name(ut, nm);
-            m->tensors_[nm] = ut;
+            if (is_ple) {
+                m->ple_table_ = ut;
+            } else {
+                m->tensors_[nm] = ut;
+            }
             const int64_t tid = gguf_find_tensor(sh.g, nm);
             m->src_[nm] = { sh.path, sh.data_off + gguf_get_tensor_offset(sh.g, tid) };
         }
@@ -518,8 +703,7 @@ void Model::load_hparams() {
     hp_.n_layer     = gguf_u32(gguf_, k("block_count"));
     hp_.n_embd      = gguf_u32(gguf_, k("embedding_length"));
     hp_.n_ff        = gguf_u32(gguf_, k("feed_forward_length"));
-    // head_count / head_count_kv are scalars on every Qwen arch but per-layer
-    // arrays on step35 (64 heads on full-attention layers, 96 on sliding ones).
+    // head_count / head_count_kv may be per-layer arrays (step35, lfm2moe).
     // gguf_u32() cannot see an array and would silently yield 0, so read the
     // array first. The scalar keeps the max, which is what buffer sizing wants.
     hp_.n_head_l = gguf_u32_array(gguf_, k("attention.head_count"));
@@ -558,6 +742,15 @@ void Model::load_hparams() {
     hp_.n_expert_used = gguf_u32(gguf_, k("expert_used_count"), 0);
     hp_.n_ff_exp      = gguf_u32(gguf_, k("expert_feed_forward_length"), 0);
     hp_.expert_weights_scale = gguf_f32(gguf_, k("expert_weights_scale"), 1.0f);
+    // Absent on the Qwen files, whose defaults (softmax, renormalised top-k, no
+    // dense lead) are what these fall back to.
+    hp_.expert_gating_func  = gguf_u32 (gguf_, k("expert_gating_func"), 1);
+    hp_.expert_weights_norm = gguf_bool(gguf_, k("expert_weights_norm"), true);
+    hp_.n_dense_lead        = gguf_u32 (gguf_, k("leading_dense_block_count"), 0);
+    if (hp_.expert_gating_func != 1 && hp_.expert_gating_func != 2) {
+        throw std::runtime_error("unsupported expert_gating_func = " +
+                                 std::to_string(hp_.expert_gating_func));
+    }
 
     // Gated DeltaNet
     hp_.ssm_d_inner = gguf_u32(gguf_, k("ssm.inner_size"), 0);
@@ -568,22 +761,24 @@ void Model::load_hparams() {
     hp_.full_attn_interval   = gguf_u32(gguf_, k("full_attention_interval"), 4);
     hp_.nextn_predict_layers = gguf_u32(gguf_, k("nextn_predict_layers"), 0);
     hp_.has_gdn = (hp_.arch == Arch::QWEN35 || hp_.arch == Arch::QWEN35MOE ||
-                   hp_.arch == Arch::QWEN3NEXT) && hp_.ssm_d_inner > 0;
+                   hp_.arch == Arch::QWEN3NEXT || hp_.arch == Arch::QWEN4EXP) &&
+                  hp_.ssm_d_inner > 0;
+
+    if (hp_.arch == Arch::QWEN4EXP) load_qwen4exp_hparams(arch);
 
     // ---- step35 (Step-3.x Flash) ----
     // Sliding-window attention on 3 of every 4 layers, a head-wise attention
-    // gate, sigmoid expert routing with a selection bias, one shared expert,
-    // and a SwiGLU clamp on the last couple of layers.
+    // gate, one ungated shared expert, and a SwiGLU clamp on the last couple
+    // of layers. Routing and the dense lead are read generically above.
     if (hp_.arch == Arch::STEP35) {
         hp_.n_swa              = gguf_u32(gguf_, k("attention.sliding_window"), 0);
         hp_.swa_pattern        = gguf_bool_array(gguf_, k("attention.sliding_window_pattern"));
         hp_.rope_freq_base_swa = gguf_f32(gguf_, k("rope.freq_base_swa"), hp_.rope_freq_base);
-        hp_.n_dense_lead       = gguf_u32(gguf_, k("leading_dense_block_count"), 0);
         hp_.n_ff_shexp         = gguf_u32(gguf_, k("expert_shared_feed_forward_length"), 0);
-        hp_.expert_gating_func = gguf_u32(gguf_, k("expert_gating_func"), 2);   // 2 = sigmoid
-        hp_.expert_weights_norm = gguf_bool(gguf_, k("expert_weights_norm"), true);
         hp_.swiglu_clamp_exp   = gguf_f32_array(gguf_, k("swiglu_clamp_exp"));
         hp_.swiglu_clamp_shexp = gguf_f32_array(gguf_, k("swiglu_clamp_shexp"));
+        // the step35 converter writes no gating key; its router is a sigmoid
+        if (!gguf_has(gguf_, k("expert_gating_func"))) hp_.expert_gating_func = 2;
 
         // Only the every-other-layer MoE layout is implemented; a GGUF that
         // says otherwise would silently route dense layers through build_moe.
@@ -599,6 +794,55 @@ void Model::load_hparams() {
         hp_.n_vocab = (uint32_t) t->ne[1];
     } else if (auto * t = tensor("token_embd.weight")) {
         hp_.n_vocab = (uint32_t) t->ne[1];
+    }
+}
+
+// qwen4exp-only hyper-parameters: hyper-connections, QSA and the PLE n-gram table.
+void Model::load_qwen4exp_hparams(const std::string & arch) {
+    auto k = [&](const char * suffix) { return arch + "." + suffix; };
+
+    hp_.hc_count    = gguf_u32(gguf_, k("hyper_connection.count"), 0);
+    hp_.hc_low_rank = gguf_u32(gguf_, k("hyper_connection.low_rank"), 0);
+    if (hp_.hc_count == 0 || hp_.hc_low_rank == 0) {
+        throw std::runtime_error("qwen4exp: missing hyper_connection.count / .low_rank");
+    }
+
+    hp_.indexer_n_head   = gguf_u32(gguf_, k("attention.indexer.head_count"), 0);
+    hp_.indexer_head_dim = gguf_u32(gguf_, k("attention.indexer.key_length"), 0);
+    hp_.indexer_top_k    = gguf_u32(gguf_, k("attention.indexer.top_k"), 0);
+    for (int32_t r : gguf_i32_array(gguf_, k("attention.compress_ratios"))) {
+        hp_.compress_ratios.push_back((uint32_t) (r < 0 ? 0 : r));
+    }
+
+    // PLE. Absent key group -> every field stays 0 and has_ple() is false.
+    auto ple_layers = gguf_i32_array(gguf_, k("ple.layers"));
+    if (ple_layers.empty()) return;
+
+    hp_.ple_layers.assign(hp_.n_layer, 0);
+    for (int32_t il : ple_layers) {
+        if (il < 0 || (uint32_t) il >= hp_.n_layer) {
+            throw std::runtime_error("qwen4exp: ple.layers out of range");
+        }
+        hp_.ple_layers[il] = 1;
+    }
+
+    hp_.ple_ngram_size      = gguf_u32(gguf_, k("ple.ngram_size"));
+    hp_.ple_heads_per_ngram = gguf_u32(gguf_, k("ple.heads_per_ngram"));
+    hp_.ple_conv_kernel     = gguf_u32(gguf_, k("ple.conv_kernel"));
+    hp_.ple_eos_token_id    = gguf_u32(gguf_, k("ple.eos_token_id"));
+    hp_.ple_image_token_id  = gguf_u32(gguf_, k("ple.image_token_id"), 0);
+    hp_.ple_head_dim        = gguf_u32(gguf_, k("embedding_length_per_layer_input"));
+    hp_.ple_n_heads         = (hp_.ple_ngram_size - 1) * hp_.ple_heads_per_ngram;
+
+    hp_.ple_layer_multipliers = gguf_u64_array(gguf_, k("ple.layer_multipliers"));
+    hp_.ple_head_offsets      = gguf_u64_array(gguf_, k("ple.head_offsets"));
+    hp_.ple_head_vocab_sizes  = gguf_u64_array(gguf_, k("ple.head_vocab_sizes"));
+
+    if (hp_.ple_ngram_size < 2 || hp_.ple_n_heads == 0 || hp_.ple_head_dim == 0 ||
+        hp_.ple_layer_multipliers.size() != hp_.ple_ngram_size ||
+        hp_.ple_head_offsets.size()      != hp_.ple_n_heads ||
+        hp_.ple_head_vocab_sizes.size()  != hp_.ple_n_heads) {
+        throw std::runtime_error("qwen4exp: inconsistent ple.* metadata");
     }
 }
 
@@ -672,7 +916,8 @@ std::string Model::summary() const {
        << "n_layer       = " << hp_.n_layer << "\n"
        << "n_embd        = " << hp_.n_embd << "\n"
        << "n_ff          = " << hp_.n_ff << "\n"
-       << "n_head        = " << hp_.n_head << " (kv=" << hp_.n_head_kv << (hp_.n_head_l.empty() ? "" : ", per-layer") << ")\n"
+       << "n_head        = " << hp_.n_head << " (kv=" << hp_.n_head_kv
+       << (hp_.n_head_l.empty() && hp_.n_head_kv_l.empty() ? "" : ", per-layer max") << ")\n"
        << "n_embd_head   = " << hp_.n_embd_head << "\n"
        << "n_ctx_train   = " << hp_.n_ctx_train << "\n"
        << "n_vocab       = " << hp_.n_vocab << "\n"
@@ -681,6 +926,11 @@ std::string Model::summary() const {
     if (hp_.is_moe()) {
         os << "n_expert      = " << hp_.n_expert << " (used=" << hp_.n_expert_used
            << ", ff_exp=" << hp_.n_ff_exp << ")\n";
+        if (hp_.gating_sigmoid() || hp_.n_dense_lead > 0 || !hp_.expert_weights_norm) {
+            os << "routing       = " << (hp_.gating_sigmoid() ? "sigmoid" : "softmax")
+               << (hp_.expert_weights_norm ? ", normalised" : ", unnormalised")
+               << ", " << hp_.n_dense_lead << " leading dense block(s)\n";
+        }
     }
     if (hp_.n_swa > 0) {
         size_t n_sliding = 0;
@@ -690,16 +940,33 @@ std::string Model::summary() const {
            << hp_.rope_freq_base_swa << ")\n";
     }
     if (hp_.arch == Arch::STEP35) {
-        os << "n_rot         = " << hp_.rot_dims(0) << " full / " << hp_.n_embd_head << " swa\n"
-           << "dense_lead    = " << hp_.n_dense_lead
-           << " (ff_shexp=" << hp_.n_ff_shexp
-           << ", gating=" << (hp_.expert_gating_func == 2 ? "sigmoid" : "softmax")
-           << ", norm=" << (hp_.expert_weights_norm ? "yes" : "no")
-           << ", scale=" << hp_.expert_weights_scale << ")\n";
+        os << "n_rot         = " << hp_.rot_dims(0) << " full / " << hp_.n_embd_head << " swa"
+           << " (ff_shexp=" << hp_.n_ff_shexp << ", scale=" << hp_.expert_weights_scale << ")\n";
     }
     if (hp_.has_gdn) {
         os << "GDN: d_inner=" << hp_.ssm_d_inner << " n_group=" << hp_.ssm_n_group
            << " d_state=" << hp_.ssm_d_state << " d_conv=" << hp_.ssm_d_conv << "\n";
+    }
+    if (hp_.has_hc()) {
+        os << "hyper-conn    = " << hp_.hc_count << " streams (low_rank="
+           << hp_.hc_low_rank << ", residual width=" << hp_.n_embd_hc() << ")\n";
+    }
+    if (hp_.has_qsa()) {
+        os << "QSA           = top_k " << hp_.indexer_top_k << ", indexer "
+           << hp_.indexer_n_head << "x" << hp_.indexer_head_dim
+           << ", dense below " << (hp_.indexer_top_k + hp_.compress_ratio(3) - 1)
+           << " cached tokens\n";
+    }
+    if (hp_.has_ple()) {
+        uint32_t ple_il = 0;
+        for (uint32_t i = 0; i < hp_.ple_layers.size(); ++i) {
+            if (hp_.ple_layers[i]) { ple_il = i; break; }
+        }
+        uint64_t rows = 0;
+        for (uint64_t v : hp_.ple_head_vocab_sizes) rows += v;
+        os << "PLE n-gram    = layer " << ple_il << ", " << hp_.ple_ngram_size
+           << "-gram, " << hp_.ple_n_heads << " heads x " << hp_.ple_head_dim
+           << " dim, " << rows << " table rows\n";
     }
     os << "tensors       = " << tensors_.size() << "\n"
        << "vocab tokens  = " << vocab_.tokens.size() << "\n"

@@ -46,11 +46,13 @@ add_subdirectory(third_party/ggml)
 
 # ---- core engine library ----
 add_library(questwend_core STATIC
+    core/args.cpp
     core/gguf_util.cpp
     core/model.cpp
     core/tokenizer.cpp
     core/runtime.cpp
     core/expert_cache.cpp
+    core/ngram_table.cpp
     core/sampler.cpp
     core/chat.cpp
     core/vision.cpp

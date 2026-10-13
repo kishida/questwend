@@ -45,10 +45,20 @@ public:
     //   derived so all experts share a uniform residency ratio).
     // ssd: if true, cache misses are streamed from the GGUF file on disk via
     //   pread (experts are not held in RAM); otherwise from the CPU expert tensors.
+    // layer_mask (multi-GPU): when given, only the layers it selects get pools
+    // here -- the others are computed on another device and cached by that
+    // device's ExpertCache. Layer indices stay global either way, so callers
+    // index every cache with the same `il`; serves() says which one owns it.
     ExpertCache(ggml_backend_t gpu_backend, Model & model,
                 int n_layer, int n_expert, int n_used, size_t vram_avail_bytes,
-                bool ssd = false);
+                bool ssd = false,
+                const std::vector<bool> * layer_mask = nullptr);
     ~ExpertCache();
+
+    // Whether this cache holds `layer`'s expert pools.
+    bool serves(int layer) const {
+        return layer >= 0 && layer < n_layer_ && layer_pool_[GATE][(size_t) layer] >= 0;
+    }
 
     // Make `layer`'s selected experts resident for all three roles, copying
     // misses into VRAM. Fills the three parallel slot-id arrays (length n each).
@@ -155,11 +165,6 @@ private:
     // A reserved-but-not-yet-loaded slot fetch (used for parallel SSD reads).
     struct FetchJob { Pool * pool; int role; int expert; int slot; };
 
-    // Does this layer own slots? False for a leading dense block (step35), whose
-    // layer_pool_ entries stay at the -1 sentinel -- every loop over layers must
-    // go through moe_layers_ or check this, or it indexes pools_[-1].
-    bool serves(int layer) const { return layer_pool_[0][layer] >= 0; }
-
     int  install(Pool & pool, int key, int layer, int expert, Role role); // fetch into a free/LRU slot
     int  slot_for(Pool & pool, int layer, int expert, Role role);
     int  reserve_victim(Pool & pool, int key);   // evict + claim a slot, no fetch
@@ -169,8 +174,6 @@ private:
     void fetch_slab(Role role, int layer, int expert, ggml_tensor * dst, int slot);
     void fetch_parallel(int layer, std::vector<FetchJob> & jobs);  // SSD: parallel pread + serial H2D
     uint8_t * host_of(const ggml_tensor * t) const;  // pool host ptr for a slot tensor (or null)
-
-    std::vector<int> moe_layers_;   // layers that actually have routed experts
 
     Model &        model_;
     ggml_backend_t backend_ = nullptr;   // GPU backend (for async H2D on its stream)

@@ -4,6 +4,7 @@
 #include "sampler.h"
 #include "chat.h"
 #include "vision.h"
+#include "args.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -73,154 +74,91 @@ static int bench_read(const std::string & path) {
 }
 #endif
 
-// CLI aliases for the offload tuning knobs (the runtime reads them as QWEN_*
-// env vars; the flag and the env var are equivalent, the flag wins if both).
-static void set_knob(const char * env, const char * val) {
-#ifdef _WIN32
-    _putenv_s(env, val);
-#else
-    setenv(env, val, /*overwrite=*/1);
-#endif
-}
-
-// A trained context of 256k (Step-3.7 and friends) would size the KV cache far
-// past what any machine has, and the whole allocation is charged to the same
-// budget as the expert pool. Cap the *automatic* default; --n-ctx overrides it.
-static const int N_CTX_AUTO_MAX = 32768;
-
 static void usage(const char * prog) {
     printf("usage: %s -m <model.gguf> [options]\n", prog);
-    printf("  -p <text>      prompt (one-shot)\n");
-    printf("  -i             interactive chat\n");
-    printf("  --chat         wrap -p prompt in ChatML\n");
-    printf("  --reasoning <on|off>  thinking mode for chat (default on)\n");
-    printf("  --mtp          MTP self-speculative greedy decode (models with a nextn block)\n");
-    printf("  --draft <N>    MTP draft length (tokens drafted per verify; default 1)\n");
-    printf("  --embd-q8      use Q8_0 (not F16) for token embedding fallback (saves ~45%% VRAM)\n");
-    printf("  --image <path> attach an image to the prompt (requires a VL model + mmproj)\n");
-    printf("  --mmproj <path> vision tower GGUF (default: mmproj-*.gguf next to the model)\n");
-    printf("  --vision-test  encode --image with --mmproj and print embedding stats (no LLM)\n");
-    printf("  -n <N>         max new tokens (default 128)\n");
-    printf("  --n-ctx <N>    context length (default: the model's trained length)\n");
-    printf("  --temp <f>     temperature (0 = greedy, default 0)\n");
-    printf("  --top-p <f>    nucleus top-p (default 0.95)\n");
-    printf("  --repeat-penalty <f>  repetition penalty over the last N tokens (default 1 = off)\n");
-    printf("  --repeat-last-n <N>   penalty window (default 64)\n");
-    printf("  --top-k <N>    top-k (default 40)\n");
-    printf("  --seed <N>     RNG seed (0 = random)\n");
-    printf("  --vram-budget <GB>  offload expert weights to CPU; keep non-expert on GPU\n");
-    printf("                      GB, fractions ok (13.5); suffix M/G to be explicit (13500M)\n");
-    printf("  --cache-profile <f> persist/prefetch hot-expert profile (warm restarts)\n");
-    printf("  --experts-ssd  stream experts from the GGUF on SSD (no RAM copy)\n");
-    printf("  --cpu          force CPU backend\n");
-    printf("  --log-tokens-per-sec   print speed\n");
-    printf("  --info         print model info and exit\n");
-    printf("offload tuning (equivalent to the QWEN_* env vars; flag wins):\n");
-    printf("  --resident-decode   resident-only routing decode: fused graph, no per-token miss\n");
-    printf("                      (lossy; auto-warmup + background refill keep quality)\n");
-    printf("  --resident-refill <N>  refilled experts per token while masked, all layers combined (default 8; 0 = frozen)\n");
-    printf("  --expert-alloc <m>  how decode splits the VRAM expert pool across layers:\n");
-    printf("                      lru | quota (per-layer, from the prompt's routing) |\n");
-    printf("                      auto = quota with --resident-decode, lru without (default)\n");
-    printf("                      (prefill always uses the whole pool as one LRU stream)\n");
-    printf("  --resident-warmup <N>  decode tokens before the mask locks in (default 32)\n");
-    printf("  --prefill-prune <eps>  skip fetching low-router-mass experts in prefill (lossy; e.g. 0.05)\n");
-    printf("  --batch-chunk <N>   prefill chunk length in tokens (default 4096)\n");
-    printf("  --ssd-direct        unbuffered SSD reads (bypass the OS page cache; with --experts-ssd)\n");
+    printf("prompt and sampling:\n");
+    printf("  -p <text>           prompt (one-shot)\n");
+    printf("  -i                  interactive chat\n");
+    printf("  --chat              wrap the -p prompt in ChatML\n");
+    printf("  --image <path>      attach an image to the prompt (needs a VL model + mmproj)\n");
+    printf("  -n <N>              max new tokens (default 128)\n");
+    printf("  --temp <f>          temperature (0 = greedy, default 0)\n");
+    printf("  --top-p <f>         nucleus top-p (default 0.95)\n");
+    printf("  --top-k <N>         top-k (default 40)\n");
+    printf("  --repeat-last-n <N> repetition-penalty window (default 64)\n");
+    printf("  --seed <N>          RNG seed (0 = random)\n");
+    printf("diagnostics:\n");
+    printf("  --info              print model info and exit\n");
+    printf("  --log-tokens-per-sec  print speed\n");
+    printf("  --dump-logits <f>   write the prompt's final-token logits to <f> (verification)\n");
+    printf("  --vision-test       encode --image with --mmproj and print embedding stats (no LLM)\n");
 #ifdef _WIN32
     printf("  --bench-read <file> raw unbuffered read benchmark (sequential head/tail + random) and exit\n");
 #endif
+    print_common_help(stdout);
 }
 
 int main(int argc, char ** argv) {
-    std::string model_path, prompt, cache_profile, mmproj_path;
+    CommonOptions opt;                  // -m, --n-ctx, GPU/offload, ... (core/args.h)
+    std::string prompt;
     std::vector<std::string> image_paths;
-    int  max_tokens = 128, n_ctx = 0, n_draft = 1;   // n_ctx 0 = model's trained length
-    size_t vram_budget_mb = 0;
-    bool interactive = false, info_only = false, chat = false, log_speed = false, force_cpu = false;
-    bool experts_ssd = false, reasoning = true, use_mtp = false, embd_q8 = false, vision_test = false;
+    int  max_tokens = 128;
+    std::string dump_logits;            // --dump-logits <file>
+    bool interactive = false, info_only = false, chat = false, log_speed = false;
+    bool vision_test = false;
     SamplerConfig sc;
     sc.temperature = 0.0f;  // CLI defaults to greedy for reproducibility
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&](){ return std::string(argv[++i]); };
-        if      (a == "-m" && i + 1 < argc) model_path = next();
-        else if (a == "-p" && i + 1 < argc) prompt = next();
+        if      (a == "-p" && i + 1 < argc) prompt = next();
         else if (a == "-i")                 interactive = true;
         else if (a == "--chat")             chat = true;
         else if (a == "-n" && i + 1 < argc) max_tokens = std::stoi(next());
-        else if (a == "--n-ctx" && i + 1 < argc) n_ctx = std::stoi(next());
         else if (a == "--temp" && i + 1 < argc)  sc.temperature = std::stof(next());
         else if (a == "--top-p" && i + 1 < argc) sc.top_p = std::stof(next());
         else if (a == "--top-k" && i + 1 < argc) sc.top_k = std::stoi(next());
         else if (a == "--seed" && i + 1 < argc)  sc.seed = (uint32_t) std::stoul(next());
-        else if (a == "--repeat-penalty" && i + 1 < argc) sc.repeat_penalty = std::stof(next());
         else if (a == "--repeat-last-n" && i + 1 < argc)  sc.repeat_last_n = std::stoi(next());
-        else if (a == "--vram-budget" && i + 1 < argc) {
-            const std::string v = next();
-            bool legacy = false;
-            vram_budget_mb = parse_vram_budget_mb(v, &legacy);
-            if (vram_budget_mb == 0) {
-                fprintf(stderr, "error: bad --vram-budget value: %s (expected e.g. 14, 13.5, 14G, 13500M)\n", v.c_str());
-                return 1;
-            }
-            if (legacy)
-                fprintf(stderr, "note: --vram-budget %s read as %zu MB (%.1f GB); the unit is now GB, "
-                                "write %.1f or %sM to be explicit\n",
-                        v.c_str(), vram_budget_mb, vram_budget_mb / 1024.0, vram_budget_mb / 1024.0, v.c_str());
-        }
-        else if (a == "--cache-profile" && i + 1 < argc) cache_profile = next();
-        else if (a == "--experts-ssd")      experts_ssd = true;
-        else if (a == "--reasoning" && i + 1 < argc) { std::string v = next(); reasoning = (v != "off" && v != "0" && v != "false"); }
-        else if (a == "--mtp")              use_mtp = true;
-        else if (a == "--draft" && i + 1 < argc) n_draft = std::stoi(next());
-        else if (a == "--embd-q8")          embd_q8 = true;
         else if (a == "--image" && i + 1 < argc)  image_paths.push_back(next());
-        else if (a == "--mmproj" && i + 1 < argc) mmproj_path = next();
         else if (a == "--vision-test")      vision_test = true;
         else if (a == "--log-tokens-per-sec")    log_speed = true;
-        else if (a == "--cpu")              force_cpu = true;
-        else if (a == "--resident-decode")  set_knob("QWEN_RESIDENT_DECODE", "1");
-        else if (a == "--expert-alloc" && i + 1 < argc) {
-            const std::string v = next();
-            if (v != "lru" && v != "quota" && v != "auto") {
-                fprintf(stderr, "error: bad --expert-alloc value: %s (expected lru, quota or auto)\n", v.c_str());
-                return 1;
-            }
-            set_knob("QWEN_EXPERT_ALLOC", v.c_str());
-        }
-        else if (a == "--resident-refill" && i + 1 < argc) set_knob("QWEN_RESIDENT_REFILL", next().c_str());
-        else if (a == "--resident-warmup" && i + 1 < argc) set_knob("QWEN_RESIDENT_WARMUP", next().c_str());
-        else if (a == "--prefill-prune" && i + 1 < argc)   set_knob("QWEN_PREFILL_PRUNE", next().c_str());
-        else if (a == "--batch-chunk" && i + 1 < argc)     set_knob("QWEN_BATCH_CHUNK", next().c_str());
-        else if (a == "--ssd-direct")       set_knob("QWEN_SSD_DIRECT", "1");
 #ifdef _WIN32
         else if (a == "--bench-read" && i + 1 < argc) return bench_read(next());
 #endif
+        else if (a == "--dump-logits" && i + 1 < argc) dump_logits = next();
         else if (a == "--info")             info_only = true;
         else if (a == "-h" || a == "--help"){ usage(argv[0]); return 0; }
         else {
-            fprintf(stderr, "error: unknown or malformed argument: %s\n\n", a.c_str());
-            usage(argv[0]);
-            return 1;
+            const ArgResult r = parse_common_arg(argc, argv, i, opt);
+            if (r == ArgResult::Error) return 1;
+            if (r == ArgResult::Unknown) {
+                fprintf(stderr, "error: unknown or malformed argument: %s\n\n", a.c_str());
+                usage(argv[0]);
+                return 1;
+            }
         }
     }
+    if (!validate_common_options(opt)) return 1;
+    // The CLI samples in-process, so --repeat-penalty is a sampler setting here.
+    sc.repeat_penalty = opt.repeat_penalty;
+    const std::string & model_path = opt.model_path;
     // standalone vision-tower test: encode images and print embedding stats
     // (for numeric comparison against the Java reference implementation)
     if (vision_test) {
-        if (mmproj_path.empty() || image_paths.empty()) {
+        if (opt.mmproj_path.empty() || image_paths.empty()) {
             fprintf(stderr, "--vision-test requires --mmproj <gguf> and --image <path>\n");
             return 1;
         }
         try {
             ggml_backend_t be = nullptr;
-            if (!force_cpu)
+            if (!opt.force_cpu)
                 for (ggml_backend_dev_t d : gpu_devices())
                     if ((be = ggml_backend_dev_init(d, nullptr))) break;
             if (!be) be = ggml_backend_cpu_init();
             {
-                auto enc = VisionEncoder::load(mmproj_path, be);
+                auto enc = VisionEncoder::load(opt.mmproj_path, be);
                 const int D = enc->n_embd(), T = enc->n_image_tokens();
                 for (const auto & ip : image_paths) {
                     auto t0 = std::chrono::steady_clock::now();
@@ -258,14 +196,19 @@ int main(int argc, char ** argv) {
 
         // Context length defaults to what the model was trained for. The KV
         // cache is sized from it, so cap it with --n-ctx if it does not fit.
-        if (n_ctx <= 0) {
+        // A trained context of 256k (Step-3.7 and friends) would size the KV
+        // cache far past what any machine has, and the whole allocation is
+        // charged to the same budget as the expert pool, so the *automatic*
+        // default is capped (as in qw-server); --n-ctx overrides it.
+        if (opt.n_ctx <= 0) {
+            const int N_CTX_AUTO_MAX = 32768;
             const int trained = (int) model->hparams().n_ctx_train;
-            n_ctx = std::min(trained, N_CTX_AUTO_MAX);
-            if (n_ctx < trained) {
+            opt.n_ctx = std::min(trained, N_CTX_AUTO_MAX);
+            if (opt.n_ctx < trained) {
                 fprintf(stderr, "context: %d tokens (capped; model trained for %d -- --n-ctx to raise)\n",
-                        n_ctx, trained);
+                        opt.n_ctx, trained);
             } else {
-                fprintf(stderr, "context: %d tokens (model's trained length; --n-ctx to change)\n", n_ctx);
+                fprintf(stderr, "context: %d tokens (model's trained length; --n-ctx to change)\n", opt.n_ctx);
             }
         }
 
@@ -279,7 +222,7 @@ int main(int argc, char ** argv) {
         std::unique_ptr<VisionEncoder> venc;
         std::vector<std::vector<float>> vembs;
         if (!image_paths.empty()) {
-            if (mmproj_path.empty()) {
+            if (opt.mmproj_path.empty()) {
                 // auto-discover mmproj-*.gguf next to the model
                 std::string dir = model_path;
                 const size_t sl = dir.find_last_of("/\\");
@@ -288,19 +231,19 @@ int main(int argc, char ** argv) {
                     const std::string fn = e.path().filename().string();
                     if (fn.rfind("mmproj", 0) == 0 && fn.size() > 5 &&
                         fn.substr(fn.size() - 5) == ".gguf") {
-                        mmproj_path = e.path().string();
+                        opt.mmproj_path = e.path().string();
                         break;
                     }
                 }
-                if (mmproj_path.empty())
+                if (opt.mmproj_path.empty())
                     throw std::runtime_error("--image given but no mmproj found (use --mmproj)");
-                fprintf(stderr, "mmproj: using %s\n", mmproj_path.c_str());
+                fprintf(stderr, "mmproj: using %s\n", opt.mmproj_path.c_str());
             }
-            if (!force_cpu)
+            if (!opt.force_cpu)
                 for (ggml_backend_dev_t d : gpu_devices())
                     if ((vis_backend = ggml_backend_dev_init(d, nullptr))) break;
             if (!vis_backend) vis_backend = ggml_backend_cpu_init();
-            venc = VisionEncoder::load(mmproj_path, vis_backend);
+            venc = VisionEncoder::load(opt.mmproj_path, vis_backend);
             if (venc->n_embd() != (int) model->hparams().n_embd)
                 throw std::runtime_error("mmproj projection dim does not match the model n_embd");
             for (const auto & ip : image_paths) {
@@ -312,24 +255,13 @@ int main(int argc, char ** argv) {
                             std::chrono::steady_clock::now() - t0).count());
             }
             chat = true;   // images imply chat formatting
-            if (vram_budget_mb > 0) {
-                const size_t vmb = (venc->gpu_bytes() + 1024 * 1024 - 1) / (1024 * 1024);
-                const size_t cut = std::min(vram_budget_mb, vmb);
-                fprintf(stderr, "vision tower: %zu MB GPU; expert cache budget %zu -> %zu MB\n",
-                        vmb, vram_budget_mb, vram_budget_mb - cut);
-                vram_budget_mb -= cut;
-            }
+            reserve_vision_tower_vram(opt, venc->gpu_bytes());
         }
 
         RuntimeConfig cfg;
-        cfg.n_ctx          = n_ctx;
-        cfg.use_cuda       = !force_cpu;
-        cfg.vram_budget_mb = vram_budget_mb;
-        cfg.cache_profile  = cache_profile;
-        cfg.experts_ssd    = experts_ssd;
+        if (!apply_common_options(opt, cfg)) return 1;
         // MTP needs the nextn block kept VRAM-resident (also the dev MTP test mode).
-        cfg.use_mtp        = use_mtp || getenv("QWEN_MTP_TEST");
-        cfg.embd_q8        = embd_q8;
+        cfg.use_mtp = opt.use_mtp || getenv("QWEN_MTP_TEST");
         Runtime rt(*model, cfg);
         Sampler smp(sc);
 
@@ -410,11 +342,11 @@ int main(int argc, char ** argv) {
                         ids.size(), s.c_str());
             }
             // MTP self-speculative greedy decode
-            if (use_mtp && rt.has_mtp()) {
+            if (opt.use_mtp && rt.has_mtp()) {
                 int generated = 0;
                 auto t0 = clk::now();
                 rt.reset();
-                rt.generate_mtp(ids, max_tokens, n_draft, [&](int32_t t) {
+                rt.generate_mtp(ids, max_tokens, opt.n_draft, [&](int32_t t) {
                     if (is_stop(t)) return false;
                     std::cout << tok.decode(t) << std::flush;
                     return ++generated < max_tokens;
@@ -432,6 +364,22 @@ int main(int argc, char ** argv) {
             auto tp0 = clk::now();
             auto logits = rt.decode(ids);
             double prefill_s = secs(clk::now() - tp0);
+
+            // --dump-logits: the prompt's final-token logits, one "i: value" per
+            // line -- the same shape llama-debug --save-logits writes, so the two
+            // can be diffed directly (see tests/qwen4/compare_logits.py).
+            if (!dump_logits.empty()) {
+                FILE * f = fopen(dump_logits.c_str(), "w");
+                if (!f) {
+                    fprintf(stderr, "error: cannot write %s\n", dump_logits.c_str());
+                    return;
+                }
+                for (size_t i = 0; i < logits.size(); ++i) {
+                    fprintf(f, "%zu: %g\n", i, logits[i]);
+                }
+                fclose(f);
+                fprintf(stderr, "logits (%zu) -> %s\n", logits.size(), dump_logits.c_str());
+            }
 
             // token generation
             smp.prime(ids);   // repetition-penalty window (prompt tail)
@@ -463,7 +411,7 @@ int main(int argc, char ** argv) {
                 std::cout << "\n> " << std::flush;
                 if (!std::getline(std::cin, line) || line.empty()) break;
                 history.push_back({ "user", line });
-                auto ids = build_chatml_tokens(tok, history, true, reasoning);
+                auto ids = build_chatml_tokens(tok, history, true, opt.reasoning);
                 // reset KV so each turn re-encodes the full history (simple + correct)
                 rt.reset();
                 run(ids);
@@ -478,7 +426,7 @@ int main(int argc, char ** argv) {
                     m.parts.push_back(ContentPart::make_image(i));
                 if (!prompt.empty()) m.parts.push_back(ContentPart::make_text(prompt));
                 ChatPromptOptions o;
-                o.reasoning      = reasoning;
+                o.reasoning      = opt.reasoning;
                 o.n_image_tokens = venc->n_image_tokens();
                 o.add_vision_id  = image_paths.size() > 1;
                 auto cp = build_qwen_prompt(tok, { m }, o);
@@ -488,7 +436,7 @@ int main(int argc, char ** argv) {
                 rt.set_embd_overrides(std::move(ovr));
                 ids = cp.ids;
             } else if (chat) {
-                ids = build_chatml_tokens(tok, {{ "user", prompt }}, true, reasoning);
+                ids = build_chatml_tokens(tok, {{ "user", prompt }}, true, opt.reasoning);
             } else {
                 if (prompt.empty()) prompt = "Hello";
                 std::cout << prompt;

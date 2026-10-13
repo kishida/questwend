@@ -20,6 +20,13 @@ typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
 
 namespace questwend {
 
+// Report a backend allocation failure with the numbers that explain it: what was
+// being allocated, how much it asked for, and what the device says it has. ggml's
+// allocators only return null, and "failed to allocate buffer" on its own leaves
+// exactly the question the reader has unanswered. Always throws.
+[[noreturn]] void throw_alloc_failure(ggml_backend_buffer_type_t buft, size_t bytes,
+                                      const std::string & what);
+
 enum class Arch {
     UNKNOWN,
     QWEN3,        // dense transformer, no GDN
@@ -27,6 +34,7 @@ enum class Arch {
     QWEN35,       // dense + Gated DeltaNet hybrid
     QWEN35MOE,    // MoE  + Gated DeltaNet hybrid
     QWEN3NEXT,    // GDN + MoE hybrid
+    QWEN4EXP,     // Qwen3.8-Flash-Next: GDN + MoE + hyper-connections + QSA + PLE
     STEP35,       // sliding-window attention + sigmoid-routed MoE (Step-3.x Flash)
 };
 
@@ -51,31 +59,40 @@ struct HParams {
     int      rope_sections[4] = {0, 0, 0, 0};
     bool     use_mrope        = false;
 
-    // ---- step35: per-layer attention shape + sliding-window attention ----
+    // Per-layer head counts. head_count / head_count_kv are scalars on every
+    // Qwen arch but per-layer arrays on step35 (64 vs 96 heads) and lfm2moe
+    // (kv = 0 on its convolution layers). Empty = uniform; always go through
+    // head_count(il) / head_count_kv(il).
+    std::vector<uint32_t> n_head_l;
+    std::vector<uint32_t> n_head_kv_l;
+
+    // ---- step35: sliding-window attention ----
     // Step-3.x Flash alternates one full-attention layer with three sliding
     // ones, and the two kinds have different head counts (64 vs 96), rotary
-    // widths (half vs whole head) and RoPE bases. These vectors are empty on
-    // architectures with a uniform shape; always go through the accessors.
-    std::vector<uint32_t> n_head_l;      // per layer; empty = uniform n_head
-    std::vector<uint32_t> n_head_kv_l;   // per layer; empty = uniform n_head_kv
-    std::vector<bool>     swa_pattern;   // per layer; true = sliding window
-    uint32_t n_swa          = 0;         // sliding window length (0 = none)
+    // widths (half vs whole head) and RoPE bases.
+    std::vector<bool> swa_pattern;       // per layer; true = sliding window
+    uint32_t n_swa              = 0;     // sliding window length (0 = none)
     float    rope_freq_base_swa = 0.0f;  // sliding layers use their own theta
 
-    // step35 MoE shape: leading dense blocks, one shared expert, sigmoid
-    // routing with a selection bias, and a per-layer SwiGLU clamp.
-    uint32_t n_dense_lead   = 0;     // layers before the first MoE block
-    uint32_t n_ff_shexp     = 0;     // shared-expert FFN size (0 = none)
-    uint32_t expert_gating_func = 0; // 1 = softmax, 2 = sigmoid
-    bool     expert_weights_norm = false;
+    // step35: one ungated shared expert and a per-layer SwiGLU clamp.
+    uint32_t n_ff_shexp = 0;                // shared-expert FFN size (0 = none)
     std::vector<float> swiglu_clamp_exp;    // per layer; 0 = no clamp
     std::vector<float> swiglu_clamp_shexp;  // per layer; 0 = no clamp
 
-    // MoE (qwen3moe / qwen35moe / qwen3next / step35)
+    // MoE (qwen3moe / qwen35moe / qwen3next / qwen4exp / step35 / lfm2moe)
     uint32_t n_expert       = 0;     // total experts (0 = dense)
     uint32_t n_expert_used  = 0;     // top-k
     uint32_t n_ff_exp       = 0;     // per-expert FFN size
     float    expert_weights_scale = 1.0f;
+    // Routing shape. Qwen ranks experts on softmax(logits); step35 and lfm2moe
+    // squash each logit with a sigmoid and rank on that plus a per-expert
+    // selection bias (blk.N.exp_probs_b.bias), mixing with the unbiased value.
+    // Values follow llama.cpp's llama_expert_gating_func_type.
+    uint32_t expert_gating_func  = 1;     // 1 = softmax, 2 = sigmoid
+    bool     expert_weights_norm = true;  // renormalise the top-k weights to sum 1
+    // Leading blocks with a dense FFN before the first MoE block (step35: 3,
+    // lfm2moe: 2). They have no routed experts at all.
+    uint32_t n_dense_lead   = 0;
 
     // Gated DeltaNet (qwen35 / qwen35moe / qwen3next)
     bool     has_gdn        = false;
@@ -87,14 +104,67 @@ struct HParams {
     uint32_t full_attn_interval = 4; // attention every `interval` layers ((il+1)%interval==0)
     uint32_t nextn_predict_layers = 0;
 
+    // ---- qwen4exp: hyper-connections ----
+    // The residual stream carries hc_count identical-width copies ("streams")
+    // instead of one, so it is hc_count * n_embd wide everywhere between layers.
+    // A low-rank gate mixes them down to n_embd for each block and scatters the
+    // block output back across the streams. 0 = ordinary single-stream residual.
+    uint32_t hc_count    = 0;
+    uint32_t hc_low_rank = 0;
+    bool     has_hc() const { return hc_count > 0; }
+    uint32_t n_embd_hc() const { return has_hc() ? hc_count * n_embd : n_embd; }
+
+    // ---- qwen4exp: QSA (query-sparse attention) ----
+    // Full-attention layers score whole blocks of compress_ratio tokens with a
+    // small indexer head and attend to the best indexer_top_k of them (plus the
+    // incomplete tail). Below indexer_top_k + compress_ratio - 1 cached tokens
+    // this is exactly dense attention, so a short-context run needs none of it.
+    uint32_t indexer_n_head   = 0;
+    uint32_t indexer_head_dim = 0;
+    uint32_t indexer_top_k    = 0;
+    std::vector<uint32_t> compress_ratios;   // per layer; 0 = plain dense attention
+    uint32_t compress_ratio(uint32_t il) const {
+        return il < compress_ratios.size() ? compress_ratios[il] : 0;
+    }
+    bool has_qsa() const { return indexer_top_k > 0; }
+
+    // ---- qwen4exp: PLE (per-layer n-gram hash embedding) ----
+    // One designated layer gathers ple_n_heads rows of a shared hash table,
+    // indexed by a 64-bit hash of the token and its predecessors. The table is
+    // enormous (26.8 GiB in the IQ1_S quant) and is never a resident weight --
+    // see NgramTable. Every field is 0 when the model has no PLE.
+    uint32_t ple_ngram_size      = 0;
+    uint32_t ple_heads_per_ngram = 0;
+    uint32_t ple_conv_kernel     = 0;
+    uint32_t ple_n_heads         = 0;  // (ngram_size - 1) * heads_per_ngram
+    uint32_t ple_head_dim        = 0;  // embedding_length_per_layer_input
+    uint32_t ple_eos_token_id    = 0;  // segment boundary -- NOT the chat EOS
+    uint32_t ple_image_token_id  = 0;  // 0 = file predates the key, falls back to EOS
+    std::vector<uint8_t>  ple_layers;            // per-layer flag
+    std::vector<uint64_t> ple_layer_multipliers; // [ngram_size]
+    std::vector<uint64_t> ple_head_offsets;      // [ple_n_heads]
+    std::vector<uint64_t> ple_head_vocab_sizes;  // [ple_n_heads]
+    bool has_ple() const { return ple_n_heads > 0; }
+    bool is_ple(uint32_t il) const {
+        return il < ple_layers.size() && ple_layers[il] != 0;
+    }
+    // Rows of conv history the PLE module adds to the recurrent state row.
+    uint32_t ple_conv_state() const {
+        return has_ple() ? (ple_conv_kernel - 1) * ple_ngram_size : 0;
+    }
+
     // GGUF metadata (display / identification)
     std::string  general_name;  // general.name
-    uint32_t     file_type = 0; // general.file_type (ggml_ftype enum value)
+    // general.file_type. The value is a llama_ftype, not the ggml_ftype the
+    // name suggests -- the two agree up to Q5_1 and diverge from there.
+    uint32_t     file_type = 0;
 
     bool is_moe() const { return n_expert > 0; }
+    bool is_moe_layer(uint32_t il) const { return is_moe() && il >= n_dense_lead; }
+    bool gating_sigmoid() const { return expert_gating_func == 2; }
 
-    // ---- per-layer shape accessors (uniform architectures fall back to the
-    //      scalar, so these are safe to call unconditionally) ----
+    // Per-layer shape accessors; uniform architectures fall back to the scalar,
+    // so these are safe to call unconditionally.
     uint32_t head_count   (uint32_t il) const { return il < n_head_l.size()    ? n_head_l[il]    : n_head; }
     uint32_t head_count_kv(uint32_t il) const { return il < n_head_kv_l.size() ? n_head_kv_l[il] : n_head_kv; }
     bool     is_swa       (uint32_t il) const { return n_swa > 0 && il < swa_pattern.size() && swa_pattern[il]; }
@@ -105,8 +175,6 @@ struct HParams {
         if (arch != Arch::STEP35) return n_rot;
         return is_swa(il) ? n_embd_head : n_embd_head / 2;
     }
-    // MoE starts after the leading dense blocks (step35: 3).
-    bool  is_moe_layer(uint32_t il) const { return is_moe() && il >= n_dense_lead; }
     float swiglu_limit_exp  (uint32_t il) const { return il < swiglu_clamp_exp.size()   ? swiglu_clamp_exp[il]   : 0.0f; }
     float swiglu_limit_shexp(uint32_t il) const { return il < swiglu_clamp_shexp.size() ? swiglu_clamp_shexp[il] : 0.0f; }
     // Main transformer stack excludes the trailing MTP (next-token-prediction) blocks.
@@ -117,6 +185,26 @@ struct HParams {
         if (!has_gdn) return false;
         return il < n_main() && ((il + 1) % full_attn_interval != 0);
     }
+};
+
+// Multi-GPU weight placement. `bufts[i]` is device i's buffer type and
+// `layer_dev[il]` names the device that computes layer il, so a tensor named
+// "blk.<il>.*" is allocated on that device and its matmuls run there. Tensors
+// with no layer prefix (token embedding, output head, final norm) go to device
+// 0, the primary. A plan with one device is the ordinary single-GPU case.
+struct DevicePlan {
+    std::vector<ggml_backend_buffer_type_t> bufts;
+    std::vector<int>                        layer_dev;
+    // Device holding each layer's expert pool. The shared-expert weights
+    // (ffn_*_shexp) are computed alongside the routed experts, so they follow
+    // this rather than layer_dev; everything else in the layer -- attention,
+    // norms, the router -- stays with layer_dev. Empty means "same as layer_dev".
+    std::vector<int>                        pool_dev;
+
+    size_t n_dev() const { return bufts.size(); }
+    // Device index for a GGUF tensor name; 0 when it has no "blk.<N>." prefix
+    // or the layer is out of range.
+    int dev_of_name(const std::string & name) const;
 };
 
 struct TensorInfo {
@@ -132,7 +220,7 @@ struct Vocab {
     int32_t bos_id = -1, eos_id = -1, pad_id = -1;
     // tokenizer.ggml.add_bos_token: the Qwen models say false, step35 says true.
     bool                     add_bos = false;
-    std::string              pre;            // tokenizer.ggml.pre ("deepseek-v3", ...)
+    std::string              pre;            // tokenizer.ggml.pre ("qwen2", "deepseek-v3", "lfm2", ...)
     std::string              chat_template;
 };
 
@@ -149,6 +237,11 @@ public:
     // Tensor lookup by exact GGUF name (e.g. "blk.0.attn_q.weight").
     ggml_tensor * tensor(const std::string & name) const;
 
+    // The PLE n-gram table's metadata (type and shape), or null when the model
+    // has none. It is not in tensor(): no backend buffer ever holds it, and
+    // NgramTable streams its rows straight from tensor_file()/_offset().
+    ggml_tensor * ple_table() const { return ple_table_; }
+
     // Token embedding tensor suitable for ggml_get_rows on any backend.
     // (CUDA get_rows does not support K-quant/IQ types, so a dequantized F16
     //  copy is provided for those; Q8_0 is used instead when set_embd_q8(true).)
@@ -159,6 +252,15 @@ public:
     // Returns the owning buffer (freed by the caller / engine).
     ggml_backend_buffer * load_weights(ggml_backend_t backend);
 
+    // Multi-GPU variant of load_weights: no offload, every weight stays on a
+    // GPU, but each layer's tensors go to the device that computes the layer.
+    // This is what lets a model that does not fit one card run on two. All
+    // buffers are caller-owned (unlike load_weights, where Model owns the one
+    // buffer it returns).
+    void load_weights_multi(ggml_backend_t primary, const DevicePlan & plan,
+                            std::vector<ggml_backend_buffer_t> & out_bufs,
+                            std::vector<size_t> * out_dev_bytes = nullptr);
+
     // Split variant: expert weight tensors (ffn_*_exps) go to cpu_buft,
     // everything else goes to gpu_backend. All output buffers are caller-owned.
     // Expert weights are spread over several cpu buffers (each below the single
@@ -166,16 +268,25 @@ public:
     // large MoE models when GPU VRAM is limited.
     // Both sides are lists because a backend can cap the size of one buffer
     // (Vulkan does, at 1 GiB by default) well below the weights' total.
+    // `plan`, when given with more than one device, places each layer's tensors
+    // on that layer's device instead of all of them on gpu_backend; out_gpu_bufs
+    // still collects every GPU buffer (the caller owns them all) and
+    // out_dev_bytes, if given, reports the bytes landed on each device so the
+    // caller can size that device's expert pool against its own budget.
     void load_weights_split(ggml_backend_t gpu_backend,
                             ggml_backend_buffer_type_t cpu_buft,
                             std::vector<ggml_backend_buffer_t> & out_gpu_bufs,
-                            std::vector<ggml_backend_buffer_t> & out_cpu_bufs);
+                            std::vector<ggml_backend_buffer_t> & out_cpu_bufs,
+                            const DevicePlan * plan = nullptr,
+                            std::vector<size_t> * out_dev_bytes = nullptr);
 
     // SSD-tier variant: routed expert weights are NOT loaded into memory at all
     // (they stay on disk and are streamed on demand by ExpertCache). Everything
     // else (incl. shared experts) goes to gpu_backend. Saves the experts' RAM.
     void load_weights_ssd(ggml_backend_t gpu_backend,
-                          std::vector<ggml_backend_buffer_t> & out_gpu_bufs);
+                          std::vector<ggml_backend_buffer_t> & out_gpu_bufs,
+                          const DevicePlan * plan = nullptr,
+                          std::vector<size_t> * out_dev_bytes = nullptr);
 
     // Source file + absolute byte offset of a tensor's data (for pread).
     // For sharded models these vary per tensor (different shard files).
@@ -185,6 +296,17 @@ public:
 
     // Returns true if this model has any routed expert tensors (MoE layers).
     bool has_expert_tensors() const;
+
+    // Bytes the weights occupy once loaded onto `backend`: every tensor, plus
+    // the F16/Q8_0 copy of the token embedding that load_weights_* makes when
+    // the backend has no get_rows kernel for the stored type. Computable from
+    // the metadata alone, so the runtime can ask whether the model fits before
+    // it commits a single byte of it. Depends on set_embd_q8() and, for
+    // offloaded_expert_bytes(), on set_keep_nextn_resident().
+    size_t weight_bytes(ggml_backend_t backend) const;
+    // The part of that total held by routed experts, i.e. what the SSD and RAM
+    // tiers take out of VRAM.
+    size_t offloaded_expert_bytes() const;
 
     // Returns true if the tensor name belongs to a routed expert (not shared expert).
     static bool is_expert_tensor(const std::string & name);
@@ -217,6 +339,8 @@ private:
     std::string    path_;
     gguf_context * gguf_   = nullptr;        // KV metadata (first shard)
     ggml_context * meta_   = nullptr;        // unified tensor metadata (+ data after load_weights)
+    ggml_context * ple_ctx_ = nullptr;       // metadata for the PLE table alone (never allocated)
+    ggml_tensor  * ple_table_ = nullptr;
     ggml_backend_buffer * weights_buf_ = nullptr;
     std::map<std::string, ggml_tensor *> tensors_;
 
@@ -231,6 +355,7 @@ private:
     ggml_tensor *         tok_embd_rows_ = nullptr;
 
     void load_hparams();
+    void load_qwen4exp_hparams(const std::string & arch);
     void load_vocab();
 
     // Read nb bytes of tensor `name` from its (possibly sharded) source file into

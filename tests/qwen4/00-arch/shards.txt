@@ -1,0 +1,3 @@
+# Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf: 0 tensors, 0.00 GiB
+# downloading_Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf.part: 595 tensors, 46.56 GiB
+# downloading_Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf.part: 629 tensors, 21.00 GiB

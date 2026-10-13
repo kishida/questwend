@@ -70,6 +70,16 @@ Tokenizer::Tokenizer(const Vocab & vocab) {
     bos_     = vocab.bos_id;
     eos_     = vocab.eos_id;
     add_bos_ = vocab.add_bos;
+    {
+        // The template's first tag, whitespace control and all: "{{- bos_token -}}"
+        const std::string & t = vocab.chat_template;
+        size_t i = t.find_first_not_of(" \t\r\n");
+        if (i != std::string::npos && t.compare(i, 2, "{{") == 0) {
+            const size_t e = t.find("}}", i);
+            template_bos_ = e != std::string::npos &&
+                            t.substr(i, e - i).find("bos_token") != std::string::npos;
+        }
+    }
     pre_     = vocab.pre == "deepseek-v3" ? Pre::DEEPSEEK3 : Pre::QWEN;
 
     id_to_token_ = vocab.tokens;

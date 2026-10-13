@@ -1,5 +1,6 @@
 #include "runtime.h"
 #include "model.h"
+#include "ngram_table.h"
 #include "expert_cache.h"
 
 #include "ggml.h"
@@ -39,12 +40,90 @@ static int sega_chunk_len() { static const int v = env_chunk("QWEN_SEGA_CHUNK", 
 // the bound the ring has to respect
 static int max_attn_batch() { return std::max(pf_chunk_len(), sega_chunk_len()); }
 
+// Prefill chunk length in tokens (--batch-chunk / QWEN_BATCH_CHUNK). The
+// batched prefill graph is the biggest one built, so this is also what bounds
+// the graph-buffer headroom below.
+static int batch_chunk() {
+    int chunk = 4096;
+    if (const char * c = getenv("QWEN_BATCH_CHUNK")) { int v = atoi(c); if (v >= 1) chunk = v; }
+    return chunk;
+}
+
+// Allocate exactly `ts` into one fresh buffer on `buft`. ggml_backend_alloc_ctx_tensors
+// cannot be used where tensors from a single context are spread over several
+// devices: it claims every unallocated tensor in the context for one buffer.
+static ggml_backend_buffer_t alloc_tensor_list(ggml_backend_buffer_type_t buft,
+                                               const std::vector<ggml_tensor *> & ts,
+                                               const char * what) {
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    size_t sz = 0;
+    for (auto * t : ts) sz += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
+    ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft, sz > 0 ? sz : 1);
+    if (!b) throw_alloc_failure(buft, sz, what);
+    ggml_tallocr ta = ggml_tallocr_new(b);
+    for (auto * t : ts)
+        if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error(std::string("alloc failed for ") + ggml_get_name(t));
+    return b;
+}
+
 struct Runtime::Impl {
     Model & model;
     RuntimeConfig cfg;
 
     // Primary compute backend (GPU or CPU).
     ggml_backend_t        backend     = nullptr;
+
+    // ---- Multi-GPU (layer split) ----
+    // Every GPU backend in the plan; gpus[0] == backend, the primary device that
+    // owns everything not tied to a transformer layer (embeddings, output head,
+    // final norm) and runs the sampling tail. A layer's weights, KV/recurrent
+    // state and expert pool all live on the same device, so the only traffic
+    // crossing the PCIe bus is the hidden state at a device boundary (~n_embd
+    // floats per token). With one device this vector has a single entry and
+    // multi_gpu() is false, which keeps every path below on its original code.
+    std::vector<ggml_backend_t> gpus;
+    std::vector<int>            layer_dev;      // layer -> index into gpus
+    // Where each layer's EXPERT POOL lives, which need not be where the layer
+    // computes its attention. A device given --gpu-split 0 holds no layers at
+    // all, so its whole budget is surplus; pool_dev hands it the expert pools of
+    // layers whose attention runs elsewhere, and that layer's expert matmul then
+    // runs there too (compute follows the weights -- the alternative, shipping
+    // expert weights device-to-device, is PCIe-bound and pointless). Equal to
+    // layer_dev unless a device is pool-only.
+    std::vector<int>            pool_dev;
+    // Per-device VRAM budget in bytes, resolved at init: --vram-budget where it
+    // named this device, otherwise what the device reports free. Never 0 once a
+    // backend is up, so plan_offload() can measure the model against it.
+    std::vector<size_t>         dev_budget;
+    // What each device said it had free, kept separately: an explicit budget may
+    // be larger than that (deliberately, on Metal, where the reported total is
+    // only the recommended working set), and the two disagreeing is worth saying.
+    std::vector<size_t>         dev_free;
+    bool                        budget_from_flag = false;   // --vram-budget named it
+    std::vector<size_t>         dev_weight_bytes;  // per-device weight bytes actually allocated
+    std::vector<size_t>         dev_kv_bytes;      // per-device KV/state bytes
+
+    bool multi_gpu() const { return gpus.size() > 1; }
+    int  dev_of(int il) const {
+        return layer_dev.empty() ? 0 : layer_dev[(size_t) il];
+    }
+    // Device holding `il`'s expert pool (and therefore running its expert matmul).
+    int  pdev_of(int il) const {
+        return pool_dev.empty() ? dev_of(il) : pool_dev[(size_t) il];
+    }
+    ggml_backend_t be_of(int il) const {
+        return gpus.empty() ? backend : gpus[(size_t) dev_of(il)];
+    }
+    // Placement plan handed to the weight loaders.
+    DevicePlan device_plan() const {
+        DevicePlan p;
+        for (ggml_backend_t be : gpus) p.bufts.push_back(ggml_backend_get_default_buffer_type(be));
+        p.layer_dev = layer_dev;
+        p.pool_dev  = pool_dev;
+        return p;
+    }
+
     // GPU weights, split across buffers when the backend caps a single one.
     std::vector<ggml_backend_buffer_t> weights_bufs;
     bool weights_buf_owned = false;   // split/ssd: ours; single-backend: Model frees it
@@ -64,9 +143,113 @@ struct Runtime::Impl {
     // When active, decode runs layer-by-layer on GPU: each layer's router is
     // computed, its selected experts are made resident in the cache (streaming
     // misses from CPU/SSD), then the expert matmuls run on GPU slot tensors.
-    std::unique_ptr<ExpertCache> ecache;
-    bool                  ssd_mode = false;     // experts streamed from SSD (no RAM copy)
+    // One expert cache per GPU (a device with no layers gets a null entry).
+    // `ecache` aliases the primary's and doubles as the "offload is on" flag,
+    // so single-GPU code reads exactly as it did before the split.
+    std::vector<std::unique_ptr<ExpertCache>> ecaches;
+    ExpertCache *         ecache = nullptr;
+    // The cache holding `il`'s experts: the one on the device that computes it.
+    // Prefill runs its expert matmuls at the pool, like decode does. Routing
+    // prefill to the layer's compute device instead was tried and measured: it
+    // does speed prefill up (+3-6%, the heavy matmul lands on the fast card),
+    // but prefill is also what WARMS the pools, so the pool device starts decode
+    // cold and has to fault its share in one miss at a time. Net -10% at 128
+    // generated tokens and still -2% at 512, where the transient has mostly
+    // washed out. The two are not separable; don't try it again.
+    ExpertCache * ec_of(int il) const {
+        if (ecaches.size() <= 1) return ecache;
+        const size_t d = (size_t) pdev_of(il);
+        return d < ecaches.size() ? ecaches[d].get() : nullptr;
+    }
+    // Every live cache, for the whole-model operations (stats, quota mode).
+    std::vector<ExpertCache *> all_ecaches() const {
+        std::vector<ExpertCache *> v;
+        for (const auto & c : ecaches) if (c) v.push_back(c.get());
+        return v;
+    }
+    // Model-wide cache counters. fetch_ms adds up per-device fetch time, which
+    // on a split runs partly in parallel -- it is a cost total, not a wall time.
+    ExpertCache::Stats ec_stats_sum() const {
+        ExpertCache::Stats t;
+        for (const auto & c : ecaches) {
+            if (!c) continue;
+            const auto & s = c->stats();
+            t.hits += s.hits; t.misses += s.misses; t.evictions += s.evictions;
+            t.fetch_ms += s.fetch_ms; t.fetch_bytes += s.fetch_bytes;
+        }
+        return t;
+    }
+    // ---- graph allocation / execution ----
+    // With one GPU these stay on the historical gallocr + direct-compute path,
+    // which is what makes reuse_graph and the CUDA-graph-friendly fused decode
+    // possible. A layer split makes every graph span devices, so it goes to the
+    // scheduler instead: sched assigns each op to the backend that owns its
+    // weights (layer weights, KV rows and expert slots all sit on the layer's
+    // device) and inserts the copies where the hidden state crosses a boundary.
+    bool alloc_graph(ggml_gallocr_t ga, ggml_cgraph * gf) {
+        if (!multi_gpu()) return ggml_gallocr_alloc_graph(ga, gf);
+        ggml_backend_sched_reset(sched);
+        return ggml_backend_sched_alloc_graph(sched, gf);
+    }
+    ggml_status compute_graph(ggml_cgraph * gf) {
+        return multi_gpu() ? ggml_backend_sched_graph_compute(sched, gf)
+                           : ggml_backend_graph_compute(backend, gf);
+    }
+    // A scheduler over every GPU in the plan plus the CPU. ggml requires the
+    // last backend to be a CPU device: it is the fallback for ops no
+    // accelerator claims.
+    ggml_backend_sched_t make_sched() {
+        std::vector<ggml_backend_t> be(gpus.begin(), gpus.end());
+        std::vector<ggml_backend_buffer_type_t> bt;
+        for (ggml_backend_t b : gpus) bt.push_back(ggml_backend_get_default_buffer_type(b));
+        be.push_back(cpu_backend);
+        bt.push_back(ggml_backend_get_default_buffer_type(cpu_backend));
+        ggml_backend_sched_t s = ggml_backend_sched_new(be.data(), bt.data(), (int) be.size(),
+                                                        GRAPH_SIZE, false, false);
+        if (!s) throw std::runtime_error("failed to create backend scheduler");
+        return s;
+    }
+
+    // Smallest pool across devices: what bounds a batch that must fit every layer.
+    int ec_min_slots() const {
+        int m = INT32_MAX;
+        for (const auto & c : ecaches) if (c) m = std::min(m, c->min_slots());
+        return m == INT32_MAX ? 0 : m;
+    }
+    bool                  offload  = false;     // routed experts do not fit in VRAM (see plan_offload)
+    bool                  ssd_mode = false;     // ... and stream from the GGUF on SSD (no RAM copy)
     ggml_gallocr_t        cache_galloc = nullptr;
+    // One graph allocator per GPU: under a layer split each per-layer segment
+    // graph is allocated and run on the device that owns the layer, so this path
+    // never touches the scheduler at all.
+    std::vector<ggml_gallocr_t> cache_gallocs;
+
+    // Carry tensors exist once per device. A layer's segment graph must read and
+    // write carries in the memory of the device that runs it; otherwise every
+    // layer on a secondary device becomes a cross-device round trip with a
+    // device sync, which is what made this path ~100x slower than the fused one.
+    // The p_* members below point at the set for the layer currently being
+    // built (use_carry); only the hidden state ever crosses, once per device
+    // boundary (hop_carry).
+    struct CarrySet {
+        ggml_context *        ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        ggml_tensor * h = nullptr, * ffn_in = nullptr, * resid = nullptr, * weights = nullptr;
+        ggml_tensor * ffn_in2 = nullptr, * resid2 = nullptr, * weights2 = nullptr;
+        ggml_tensor * slot_g = nullptr, * slot_u = nullptr, * slot_d = nullptr;
+        // qwen4exp: `resid` has no meaning when the residual is hc streams wide
+        // (seg B re-reads `h` instead); what seg B needs from seg A is the
+        // scatter weights the ffn mixer produced. `ple` holds this token's
+        // gathered n-gram rows.
+        ggml_tensor * inject = nullptr, * inject2 = nullptr, * ple = nullptr;
+    };
+    std::vector<CarrySet> carries;
+    std::vector<float>    hop_buf;      // staging for the boundary hidden-state hop
+
+    void use_carry(int d);
+    void hop_carry(int from, int to);            // the running hidden state
+    void hop_carry_ab(int from, int to, int il); // seg A -> seg B carries for layer il
+    void plan_pools();                           // fill pool_dev from per-device surplus
     // persistent "carry" tensors that bridge the per-layer graph segments
     ggml_context *        cctx       = nullptr;
     ggml_backend_buffer_t cbuf       = nullptr;
@@ -83,6 +266,9 @@ struct Runtime::Impl {
     ggml_tensor *         p_slot_g   = nullptr;  // [n_used]   gate slot ids (host -> GPU)
     ggml_tensor *         p_slot_u   = nullptr;  // [n_used]   up   slot ids
     ggml_tensor *         p_slot_d   = nullptr;  // [n_used]   down slot ids
+    ggml_tensor *         p_inject   = nullptr;  // [hc]       hc scatter weights (seg A -> B)
+    ggml_tensor *         p_inject2  = nullptr;
+    ggml_tensor *         p_ple      = nullptr;  // [n_embd]   this token's n-gram rows
 
     // Phase B v2-fast: optimistic single-graph decode over the VRAM cache.
     // One persistent (CUDA-graph friendly) graph runs the whole token; per-layer
@@ -115,6 +301,9 @@ struct Runtime::Impl {
     ggml_context *        f_ctx    = nullptr;
     ggml_cgraph *         f_gf     = nullptr;
     ggml_gallocr_t        f_galloc = nullptr;
+    // Multi-GPU only: the fused graph's own scheduler, so that a reset from any
+    // other graph cannot invalidate its one-time allocation.
+    ggml_backend_sched_t  f_sched  = nullptr;
     int                   f_nkv    = 0;
     std::vector<int32_t>  g2s_host;
     std::vector<int32_t>  sel_host;
@@ -125,11 +314,30 @@ struct Runtime::Impl {
 
     // recurrent / KV state (persistent across decode steps)
     ggml_context *        st_ctx = nullptr;
-    ggml_backend_buffer_t st_buf = nullptr;
+    // KV / recurrent state, one buffer per GPU: a layer's state must sit on the
+    // device that computes the layer. Single-GPU leaves exactly one entry.
+    std::vector<ggml_backend_buffer_t> st_bufs;
     std::vector<ggml_tensor *> k_cache;     // [n_embd_gqa, n_ctx]  (attention layers)
     std::vector<ggml_tensor *> v_cache;     // [n_embd_gqa, n_ctx]  (attention layers, non-transposed)
     std::vector<ggml_tensor *> conv_state;  // [d_conv-1, conv_ch]  (GDN layers)
     std::vector<ggml_tensor *> ssm_state;   // [S, S, H_v]          (GDN layers)
+    // qwen4exp PLE: the module's own dilated-conv history, kept per PLE layer
+    // and shaped like conv_state -- tokens on ne[0] so a batch concatenates.
+    std::vector<ggml_tensor *> ple_conv_state;  // [(K-1)*ngram, hc_dim]
+    // qwen4exp QSA: raw (unnormed, unroped) indexer keys, one per cached token.
+    // Pooling happens over these, so they are stored before either transform --
+    // and in F32, because the pooled scores decide which cells are attended to
+    // at all and an F16 round trip can reorder a near tie.
+    std::vector<ggml_tensor *> idx_k_cache;     // [indexer_head_dim, n_ctx]
+
+    // The n-gram table lives outside every backend buffer (see ngram_table.h).
+    // ngram_hist carries the tokens preceding the current batch so a chunked
+    // prefill and a token-at-a-time decode hash the same context a single-shot
+    // pass would; it is cleared by reset() alongside the KV.
+    std::unique_ptr<NgramTable> ngram;
+    std::vector<int32_t> ngram_hist;
+    std::vector<int32_t> ngram_rows;    // scratch: n_heads row indices per token
+    std::vector<float>   ngram_embd;    // scratch: the gathered rows, F32
 
     ggml_gallocr_t galloc = nullptr;
 
@@ -228,6 +436,16 @@ struct Runtime::Impl {
     // offload build every byte saved goes straight to the expert pool.
     int                   swa_ring = 0;
     ggml_tensor *         ring_idx = nullptr;   // per-graph ring write positions
+    // The ring size for a given context: QWEN_SWA_RING=0 turns it off (the A/B
+    // that proves it changes no output). A function of the model and n_ctx
+    // alone, so the memory plan can use it before init() sets swa_ring.
+    int swa_ring_for(int ctx) const {
+        const auto & hp = model.hparams();
+        if (hp.n_swa == 0) return 0;
+        if (const char * e = getenv("QWEN_SWA_RING")) if (atoi(e) == 0) return 0;
+        const int r = ((int) hp.n_swa + max_attn_batch() + KV_BUCKET - 1) / KV_BUCKET * KV_BUCKET;
+        return r < ctx ? r : 0;   // only worth it when it actually saves rows
+    }
     int  kv_rows(int il) const {
         return (swa_ring > 0 && model.hparams().is_swa(il)) ? swa_ring : n_ctx;
     }
@@ -238,10 +456,10 @@ struct Runtime::Impl {
     Impl(Model & m, const RuntimeConfig & c) : model(m), cfg(c) {}
     ~Impl() {
         if (ecache) {
-            if (getenv("QWEN_LAYER_STATS")) ecache->dump_layer_stats("decode");
+            if (getenv("QWEN_LAYER_STATS")) for (auto * c : all_ecaches()) c->dump_layer_stats("decode");
             // What quota would the generation's own routing have asked for?
-            if (getenv("QWEN_LAYER_QUOTA_DRIFT")) ecache->dump_quota_plan("decode-fit");
-            const auto & s = ecache->stats();
+            if (getenv("QWEN_LAYER_QUOTA_DRIFT")) for (auto * c : all_ecaches()) c->dump_quota_plan("decode-fit");
+            const auto & s = ec_stats_sum();
             const uint64_t acc = s.hits + s.misses;
             fprintf(stderr,
                     "expert cache stats: %llu accesses, %.1f%% hit, %llu misses, %llu evictions\n",
@@ -262,10 +480,22 @@ struct Runtime::Impl {
             else if (s.fetch_bytes)
                 fprintf(stderr, "expert cache fetch: %.1f MB (async H2D)\n",
                     s.fetch_bytes / 1024.0 / 1024.0);
-            if (cfg.cache_profile_save && !cfg.cache_profile.empty() && ecache->save_profile(cfg.cache_profile))
-                fprintf(stderr, "expert cache: saved profile to '%s'\n", cfg.cache_profile.c_str());
+            // Each device profiles only its own layers, so a split writes one
+            // file per device (".gpu<N>") rather than having them clobber each
+            // other; a single GPU keeps the plain filename it always had.
+            if (cfg.cache_profile_save && !cfg.cache_profile.empty()) {
+                for (size_t d = 0; d < ecaches.size(); ++d) {
+                    if (!ecaches[d]) continue;
+                    const std::string path = multi_gpu()
+                        ? cfg.cache_profile + ".gpu" + std::to_string(d)
+                        : cfg.cache_profile;
+                    if (ecaches[d]->save_profile(path))
+                        fprintf(stderr, "expert cache: saved profile to '%s'\n", path.c_str());
+                }
+            }
         }
-        ecache.reset();
+        ecaches.clear();
+        ecache = nullptr;
         if (m_galloc)       ggml_gallocr_free(m_galloc);
         if (m_ctx)          ggml_free(m_ctx);
         if (r_galloc)       ggml_gallocr_free(r_galloc);
@@ -277,17 +507,24 @@ struct Runtime::Impl {
         if (backend_mtp && backend_mtp != backend) ggml_backend_free(backend_mtp);
         if (mtp_galloc)     ggml_gallocr_free(mtp_galloc);
         if (f_galloc)       ggml_gallocr_free(f_galloc);
+        if (f_sched)        ggml_backend_sched_free(f_sched);
         if (f_ctx)          ggml_free(f_ctx);
         if (bak_buf)        ggml_backend_buffer_free(bak_buf);
         if (bak_ctx)        ggml_free(bak_ctx);
-        if (cache_galloc)   ggml_gallocr_free(cache_galloc);
+        for (auto g : cache_gallocs) if (g) ggml_gallocr_free(g);
+        cache_galloc = nullptr;   // aliases cache_gallocs[0], already freed
+        for (auto & c : carries) {
+            if (c.buf) ggml_backend_buffer_free(c.buf);
+            if (c.ctx) ggml_free(c.ctx);
+        }
+        carries.clear();
         if (cbuf)           ggml_backend_buffer_free(cbuf);
         if (cctx)           ggml_free(cctx);
         if (sched)          ggml_backend_sched_free(sched);
         if (galloc)         ggml_gallocr_free(galloc);
         if (dgalloc)        ggml_gallocr_free(dgalloc);
         if (dctx)           ggml_free(dctx);
-        if (st_buf)         ggml_backend_buffer_free(st_buf);
+        for (auto b : st_bufs) if (b) ggml_backend_buffer_free(b);
         if (st_ctx)         ggml_free(st_ctx);
         // expert_cpu_bufs and weights_bufs are owned here (not by Model) in
         // split/ssd mode; in single-backend mode Model owns and frees the weights.
@@ -295,6 +532,9 @@ struct Runtime::Impl {
         if (cpu_backend)    ggml_backend_free(cpu_backend);
         if (weights_buf_owned)
             for (auto b : weights_bufs) if (b) ggml_backend_buffer_free(b);
+        // gpus[0] aliases `backend`; free the secondaries first, then it.
+        for (size_t i = 1; i < gpus.size(); ++i)
+            if (gpus[i]) ggml_backend_free(gpus[i]);
         if (backend)        ggml_backend_free(backend);
     }
 
@@ -305,13 +545,69 @@ struct Runtime::Impl {
         if (!t) throw std::runtime_error(std::string("missing tensor: ") + name);
         return t;
     }
+    // Is the PLE module part of the graph? False for a model without one and
+    // for --ngram off, which is what makes that flag a graph-level switch
+    // rather than just a storage choice.
+    bool use_ple() const {
+        return ngram && ngram->mode() != NgramTable::Mode::OFF &&
+               model.hparams().has_ple();
+    }
+
     ggml_tensor * Wopt(const char * fmt, int il) {
         char name[256];
         snprintf(name, sizeof(name), fmt, il);
         return model.tensor(name);
     }
+    // Final norm and LM head. lfm2 files name the final norm token_embd_norm
+    // (a converter quirk llama.cpp keeps), and a tied head reuses the embedding.
+    ggml_tensor * out_norm_w() const {
+        if (ggml_tensor * t = model.tensor("output_norm.weight")) return t;
+        if (ggml_tensor * t = model.tensor("token_embd_norm.weight")) return t;
+        throw std::runtime_error("missing tensor: output_norm.weight");
+    }
+    ggml_tensor * out_proj_w() const {
+        if (ggml_tensor * t = model.tensor("output.weight")) return t;
+        return model.tensor("token_embd.weight");
+    }
 
     void init();
+    void plan_layers();   // fill layer_dev from the --gpu-split shares
+    void plan_offload();  // decide `offload` / `ssd_mode` from the resolved budgets
+    // Graph-buffer headroom to keep on each device: what gallocr and sched
+    // allocate for the forward pass, before the expert pool takes what is left
+    // of the budget. Used by the offload decision and by the pool sizing, so
+    // the two cannot drift apart.
+    //
+    // This was a flat 1 GiB, which is 6% of a 16 GB card and 17% of a 6 GB one,
+    // and it ignored --batch-chunk -- the one knob that changes the size of the
+    // graph being reserved for. Measured against the batched prefill graph at
+    // chunk 4096, which is the largest one built: 112 MB for 35B-A3B (residual
+    // 2048) and 200 MB for Qwen3.8-Flash-Next (residual 10240, i.e. five times
+    // the width for under twice the buffer -- most of it is the vocabulary-sized
+    // tail, not the token dimension). Hence a fixed part plus a term in
+    // width * chunk, at a little under two times the measurements.
+    //
+    // Only the offload path spends this: without a pool there is nothing for the
+    // headroom to take memory away from, and an underestimate there merely makes
+    // "it fits" slightly more optimistic. On the offload path an underestimate
+    // fails when prefill allocates its graph -- with the numbers, since
+    // throw_alloc_failure() reports them.
+    size_t compute_headroom() const {
+        const size_t scaled = (size_t) model.hparams().n_embd_hc() * (size_t) batch_chunk() * 4;
+        const size_t want   = 192ull * 1024 * 1024 + scaled;
+        return std::min<size_t>(std::max<size_t>(want, 256ull * 1024 * 1024),
+                                1024ull * 1024 * 1024);
+    }
+    // What the graph allocators actually hold, against compute_headroom(), which
+    // is what the expert pool gave up for them. gallocr sizes its buffer on
+    // first use and grows it as bigger graphs appear, so this reports whenever
+    // the total grows -- a handful of lines that stop once prefill has run.
+    void report_compute_buffers();
+    size_t compute_reported = 0;
+    // Bytes of KV / recurrent state layer `il` needs at cfg.n_ctx. Computed from
+    // the hyper-parameters, so plan_offload() can charge for the state buffers
+    // before they are allocated.
+    size_t state_bytes(int il) const;
     void zero_states();
     // logits_all=false computes the output head for the LAST token only. The
     // head is [n_embd, n_vocab] -- on a large vocabulary it is the single most
@@ -355,11 +651,47 @@ struct Runtime::Impl {
     ggml_tensor * build_attn(ggml_context * ctx, ggml_cgraph * gf, int il,
                              ggml_tensor * Q, ggml_tensor * K, ggml_tensor * V,
                              ggml_tensor * mask, int n_tokens, int n_kv, int kv_pos = -1);
-    // ---- graph tensor dump (QWEN_DUMP_LAYERS) ----
+    // Upload the causal (and, on step35, the sliding-window) attention masks for
+    // a batch of n_tokens whose first token sits at absolute position pos0.
+    void fill_masks(ggml_cgraph * gf, int n_tokens, int n_kv, int pos0);
+    // Create a graph's sliding-layer inputs: the mask, and (when the cache
+    // wraps) the ring write index build_attn scatters through. Sets ring_idx.
+    ggml_tensor * new_swa_inputs(ggml_context * ctx, int n_tokens, int n_kv);
+    // The mask input for layer il's attention in a one-graph-per-layer
+    // segment: the sliding one on a sliding layer, the causal one otherwise.
+    ggml_tensor * new_layer_mask(ggml_context * ctx, int il, int n_tokens, int n_kv);
+    // step35 head-wise attention gate (a no-op elsewhere).
+    ggml_tensor * apply_attn_gate(ggml_context * ctx, int il, ggml_tensor * att,
+                                  ggml_tensor * x, int n_head_l, int n_tokens);
+    ggml_tensor * build_gdn(ggml_context * ctx, ggml_cgraph * gf, int il,
+                            ggml_tensor * x, int n_tokens);
+
+    // ---- expert routing (every MoE graph goes through this) ----
+    // Qwen ranks on softmax(logits). step35 / lfm2moe squash each logit with a
+    // sigmoid and rank on that plus a per-expert selection bias, mixing with the
+    // *unbiased* value (the bias only decides who gets picked). All graphs --
+    // resident, offload prefill, offload decode, fused decode -- share this, so
+    // they cannot silently pick different experts.
+    //   rm: optional residency mask ([n_exp, 1], 0 / -inf). It is applied to the
+    //       logits and again after the bias, which could otherwise rank a masked
+    //       (prob 0) expert first.
+    struct Route {
+        ggml_tensor * selected = nullptr;   // [n_used, n_tokens] i32 (strided view)
+        ggml_tensor * weights  = nullptr;   // [1, n_used, n_tokens]
+    };
+    Route route_experts(ggml_context * ctx, int il, ggml_tensor * logits,
+                        ggml_tensor * rm, int n_tokens);
+    // The order route_experts ranks in, before any residency mask: what the
+    // router *wants*, for the resident-decode refill hint.
+    ggml_tensor * router_rank(ggml_context * ctx, int il, ggml_tensor * logits);
+    // Dense SwiGLU FFN (dense models, and the leading dense blocks of a MoE).
+    ggml_tensor * build_dense_ffn(ggml_context * ctx, int il, ggml_tensor * x);
+
+    // ---- graph tensor dump (QWEN_DUMP_LAYERS=0,3,44 or =all) ----
     // Pins named intermediates as graph outputs so they survive gallocr reuse,
     // then prints one whole-tensor sum each after the run. The names match
-    // llama.cpp's cb() labels so a capture from llama-debug can be diffed
-    // line for line (see tests/step-ref/README.md).
+    // llama.cpp's cb() labels so a llama-debug capture can be diffed line for
+    // line with tests/step-ref/cmp.py.
     std::vector<int>                                   dump_layers;   // -1 = all
     std::vector<std::pair<std::string, ggml_tensor *>> dump_list;
     bool dump_wants(int il) const {
@@ -378,18 +710,39 @@ struct Runtime::Impl {
         return t;
     }
     void dump_flush(const char * tag);
+    // ---- qwen4exp hyper-connections ----
+    // The residual is hc_count streams wide. Each block reads one n_embd-wide
+    // view of it (build_hc_mix) and its output is scattered back over all the
+    // streams (build_hc_combine). The mixer's grouped RMSNorm is what a plain
+    // architecture would call attn_norm / ffn_norm -- qwen4exp carries no
+    // separate norm tensors, and the final mixer doubles as the output norm.
+    //   res_hc is [n_embd, hc, n_tokens]; the mix returns [n_embd, n_tokens].
+    // `inject`, when non-null, receives the [hc, n_tokens] scatter weights that
+    // the matching build_hc_combine needs.
+    ggml_tensor * build_hc_mix(ggml_context * ctx, ggml_tensor * res_hc,
+                               ggml_tensor * w_norm, ggml_tensor * w_down,
+                               ggml_tensor * w_up, ggml_tensor * w_inject,
+                               ggml_tensor ** inject);
+    ggml_tensor * build_hc_combine(ggml_context * ctx, ggml_tensor * res_hc,
+                                   ggml_tensor * block_out, ggml_tensor * inject);
+    // qwen4exp PLE. `emb` is the host-gathered n-gram rows [n_embd, n_tokens].
+    ggml_tensor * build_ple(ggml_context * ctx, ggml_cgraph * gf, int il,
+                            ggml_tensor * res_hc, ggml_tensor * emb, int n_tokens);
+    void fill_ple_input(ggml_cgraph * gf, const int32_t * tokens, int n_tokens);
 
-    // Upload the causal (and, on step35, the sliding-window) attention masks for
-    // a batch of n_tokens whose first token sits at absolute position pos0.
-    void fill_masks(ggml_cgraph * gf, int n_tokens, int n_kv, int pos0);
-    // Create a graph's sliding-layer inputs: the mask, and (when the cache
-    // wraps) the ring write index build_attn scatters through. Sets ring_idx.
-    ggml_tensor * new_swa_inputs(ggml_context * ctx, int n_tokens, int n_kv);
-    // step35 head-wise attention gate (a no-op elsewhere).
-    ggml_tensor * apply_attn_gate(ggml_context * ctx, int il, ggml_tensor * att,
-                                  ggml_tensor * x, int n_head_l, int n_tokens);
-    ggml_tensor * build_gdn(ggml_context * ctx, ggml_cgraph * gf, int il,
-                            ggml_tensor * x, int n_tokens);
+    // qwen4exp QSA. The host-side inputs depend on the cache layout and the
+    // batch's positions but not on the layer, so one set serves every QSA layer
+    // in a graph; build_qsa_mask fills this on first use.
+    struct QsaShared {
+        ggml_tensor * cell_blk = nullptr, * blk_cells = nullptr;
+        ggml_tensor * blk_pos  = nullptr, * bias      = nullptr;
+        int n_blocks = 0, width = 0;
+    };
+    ggml_tensor * build_qsa_mask(ggml_context * ctx, ggml_cgraph * gf, int il,
+                                 ggml_tensor * cur, ggml_tensor * inp_pos,
+                                 ggml_tensor * mask, int n_tokens, int n_kv,
+                                 int kv_pos, QsaShared & shared);
+    void set_qsa_inputs(ggml_cgraph * gf, int n_tokens, int n_kv, int kv_pos);
     ggml_tensor * build_moe(ggml_context * ctx, ggml_cgraph * gf, int il,
                             ggml_tensor * x, int n_tokens);
     const std::vector<float> & decode(const std::vector<int32_t> & tokens);
@@ -478,15 +831,94 @@ void Runtime::Impl::init() {
         }
     }
 
+    // A context longer than the model was trained for is allowed -- it degrades
+    // rather than breaks, and seeing how much is a fair thing to want -- but it
+    // is never what someone meant to ask for by accident. There is no RoPE
+    // scaling here (no YaRN, no frequency scaling), so every position past the
+    // trained length is plain extrapolation, and the KV cache is sized for the
+    // whole thing regardless of how much of it the model can use.
+    if (cfg.n_ctx > 0 && model.hparams().n_ctx_train > 0 &&
+        (uint32_t) cfg.n_ctx > model.hparams().n_ctx_train)
+        fprintf(stderr, "warning: --n-ctx %d is past this model's trained context length of %u."
+                        " Positions beyond it are extrapolated (no RoPE scaling is implemented)"
+                        " and the output degrades there; the KV cache is sized for all %d either"
+                        " way.\n",
+                cfg.n_ctx, model.hparams().n_ctx_train, cfg.n_ctx);
+
     // Prefer a GPU device (CUDA/Metal/etc.) when requested and available.
     if (cfg.use_cuda) {
-        for (ggml_backend_dev_t dev : gpu_devices()) {
-            backend = ggml_backend_dev_init(dev, nullptr);
-            if (backend) {
-                fprintf(stderr, "backend: GPU [%s] %s\n",
-                        ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
-                break;
+        const std::vector<ggml_backend_dev_t> devs = gpu_devices();
+        // Without an explicit plan, take the first device that initializes --
+        // the historical behavior. With one, honor the requested order and
+        // treat a device that fails to init as fatal: silently dropping it
+        // would shift every layer's placement away from what was measured.
+        if (cfg.gpus.empty()) {
+            for (ggml_backend_dev_t dev : devs) {
+                backend = ggml_backend_dev_init(dev, nullptr);
+                if (backend) {
+                    // No --vram-budget: the budget is what the card has free
+                    // right now. Whatever the model does not fit into it goes
+                    // to the expert tier, so the common case needs no flag.
+                    size_t got_free = 0, dev_total = 0;
+                    ggml_backend_dev_memory(dev, &got_free, &dev_total);
+                    budget_from_flag = cfg.vram_budget_mb > 0;
+                    const size_t budget = budget_from_flag
+                        ? cfg.vram_budget_mb * 1024ull * 1024ull : got_free;
+                    // `got_free` is read after dev_init, so the CUDA context --
+                    // kernel images and all, several hundred MB of it -- is
+                    // already out of it. Printing the total next to it is what
+                    // keeps that from reading as memory gone missing.
+                    char b_s[96];
+                    if (budget_from_flag)
+                        snprintf(b_s, sizeof(b_s), "budget %zu MB of %zu free", budget >> 20,
+                                 got_free >> 20);
+                    else
+                        snprintf(b_s, sizeof(b_s), "free %zu MB", got_free >> 20);
+                    fprintf(stderr, "backend: GPU [%s] %s (%s of %zu MB, after the backend"
+                                    " context)\n",
+                            ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                            b_s, dev_total >> 20);
+                    gpus.push_back(backend);
+                    dev_budget.push_back(budget);
+                    dev_free.push_back(got_free);
+                    break;
+                }
             }
+        } else {
+            for (const GpuPlan & p : cfg.gpus) {
+                if (p.device < 0 || (size_t) p.device >= devs.size())
+                    throw std::runtime_error("--gpus: no GPU device with index "
+                                             + std::to_string(p.device) + " (found "
+                                             + std::to_string(devs.size()) + ")");
+                ggml_backend_t be = ggml_backend_dev_init(devs[(size_t) p.device], nullptr);
+                if (!be)
+                    throw std::runtime_error("failed to init GPU device "
+                                             + std::to_string(p.device));
+                // With no --vram-budget there is still a ratio to pick: use what
+                // the device actually has free, so a resident (non-offload)
+                // split lands layers in proportion to real capacity instead of
+                // piling them all onto the primary.
+                const bool from_free = (p.budget_mb == VRAM_BUDGET_AUTO);
+                size_t got_free = 0, dev_total = 0;
+                ggml_backend_dev_memory(devs[(size_t) p.device], &got_free, &dev_total);
+                const size_t budget = from_free ? got_free : p.budget_mb * 1024ull * 1024ull;
+                if (!from_free) budget_from_flag = true;
+                char split_s[32], b_s[96];
+                if (p.split < 0.0f) snprintf(split_s, sizeof(split_s), "auto");
+                else                snprintf(split_s, sizeof(split_s), "%.3g", p.split);
+                if (from_free) snprintf(b_s, sizeof(b_s), "free %zu MB", got_free >> 20);
+                else           snprintf(b_s, sizeof(b_s), "budget %zu MB of %zu free",
+                                        budget >> 20, got_free >> 20);
+                fprintf(stderr, "backend: GPU%d [%s] %s (%s of %zu MB, after the backend"
+                                " context; split %s)\n",
+                        p.device, ggml_backend_dev_name(devs[(size_t) p.device]),
+                        ggml_backend_dev_description(devs[(size_t) p.device]),
+                        b_s, dev_total >> 20, split_s);
+                gpus.push_back(be);
+                dev_budget.push_back(budget);
+                dev_free.push_back(got_free);
+            }
+            backend = gpus[0];
         }
         if (!backend) fprintf(stderr, "backend: no GPU device found, falling back to CPU\n");
     }
@@ -497,24 +929,68 @@ void Runtime::Impl::init() {
         if (nth <= 0) nth = 4;
         ggml_backend_cpu_set_n_threads(backend, nth);
         fprintf(stderr, "backend: CPU (%d threads)\n", nth);
+        gpus.assign(1, backend);          // "device 0" is the CPU here
+        // ... so the "VRAM" budget is host memory: what --vram-budget said, or
+        // most of what the OS reports free. Most, not all: the SSD tier wants
+        // page cache left over, and off Windows ggml reports total RAM as free.
+        size_t host_free = 0, host_total = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(backend), &host_free, &host_total);
+        budget_from_flag = cfg.vram_budget_mb > 0;
+        size_t budget = cfg.vram_budget_mb * 1024ull * 1024ull;
+        if (!budget_from_flag) {
+            budget = host_free / 4 * 3;
+            fprintf(stderr, "backend: CPU memory budget %zu MB (3/4 of %zu MB free)\n",
+                    budget >> 20, host_free >> 20);
+        }
+        dev_budget.assign(1, budget);
+        dev_free.assign(1, host_free);
     }
-
-    // ---- Phase B: Expert weight offload via CPU backend + sched ----
-    const bool use_expert_offload =
-        cfg.vram_budget_mb > 0 && model.has_expert_tensors() && cfg.use_cuda;
 
     // Keep the MTP (nextn) block's experts VRAM-resident only when MTP is in use;
     // otherwise let them offload with the rest (saves VRAM). Must be set before
-    // any load_weights_* call.
+    // any load_weights_* call -- and before plan_offload(), which counts the
+    // bytes these two decide.
     model.set_keep_nextn_resident(cfg.use_mtp && model.hparams().has_mtp());
     model.set_embd_q8(cfg.embd_q8);
 
-    if (use_expert_offload && cfg.experts_ssd) {
+    // ---- Phase B: expert weight offload ----
+    // Whether the experts have to leave VRAM at all, and to which tier. Runs
+    // before plan_layers() because the layer split hands a pool-only device its
+    // whole budget, which only means something when there are pools to place.
+    plan_offload();
+    const bool use_expert_offload = offload;
+
+    // Decide which device computes which layer before any weight is placed.
+    plan_layers();
+
+    if (use_expert_offload && ssd_mode) {
         // ---- SSD tier: experts stay on disk; non-expert weights -> GPU ----
-        ssd_mode = true;
         weights_buf_owned = true;   // set first: a throw mid-load still frees what was allocated
-        model.load_weights_ssd(backend, weights_bufs);
+        DevicePlan ssd_plan = device_plan();
+        model.load_weights_ssd(backend, weights_bufs, &ssd_plan, &dev_weight_bytes);
         reuse_graph = false;   // every token goes through the per-token cache path
+        // The SSD tier has no CPU backend to fall back to, so it normally runs
+        // without a scheduler at all. A layer split still needs one to route
+        // each op to the device holding that layer's weights. ggml_backend_sched
+        // asserts that the LAST backend is a CPU device (it is the fallback for
+        // ops no accelerator claims), so one has to be created here even though
+        // this tier never runs expert matmuls on it.
+        if (multi_gpu()) {
+            cpu_backend = ggml_backend_cpu_init();
+            if (!cpu_backend) throw std::runtime_error("failed to init CPU backend (ssd tier)");
+            int nth = cfg.n_threads > 0 ? cfg.n_threads : (int) std::thread::hardware_concurrency();
+            if (nth <= 0) nth = 4;
+            ggml_backend_cpu_set_n_threads(cpu_backend, nth);
+
+            std::vector<ggml_backend_t> sb(gpus.begin(), gpus.end());
+            std::vector<ggml_backend_buffer_type_t> st;
+            for (ggml_backend_t be : gpus) st.push_back(ggml_backend_get_default_buffer_type(be));
+            sb.push_back(cpu_backend);
+            st.push_back(ggml_backend_get_default_buffer_type(cpu_backend));
+            sched = ggml_backend_sched_new(sb.data(), st.data(), (int) sb.size(),
+                                           GRAPH_SIZE, false, false);
+            if (!sched) throw std::runtime_error("failed to create backend scheduler (ssd tier)");
+        }
         fprintf(stderr, "expert offload: ON (SSD tier, decode via VRAM cache; prefill in batched chunks)\n");
     } else if (use_expert_offload) {
         // Create a CPU backend for expert weights.
@@ -534,18 +1010,23 @@ void Runtime::Impl::init() {
             cpu_buft = ggml_backend_get_default_buffer_type(cpu_backend);
         }
 
-        // Load weights: non-expert → GPU, expert → CPU (pinned).
+        // Load weights: non-expert → GPU (its layer's GPU under a split),
+        // expert → CPU (pinned).
         weights_buf_owned = true;   // set first: a throw mid-load still frees what was allocated
-        model.load_weights_split(backend, cpu_buft, weights_bufs, expert_cpu_bufs);
+        DevicePlan plan = device_plan();
+        model.load_weights_split(backend, cpu_buft, weights_bufs, expert_cpu_bufs,
+                                 &plan, &dev_weight_bytes);
 
-        // Create backend scheduler: GPU first (higher priority), CPU fallback.
-        // The sched routes ops to GPU for GPU-backend tensors and CPU for CPU-backend tensors.
-        ggml_backend_t   sched_be[2]   = { backend, cpu_backend };
-        ggml_backend_buffer_type_t sched_bt[2] = {
-            ggml_backend_get_default_buffer_type(backend),
-            ggml_backend_get_default_buffer_type(cpu_backend),
-        };
-        sched = ggml_backend_sched_new(sched_be, sched_bt, 2, GRAPH_SIZE, false, false);
+        // Create backend scheduler: GPUs first (higher priority, in plan order),
+        // CPU last. The sched routes each op to the backend that owns its
+        // weights and inserts the cross-device copies at the layer boundaries.
+        std::vector<ggml_backend_t> sched_be(gpus.begin(), gpus.end());
+        std::vector<ggml_backend_buffer_type_t> sched_bt;
+        for (ggml_backend_t be : gpus) sched_bt.push_back(ggml_backend_get_default_buffer_type(be));
+        sched_be.push_back(cpu_backend);
+        sched_bt.push_back(ggml_backend_get_default_buffer_type(cpu_backend));
+        sched = ggml_backend_sched_new(sched_be.data(), sched_bt.data(),
+                                       (int) sched_be.size(), GRAPH_SIZE, false, false);
         if (!sched) throw std::runtime_error("failed to create backend scheduler");
 
         // Disable persistent reuse graph — sched alloc is incompatible with it.
@@ -553,6 +1034,24 @@ void Runtime::Impl::init() {
 
         fprintf(stderr, "expert offload: ON (experts stream into the VRAM cache;"
                         " QWEN_CPU_PREFILL=1 runs prefill experts on CPU instead)\n");
+    } else if (multi_gpu()) {
+        // Plain resident weights spread over the GPUs: no offload, the model
+        // simply does not fit one card. The graph then spans devices, so it
+        // needs a scheduler (and the persistent reuse graph, which assumes a
+        // single backend and its own buffer, has to go).
+        weights_buf_owned = true;   // set first: a throw mid-load still frees what was allocated
+        DevicePlan plan = device_plan();
+        model.load_weights_multi(backend, plan, weights_bufs, &dev_weight_bytes);
+
+        cpu_backend = ggml_backend_cpu_init();
+        if (!cpu_backend) throw std::runtime_error("failed to init CPU backend for multi-GPU");
+        int nth = cfg.n_threads > 0 ? cfg.n_threads : (int) std::thread::hardware_concurrency();
+        if (nth <= 0) nth = 4;
+        ggml_backend_cpu_set_n_threads(cpu_backend, nth);
+        sched = make_sched();
+        reuse_graph = false;
+        fprintf(stderr, "multi-GPU: model resident across %zu GPUs (no expert offload)\n",
+                gpus.size());
     } else {
         weights_bufs.push_back(model.load_weights(backend));
     }
@@ -564,38 +1063,49 @@ void Runtime::Impl::init() {
     const auto & hp = model.hparams();
     n_ctx = cfg.n_ctx;
     const int n_layer    = hp.n_layer;
-    const int n_embd_gqa = hp.n_head_kv * hp.n_embd_head;
 
     // Size the sliding-window ring: the window itself plus the largest batch any
     // graph will attend over at once, since those queries need keys reaching
-    // n_swa back from the batch's *first* token. Both chunk sizes are env knobs,
-    // so read them the same way their owners do. QWEN_SWA_RING=0 turns the ring
-    // off (the A/B that proves it changes no output).
-    if (hp.n_swa > 0 && getenv("QWEN_SWA_RING") != nullptr
-                     && atoi(getenv("QWEN_SWA_RING")) == 0) {
-        swa_ring = 0;
-    } else if (hp.n_swa > 0) {
-        const int r = ((int) hp.n_swa + max_attn_batch() + KV_BUCKET - 1) / KV_BUCKET * KV_BUCKET;
-        // Only worth it when it actually saves rows.
-        swa_ring = r < n_ctx ? r : 0;
-        if (swa_ring > 0) {
-            size_t full = 0, ring = 0;
-            for (int il = 0; il < (int) hp.n_layer; ++il)
-                (hp.is_swa(il) ? ring : full) += 1;
-            fprintf(stderr, "SWA KV ring: %d rows on %zu sliding layers (%zu full at %d)"
-                            " = %.2f GB instead of %.2f GB\n",
-                    swa_ring, ring, full, n_ctx,
-                    (double) (ring * swa_ring + full * n_ctx) * n_embd_gqa * 2 * 2 / 1e9,
-                    (double) (ring + full) * n_ctx * n_embd_gqa * 2 * 2 / 1e9);
+    // n_swa back from the batch's *first* token.
+    swa_ring = swa_ring_for(n_ctx);
+    if (swa_ring > 0) {
+        size_t full = 0, ring = 0, gqa = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            (hp.is_swa(il) ? ring : full) += 1;
+            gqa = std::max(gqa, (size_t) hp.head_count_kv(il) * hp.n_embd_head);
         }
+        fprintf(stderr, "SWA KV ring: %d rows on %zu sliding layers (%zu full at %d)"
+                        " = %.2f GB instead of %.2f GB\n",
+                swa_ring, ring, full, n_ctx,
+                (double) (ring * swa_ring + full * n_ctx) * gqa * 2 * 2 / 1e9,
+                (double) (ring + full) * n_ctx * gqa * 2 * 2 / 1e9);
     }
 
     const int conv_ch = hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state;
     const int S       = hp.ssm_d_state;
     const int H_v     = hp.ssm_dt_rank;
 
+    // The n-gram table is deliberately built after the weights: it is not one of
+    // them. No backend buffer holds it in any mode.
+    {
+        NgramTable::Mode m = NgramTable::Mode::DISK;
+        if (!NgramTable::parse_mode(cfg.ngram_mode, m)) {
+            throw std::runtime_error("--ngram: expected off, disk or ram, got '"
+                                     + cfg.ngram_mode + "'");
+        }
+        ngram.reset(new NgramTable(model, m, cfg.ngram_cache_mb));
+        if (hp.has_ple()) {
+            fprintf(stderr, "ngram: %s", NgramTable::mode_name(ngram->mode()));
+            if (ngram->mode() == NgramTable::Mode::OFF) {
+                fprintf(stderr, " (n-gram embedding disabled)\n");
+            } else {
+                fprintf(stderr, " (%zu MB resident)\n", ngram->resident_bytes() >> 20);
+            }
+        }
+    }
+
     ggml_init_params kp{};
-    kp.mem_size   = (size_t) ggml_tensor_overhead() * n_layer * 4 + 4096;
+    kp.mem_size   = (size_t) ggml_tensor_overhead() * n_layer * 6 + 4096;
     kp.no_alloc   = true;
     st_ctx = ggml_init(kp);
 
@@ -603,6 +1113,8 @@ void Runtime::Impl::init() {
     v_cache.assign(n_layer, nullptr);
     conv_state.assign(n_layer, nullptr);
     ssm_state.assign(n_layer, nullptr);
+    ple_conv_state.assign(n_layer, nullptr);
+    idx_k_cache.assign(n_layer, nullptr);
 
     for (int il = 0; il < n_layer; ++il) {
         if (hp.is_recurrent(il)) {
@@ -616,20 +1128,60 @@ void Runtime::Impl::init() {
             // convert from F32 via set_rows / cpy; flash attention takes F16
             // K/V natively, and the fallback path feeds them to mul_mat, which
             // handles an F16 src0 against F32 activations.
-            const int rows = kv_rows(il);
-            k_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_gqa, rows);
-            v_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_gqa, rows);
+            // per-layer width: the kv head count may vary by layer (step35)
+            const int gqa_l = (int) hp.head_count_kv(il) * (int) hp.n_embd_head;
+            const int rows  = kv_rows(il);   // a sliding layer holds only its window
+            k_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, gqa_l, rows);
+            v_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, gqa_l, rows);
             ggml_set_name(k_cache[il], ("k_" + std::to_string(il)).c_str());
             ggml_set_name(v_cache[il], ("v_" + std::to_string(il)).c_str());
+            if (hp.has_qsa() && hp.compress_ratio(il) > 0) {
+                idx_k_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F32,
+                        hp.indexer_head_dim, n_ctx);
+                ggml_set_name(idx_k_cache[il], ("idxk_" + std::to_string(il)).c_str());
+            }
+        }
+        // independent of the attention/GDN split: a PLE layer can be either
+        if (use_ple() && hp.is_ple(il)) {
+            ple_conv_state[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F32,
+                    hp.ple_conv_state(), hp.n_embd_hc());
+            ggml_set_name(ple_conv_state[il], ("ple_conv_" + std::to_string(il)).c_str());
         }
     }
-    st_buf = ggml_backend_alloc_ctx_tensors(st_ctx, backend);
-    if (!st_buf) throw std::runtime_error("failed to alloc state buffer");
+    // A layer's KV / recurrent state must live on the device that computes the
+    // layer, so with a split the one state buffer becomes one per device.
+    st_bufs.assign(std::max<size_t>(gpus.size(), 1), nullptr);
+    if (!multi_gpu()) {
+        st_bufs[0] = ggml_backend_alloc_ctx_tensors(st_ctx, backend);
+        if (!st_bufs[0]) {
+            size_t want = 0;
+            for (int il = 0; il < n_layer; ++il) want += state_bytes(il);
+            throw_alloc_failure(ggml_backend_get_default_buffer_type(backend), want,
+                                "the KV / recurrent state cache");
+        }
+    } else {
+        for (size_t d = 0; d < gpus.size(); ++d) {
+            std::vector<ggml_tensor *> ts;
+            for (int il = 0; il < n_layer; ++il) {
+                if ((size_t) dev_of(il) != d) continue;
+                if (k_cache[il])    { ts.push_back(k_cache[il]);    ts.push_back(v_cache[il]); }
+                if (idx_k_cache[il]) ts.push_back(idx_k_cache[il]);
+                if (conv_state[il]) { ts.push_back(conv_state[il]); ts.push_back(ssm_state[il]); }
+                if (ple_conv_state[il]) ts.push_back(ple_conv_state[il]);
+            }
+            st_bufs[d] = alloc_tensor_list(ggml_backend_get_default_buffer_type(gpus[d]),
+                                           ts, "state buffer");
+        }
+    }
+    for (size_t d = 0; d < st_bufs.size() && d < dev_kv_bytes.size(); ++d)
+        dev_kv_bytes[d] = st_bufs[d] ? ggml_backend_buffer_get_size(st_bufs[d]) : 0;
 
     if (!sched) {
         galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
-    if (sched || ssd_mode) {
+    // A sched no longer implies offload: a multi-GPU resident model has one too,
+    // and it has no expert cache to build.
+    if (use_expert_offload || ssd_mode) {
         init_cache();   // dynamic per-expert VRAM cache for the decode hot path
     }
     // MTP: main forward exposes its last hidden, drafted by the nextn block
@@ -640,6 +1192,338 @@ void Runtime::Impl::init() {
         init_state_backup();   // MTP reject needs GDN rollback even without the cache
     }
     zero_states();
+}
+
+void Runtime::Impl::report_compute_buffers() {
+    const size_t nd = std::max<size_t>(gpus.size(), 1);
+    std::vector<size_t> per_dev(nd, 0);
+    auto add = [&](ggml_gallocr_t g, size_t d) {
+        if (g && d < nd) per_dev[d] += ggml_gallocr_get_buffer_size(g, 0);
+    };
+    // The per-device cache allocators; cache_galloc aliases cache_gallocs[0].
+    for (size_t d = 0; d < cache_gallocs.size(); ++d) add(cache_gallocs[d], d);
+    if (cache_gallocs.empty()) add(cache_galloc, 0);
+    // Everything else builds its graph on the primary device.
+    for (ggml_gallocr_t g : { galloc, mtp_galloc, m_galloc, r_galloc, v_galloc, dgalloc, f_galloc })
+        add(g, 0);
+    if (sched)
+        for (size_t d = 0; d < gpus.size() && d < nd; ++d)
+            per_dev[d] += ggml_backend_sched_get_buffer_size(sched, gpus[d]);
+
+    size_t total = 0;
+    for (size_t b : per_dev) total += b;
+    if (total <= compute_reported) return;   // no growth since the last line
+    compute_reported = total;
+
+    fprintf(stderr, "compute buffers: %zu MB", total >> 20);
+    if (nd > 1) {
+        fprintf(stderr, " (");
+        for (size_t d = 0; d < nd; ++d)
+            fprintf(stderr, "%sGPU%d %zu", d ? ", " : "",
+                    d < cfg.gpus.size() ? cfg.gpus[d].device : (int) d, per_dev[d] >> 20);
+        fprintf(stderr, " MB)");
+    }
+    fprintf(stderr, " of the %zu MB reserved per device\n", compute_headroom() >> 20);
+}
+
+size_t Runtime::Impl::state_bytes(int il) const {
+    const auto & hp = model.hparams();
+    size_t n = 0;
+    if (hp.is_recurrent(il)) {
+        const size_t conv_ch = (size_t) hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state;
+        n += (size_t) (hp.ssm_d_conv - 1) * conv_ch * 4;
+        n += (size_t) hp.ssm_d_state * hp.ssm_d_state * hp.ssm_dt_rank * 4;
+    } else {
+        const size_t n_embd_gqa = (size_t) hp.head_count_kv((uint32_t) il) * hp.n_embd_head;
+        const int    ring       = hp.is_swa((uint32_t) il) ? swa_ring_for(cfg.n_ctx) : 0;
+        n += 2 * n_embd_gqa * (size_t) (ring > 0 ? ring : cfg.n_ctx) * 2;   // F16 K and V
+        if (hp.has_qsa() && hp.compress_ratio((uint32_t) il) > 0)
+            n += (size_t) hp.indexer_head_dim * cfg.n_ctx * 4;
+    }
+    // The PLE conv state exists only when the module is in the graph, which
+    // --ngram off removes (use_ple(), but the table is not built yet here).
+    if (hp.has_ple() && cfg.ngram_mode != "off" && hp.is_ple((uint32_t) il))
+        n += (size_t) hp.ple_conv_state() * hp.n_embd_hc() * 4;
+    return n;
+}
+
+// Decide whether the routed experts have to leave VRAM, and to which tier.
+//
+// The budget is what --vram-budget asked for or, without it, what the devices
+// report free -- a capacity, not a mode switch. A model whose weights, KV cache
+// and compute headroom all fit inside it stays fully resident; one that does not
+// streams its routed experts from the tier cfg.expert_tier names. That is what
+// lets the common case -- a model bigger than the machine -- run with no flags.
+void Runtime::Impl::plan_offload() {
+    offload  = false;
+    ssd_mode = false;
+
+    size_t budget = 0, free_total = 0;
+    for (size_t b : dev_budget) budget += b;
+    for (size_t f : dev_free)   free_total += f;
+    if (budget == 0) return;   // no device would say how much it has: stay resident
+
+    const auto & hp = model.hparams();
+    const size_t weights = model.weight_bytes(backend);
+    size_t kv = 0;
+    for (int il = 0; il < (int) hp.n_layer; ++il) kv += state_bytes(il);
+    const size_t compute = compute_headroom() * std::max<size_t>(gpus.size(), 1);
+    const size_t need    = weights + kv + compute;
+
+    if (model.has_expert_tensors() && need > budget) {
+        offload  = true;
+        ssd_mode = cfg.expert_tier == ExpertTier::Ssd;
+    }
+
+    // What the device has to hold whatever the tier decides: the weights that
+    // stay on it plus the KV / recurrent state. The compute headroom is left out
+    // -- it is a reservation the expert pool gives way to, and a graph needing
+    // less than the headroom still runs -- so this is the floor, not the wish.
+    const size_t experts = offload ? model.offloaded_expert_bytes() : 0;
+    const size_t must    = weights - experts + kv;
+
+    // Two independent "does not fit" answers, and they mean different things.
+    // The budget is what was asked for; free is what the device admits to. Only
+    // when both say no is the run certain to fail, and that is the one worth
+    // refusing before an hour of weight loading -- it is also the auto case,
+    // where the two are the same number. Either one alone is survivable: a
+    // deliberately stingy budget still allocates against the real device, and an
+    // explicit budget above `free` is how one asks Metal for more than its
+    // recommended working set.
+    const bool over_budget = must > budget;
+    const bool over_free   = free_total > 0 && must > free_total;
+    const size_t resident_w = weights - experts;
+    if (over_budget && over_free) {
+        char msg[768];
+        snprintf(msg, sizeof(msg),
+                 "%zu MB has to stay on the device and only %zu MB is available: "
+                 "%zu MB of weights that cannot be offloaded + %zu MB of KV/recurrent state "
+                 "at --n-ctx %d%s. Lower --n-ctx, spread the model over more devices with "
+                 "--gpus, or run on the CPU with --cpu.",
+                 must >> 20, std::min(budget, free_total) >> 20,
+                 resident_w >> 20, kv >> 20, cfg.n_ctx,
+                 model.has_expert_tensors() ? "" : " (a dense model: no experts to offload)");
+        throw std::runtime_error(msg);
+    }
+    if (over_budget && model.has_expert_tensors())
+        fprintf(stderr, "warning: %zu MB has to stay on the device (weights %zu + KV %zu at"
+                        " --n-ctx %d) but the budget is %zu MB, so nothing is left for the"
+                        " expert pool and every token will miss. Lower --n-ctx or raise"
+                        " --vram-budget.\n",
+                must >> 20, resident_w >> 20, kv >> 20, cfg.n_ctx, budget >> 20);
+    else if (over_budget)
+        fprintf(stderr, "warning: %zu MB has to stay on the device (weights %zu + KV %zu at"
+                        " --n-ctx %d) but the budget is %zu MB; a dense model has nothing to"
+                        " offload, so it is loaded over budget and may spill to system memory."
+                        " Lower --n-ctx or raise --vram-budget.\n",
+                must >> 20, resident_w >> 20, kv >> 20, cfg.n_ctx, budget >> 20);
+    else if (over_free)
+        fprintf(stderr, "warning: %zu MB has to stay on the device but it reports only %zu MB"
+                        " free; --vram-budget is above what the driver admits to having\n",
+                must >> 20, free_total >> 20);
+    else if (offload && must + compute > budget)
+        fprintf(stderr, "warning: weights %zu + KV %zu + compute %zu MB leave nothing of the"
+                        " %zu MB budget for the expert pool; it falls back to its minimum and"
+                        " every token will miss. Lower --n-ctx or raise --vram-budget.\n",
+                resident_w >> 20, kv >> 20, compute >> 20, budget >> 20);
+
+    if (!model.has_expert_tensors()) return;   // dense: there is no tier to report on
+    if (!offload) {
+        fprintf(stderr, "expert offload: off (weights %zu + KV %zu + compute %zu MB"
+                        " fit the %zu MB budget)\n",
+                weights >> 20, kv >> 20, compute >> 20, budget >> 20);
+        return;
+    }
+    fprintf(stderr, "expert offload: %s tier (needs %zu MB, budget %zu MB;"
+                    " %zu MB of routed experts move out, %zu MB stays)\n",
+            ssd_mode ? "SSD" : "RAM", need >> 20, budget >> 20, experts >> 20,
+            (must + compute) >> 20);
+}
+
+// Assign each transformer layer to a GPU. Devices get contiguous ranges of the
+// main stack in plan order, sized by their --gpu-split share (or, with no
+// explicit split, by their VRAM budget). A device whose share is 0 gets no
+// layers at all -- its budget then goes entirely to the expert pool, which is
+// how a pure "expert pool" device falls out of the same knob as a layer split.
+void Runtime::Impl::plan_layers() {
+    const auto & hp = model.hparams();
+    const int n_layer = (int) hp.n_layer;
+    const int n_main  = (int) hp.n_main();
+
+    layer_dev.assign((size_t) n_layer, 0);
+    dev_weight_bytes.assign(gpus.size(), 0);
+    dev_kv_bytes.assign(gpus.size(), 0);
+    if (gpus.size() <= 1) return;
+
+    // An explicit --gpu-split on any device switches the whole plan to explicit
+    // shares; otherwise split proportionally to each device's VRAM budget.
+    bool auto_split = true;
+    for (const GpuPlan & p : cfg.gpus) if (p.split >= 0.0f) auto_split = false;
+
+    std::vector<double> share(gpus.size(), 0.0);
+    double total = 0.0;
+    for (size_t i = 0; i < gpus.size(); ++i) {
+        share[i] = auto_split ? (double) dev_budget[i]
+                              : (i < cfg.gpus.size() && cfg.gpus[i].split >= 0.0f
+                                     ? (double) cfg.gpus[i].split : 0.0);
+        total += share[i];
+    }
+    if (total <= 0.0) { share[0] = 1.0; total = 1.0; }   // nothing to go on: all on primary
+
+    // Cumulative rounding, so the ranges tile [0, n_main) exactly. Shares are
+    // relative, which means values that happen to add up to the layer count come
+    // back out as themselves: "36,4" on a 40-layer model gives exactly 36 and 4,
+    // with no special case for it.
+    int start = 0;
+    double cum = 0.0;
+    for (size_t i = 0; i < gpus.size(); ++i) {
+        cum += share[i] / total;
+        int end = (i + 1 == gpus.size()) ? n_main : (int) llround(cum * n_main);
+        if (share[i] <= 0.0) end = start;            // 0 share: expert pool only
+        end = std::max(start, std::min(end, n_main));
+        for (int il = start; il < end; ++il) layer_dev[(size_t) il] = (int) i;
+        start = end;
+    }
+    for (int il = start; il < n_main; ++il) layer_dev[(size_t) il] = 0;   // rounding tail
+
+    // The trailing MTP (nextn) blocks stay on the primary device. Their graphs
+    // are built by the single-backend MTP path, and one hidden-state hop per
+    // drafted token is far cheaper than making that path span devices.
+    for (int il = n_main; il < n_layer; ++il) layer_dev[(size_t) il] = 0;
+
+    fprintf(stderr, "gpu layer split (%d main layers over %zu devices):\n", n_main, gpus.size());
+    for (size_t i = 0; i < gpus.size(); ++i) {
+        int lo = -1, hi = -1, cnt = 0;
+        for (int il = 0; il < n_main; ++il)
+            if (layer_dev[(size_t) il] == (int) i) { if (lo < 0) lo = il; hi = il; ++cnt; }
+        const int devidx = i < cfg.gpus.size() ? cfg.gpus[i].device : (int) i;
+        if (cnt == 0)
+            fprintf(stderr, "  GPU%d: no layers (expert pool only, %zu MB budget)\n",
+                    devidx, dev_budget[i] >> 20);
+        else
+            fprintf(stderr, "  GPU%d: layers %d-%d (%d, %.0f%%), %zu MB budget\n",
+                    devidx, lo, hi, cnt, 100.0 * cnt / n_main, dev_budget[i] >> 20);
+    }
+
+    // Expert pools are placed here too, because weight placement follows them:
+    // a layer's shared-expert weights have to sit with its expert matmul.
+    plan_pools();
+}
+
+// Point the p_* carry members at device `d`'s set, so the segment graphs built
+// after this call read and write carries in that device's memory.
+void Runtime::Impl::use_carry(int d) {
+    if (carries.empty()) return;
+    const CarrySet & c = carries[(size_t) std::min<size_t>((size_t) d, carries.size() - 1)];
+    p_h        = c.h;
+    p_ffn_in   = c.ffn_in;
+    p_resid    = c.resid;
+    p_weights  = c.weights;
+    p_ffn_in2  = c.ffn_in2;
+    p_resid2   = c.resid2;
+    p_weights2 = c.weights2;
+    p_slot_g   = c.slot_g;
+    p_slot_u   = c.slot_u;
+    p_slot_d   = c.slot_d;
+    p_inject   = c.inject;
+    p_inject2  = c.inject2;
+    p_ple      = c.ple;
+}
+
+// Move the running hidden state across a device boundary. This is the only
+// value that crosses -- n_embd floats (~8 KB), once per boundary per token,
+// which is the whole point of assigning layers in contiguous ranges.
+void Runtime::Impl::hop_carry(int from, int to) {
+    if (from == to || carries.size() <= 1) return;
+    const size_t n = ggml_nbytes(carries[(size_t) from].h);
+    hop_buf.resize(n / sizeof(float));
+    ggml_backend_tensor_get(carries[(size_t) from].h, hop_buf.data(), 0, n);
+    ggml_backend_tensor_set(carries[(size_t) to].h,   hop_buf.data(), 0, n);
+}
+
+// Copy layer `il`'s seg A -> seg B carries across a device boundary. Needed
+// when the layer's expert pool sits on a different device than its attention:
+// the normed FFN input, the residual base and the router weights all have to
+// follow the expert matmul. ~2*n_embd + n_used floats, against expert weights
+// that are three orders of magnitude larger -- which is why the matmul is moved
+// to the pool rather than the pool to the matmul.
+void Runtime::Impl::hop_carry_ab(int from, int to, int il) {
+    if (from == to || carries.size() <= 1) return;
+    const CarrySet & a = carries[(size_t) from];
+    const CarrySet & b = carries[(size_t) to];
+    auto cp = [&](ggml_tensor * s, ggml_tensor * d) {
+        const size_t n = ggml_nbytes(s);
+        hop_buf.resize((n + sizeof(float) - 1) / sizeof(float));
+        ggml_backend_tensor_get(s, hop_buf.data(), 0, n);
+        ggml_backend_tensor_set(d, hop_buf.data(), 0, n);
+    };
+    if (il & 1) { cp(a.ffn_in2, b.ffn_in2); cp(a.resid2, b.resid2); cp(a.weights2, b.weights2); }
+    else        { cp(a.ffn_in,  b.ffn_in ); cp(a.resid,  b.resid ); cp(a.weights,  b.weights ); }
+    if (a.inject) cp(il & 1 ? a.inject2 : a.inject, il & 1 ? b.inject2 : b.inject);
+}
+
+// Decide where each layer's expert pool lives, from how much VRAM each device
+// has left once its own weights and KV are placed. A device with no compute
+// layers contributes its whole budget here, which is what turns --gpu-split 0
+// into a pure expert pool. Ranges are contiguous so that when the split ratios
+// happen to match the surplus ratios, pool_dev == layer_dev and nothing hops.
+void Runtime::Impl::plan_pools() {
+    const auto & hp = model.hparams();
+    const int n_main = (int) hp.n_main();
+    pool_dev.assign((size_t) n_main, 0);
+    for (int il = 0; il < n_main; ++il) pool_dev[(size_t) il] = dev_of(il);
+    if (gpus.size() <= 1) return;
+    // Without expert offload there are no pools to place: the weights are all
+    // resident and a layer's experts are wherever its other weights are.
+    if (!offload) return;
+
+    // Runs before the weights are placed (their placement depends on the answer),
+    // so the surplus is budget minus the KV cache and the compute headroom, with
+    // the non-expert weights left out. They are roughly proportional to a
+    // device's layer count, so leaving them out skews the ratio a little but not
+    // the shape; the placement line below makes the outcome visible.
+    const size_t compute = compute_headroom();
+    const int conv_ch    = hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state;
+    std::vector<double> surplus(gpus.size(), 0.0);
+    double total = 0.0;
+    for (size_t d = 0; d < gpus.size(); ++d) {
+        size_t kv = 0;
+        for (int il = 0; il < (int) hp.n_layer; ++il) {
+            if ((size_t) dev_of(il) != d) continue;
+            if (hp.is_recurrent(il))
+                kv += (size_t) (hp.ssm_d_conv - 1) * conv_ch * 4
+                    + (size_t) hp.ssm_d_state * hp.ssm_d_state * hp.ssm_dt_rank * 4;
+            else
+                kv += (size_t) 2 * hp.head_count_kv(il) * hp.n_embd_head * cfg.n_ctx * 2;   // F16 K and V
+        }
+        const size_t reserve = kv + compute;
+        surplus[d] = dev_budget[d] > reserve ? (double) (dev_budget[d] - reserve) : 0.0;
+        total += surplus[d];
+    }
+    if (total <= 0.0) return;   // nothing to distribute: pools stay with their layers
+
+    int start = 0;
+    double cum = 0.0;
+    for (size_t d = 0; d < gpus.size(); ++d) {
+        cum += surplus[d] / total;
+        int end = (d + 1 == gpus.size()) ? n_main : (int) llround(cum * n_main);
+        if (surplus[d] <= 0.0) end = start;
+        end = std::max(start, std::min(end, n_main));
+        for (int il = start; il < end; ++il) pool_dev[(size_t) il] = (int) d;
+        start = end;
+    }
+    for (int il = start; il < n_main; ++il) pool_dev[(size_t) il] = (int) gpus.size() - 1;
+
+    int hops = 0;
+    for (int il = 0; il < n_main; ++il) if (pool_dev[(size_t) il] != dev_of(il)) ++hops;
+    fprintf(stderr, "expert pool placement:");
+    for (size_t d = 0; d < gpus.size(); ++d) {
+        int cnt = 0;
+        for (int il = 0; il < n_main; ++il) if (pool_dev[(size_t) il] == (int) d) ++cnt;
+        const int devidx = d < cfg.gpus.size() ? cfg.gpus[d].device : (int) d;
+        fprintf(stderr, " GPU%d=%d layers (%.0f MB surplus)", devidx, cnt, surplus[d] / 1048576.0);
+    }
+    fprintf(stderr, "; %d layer(s) compute experts off their attention device\n", hops);
 }
 
 // Allocate the VRAM slot pools and the persistent per-layer carry tensors.
@@ -655,58 +1539,131 @@ void Runtime::Impl::init_cache() {
     // On Windows the driver then silently spills allocations to shared system
     // memory (paged over PCIe), uniformly slowing prefill and decode; sizing
     // the pool against the real KV bytes keeps everything VRAM-resident.
-    const size_t budget   = cfg.vram_budget_mb * 1024ull * 1024ull;
-    size_t gpu_w = 0;
-    for (auto b : weights_bufs) gpu_w += ggml_backend_buffer_get_size(b);
-    const size_t kv_bytes = st_buf ? ggml_backend_buffer_get_size(st_buf) : 0;
-    const size_t compute  = 1024ull * 1024ull * 1024ull;   // gallocr graph buffers
-    const size_t reserve  = gpu_w + kv_bytes + compute;
-    size_t avail = budget > reserve ? budget - reserve : 0;
-    fprintf(stderr, "VRAM budget %zu MB = weights %zu + KV %zu + compute %zu + expert pool %zu MB\n",
-            cfg.vram_budget_mb, gpu_w >> 20, kv_bytes >> 20, compute >> 20, avail >> 20);
+    const size_t compute = compute_headroom();   // gallocr graph buffers
 
     // Only the main stack's experts are offloaded; the trailing MTP (nextn) block
     // stays fully VRAM-resident, so the cache covers n_main() layers (not n_layer).
-    ecache = std::make_unique<ExpertCache>(backend, model, hp.n_main(), hp.n_expert, n_used, avail, ssd_mode);
+    const int n_main = (int) hp.n_main();
+
+    if (!multi_gpu()) {
+        const size_t budget = dev_budget.empty() ? 0 : dev_budget[0];
+        size_t gpu_w = 0;
+        for (auto b : weights_bufs) gpu_w += ggml_backend_buffer_get_size(b);
+        size_t kv_bytes = 0;
+        for (auto b : st_bufs) if (b) kv_bytes += ggml_backend_buffer_get_size(b);
+        const size_t reserve = gpu_w + kv_bytes + compute;
+        const size_t avail   = budget > reserve ? budget - reserve : 0;
+        fprintf(stderr, "VRAM budget %zu MB = weights %zu + KV %zu + compute %zu + expert pool %zu MB\n",
+                budget >> 20, gpu_w >> 20, kv_bytes >> 20, compute >> 20, avail >> 20);
+        ecaches.push_back(std::make_unique<ExpertCache>(
+            backend, model, n_main, hp.n_expert, n_used, avail, ssd_mode));
+    } else {
+        // One cache per device, each sized against that device's own budget and
+        // covering the layers whose expert pool it holds. That is not always the
+        // set of layers it computes: a device given --gpu-split 0 has no layers
+        // but still takes pools, which is the expert-pool layout (plan_pools()
+        // ran back in plan_layers(), since weight placement follows it).
+        for (size_t d = 0; d < gpus.size(); ++d) {
+            std::vector<bool> mask((size_t) n_main, false);
+            int n_owned = 0;
+            for (int il = 0; il < n_main; ++il)
+                if ((size_t) pdev_of(il) == d) { mask[(size_t) il] = true; ++n_owned; }
+
+            const size_t gpu_w    = d < dev_weight_bytes.size() ? dev_weight_bytes[d] : 0;
+            const size_t kv_bytes = d < dev_kv_bytes.size()     ? dev_kv_bytes[d]     : 0;
+            const size_t budget   = dev_budget[d];
+            // A device that computes nothing still needs a graph buffer only for
+            // the splits sched routes to it, but reserving the full compute
+            // headroom on every device is the safe side of the estimate.
+            const size_t reserve = gpu_w + kv_bytes + compute;
+            const size_t avail   = budget > reserve ? budget - reserve : 0;
+            const int devidx = d < cfg.gpus.size() ? cfg.gpus[d].device : (int) d;
+            fprintf(stderr, "GPU%d budget %zu MB = weights %zu + KV %zu + compute %zu"
+                            " + expert pool %zu MB (%d layers)\n",
+                    devidx, budget >> 20, gpu_w >> 20, kv_bytes >> 20, compute >> 20,
+                    avail >> 20, n_owned);
+            if (n_owned == 0) { ecaches.push_back(nullptr); continue; }
+            ecaches.push_back(std::make_unique<ExpertCache>(
+                gpus[d], model, n_main, hp.n_expert, n_used, avail, ssd_mode, &mask));
+        }
+    }
+    ecache = ecaches[0].get();
 
     // persistent carry tensors (bridge per-layer graph segments) + fast-path
     // in-graph remap table (g2s_all) and selection readback (sel_all).
+    // One carry set per GPU (exactly one without a split, which reproduces the
+    // original single-buffer layout). See the CarrySet comment in Impl.
+    carries.resize(std::max<size_t>(gpus.size(), 1));
+    for (size_t d = 0; d < carries.size(); ++d) {
+        CarrySet & c = carries[d];
+        ggml_init_params ccp{};
+        ccp.mem_size = ggml_tensor_overhead() * 20 + 256;
+        ccp.no_alloc = true;
+        c.ctx      = ggml_init(ccp);
+        // hc widens the running hidden state; everything else is per-token
+        c.h        = hp.has_hc()
+                ? ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, n_embd, hp.hc_count)
+                : ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
+        c.ffn_in   = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
+        c.resid    = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
+        c.weights  = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_used);
+        c.ffn_in2  = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
+        c.resid2   = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
+        c.weights2 = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_used);
+        c.slot_g   = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, n_used, 1);
+        c.slot_u   = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, n_used, 1);
+        c.slot_d   = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, n_used, 1);
+        if (hp.has_hc()) {
+            c.inject  = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, hp.hc_count);
+            c.inject2 = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, hp.hc_count);
+        }
+        if (use_ple()) {
+            c.ple = ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, n_embd, 1);
+        }
+        char nm[64];
+        const char * base[10] = { "h", "ffn_in", "resid", "weights", "ffn_in2",
+                                  "resid2", "weights2", "slot_g", "slot_u", "slot_d" };
+        ggml_tensor * ts[10] = { c.h, c.ffn_in, c.resid, c.weights, c.ffn_in2,
+                                 c.resid2, c.weights2, c.slot_g, c.slot_u, c.slot_d };
+        for (int k = 0; k < 10; ++k) {
+            snprintf(nm, sizeof(nm), "carry%zu.%s", d, base[k]);
+            ggml_set_name(ts[k], nm);
+        }
+        const char * opt_base[3] = { "inject", "inject2", "ple" };
+        ggml_tensor * opt[3] = { c.inject, c.inject2, c.ple };
+        for (int k = 0; k < 3; ++k) {
+            if (!opt[k]) continue;
+            snprintf(nm, sizeof(nm), "carry%zu.%s", d, opt_base[k]);
+            ggml_set_name(opt[k], nm);
+        }
+        c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, gpus.empty() ? backend : gpus[d]);
+        if (!c.buf) throw std::runtime_error("init_cache: failed to alloc carry buffer");
+    }
+    use_carry(0);
+
+    // Model-wide tables for the fused single-graph path. That graph is planned
+    // by a scheduler, which copies these to whichever device needs them, so one
+    // copy on the primary is enough.
     ggml_init_params cp{};
-    cp.mem_size = ggml_tensor_overhead() * 16 + 256;
+    cp.mem_size = ggml_tensor_overhead() * 8 + 256;
     cp.no_alloc = true;
     cctx = ggml_init(cp);
-    p_h       = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
-    p_ffn_in  = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
-    p_resid   = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
-    p_weights = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_used);
-    p_ffn_in2 = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
-    p_resid2  = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_embd);
-    p_weights2= ggml_new_tensor_1d(cctx, GGML_TYPE_F32, n_used);
-    p_slot_g  = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, 1);
-    p_slot_u  = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, 1);
-    p_slot_d  = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, 1);
     g2s_all   = ggml_new_tensor_3d(cctx, GGML_TYPE_I32, 1, hp.n_expert, 3 * hp.n_layer);
     sel_all   = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, hp.n_layer);
     resmask_all = ggml_new_tensor_2d(cctx, GGML_TYPE_F32, hp.n_expert, hp.n_layer);
     ggml_set_name(resmask_all, "carry.resmask");
     want_all = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, hp.n_layer);
     ggml_set_name(want_all, "carry.want");
-    ggml_set_name(p_h, "carry.h");
-    ggml_set_name(p_ffn_in, "carry.ffn_in");
-    ggml_set_name(p_resid, "carry.resid");
-    ggml_set_name(p_weights, "carry.weights");
-    ggml_set_name(p_ffn_in2, "carry.ffn_in2");
-    ggml_set_name(p_resid2, "carry.resid2");
-    ggml_set_name(p_weights2, "carry.weights2");
-    ggml_set_name(p_slot_g, "carry.slot_g");
-    ggml_set_name(p_slot_u, "carry.slot_u");
-    ggml_set_name(p_slot_d, "carry.slot_d");
     ggml_set_name(g2s_all, "carry.g2s");
     ggml_set_name(sel_all, "carry.sel");
     cbuf = ggml_backend_alloc_ctx_tensors(cctx, backend);
-    if (!cbuf) throw std::runtime_error("init_cache: failed to alloc carry buffer");
+    if (!cbuf) throw std::runtime_error("init_cache: failed to alloc table buffer");
 
-    cache_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    cache_gallocs.clear();
+    for (size_t d = 0; d < std::max<size_t>(gpus.size(), 1); ++d)
+        cache_gallocs.push_back(ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(gpus.empty() ? backend : gpus[d])));
+    cache_galloc = cache_gallocs[0];   // alias: the primary's, used by batched prefill
     f_galloc     = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
 
     g2s_host.assign((size_t) 3 * hp.n_layer * hp.n_expert, 0);
@@ -717,14 +1674,27 @@ void Runtime::Impl::init_cache() {
     if (getenv("QWEN_FASTCACHE")) cache_fast_enabled = true;   // experimental single-graph path
     if (getenv("QWEN_RESIDENT_DECODE")) { cache_fast_enabled = true; resident_decode = true; }
 
+
     init_state_backup();   // GDN rollback buffers (speculative miss / MTP reject)
 
-    // warm restart: pre-fill VRAM slots from a saved hot-expert profile
+    // warm restart: pre-fill VRAM slots from a saved hot-expert profile. Under a
+    // split each device reads its own ".gpu<N>" file, falling back to a
+    // single-GPU profile (load_prefetch keeps only the layers this device owns),
+    // so a profile recorded before the split still warms both devices.
     if (!cfg.cache_profile.empty()) {
-        size_t n = ecache->load_prefetch(cfg.cache_profile);
-        if (n > 0)
-            fprintf(stderr, "expert cache: prefetched %zu experts from profile '%s'\n",
-                    n, cfg.cache_profile.c_str());
+        for (size_t d = 0; d < ecaches.size(); ++d) {
+            if (!ecaches[d]) continue;
+            std::string path = multi_gpu() ? cfg.cache_profile + ".gpu" + std::to_string(d)
+                                           : cfg.cache_profile;
+            size_t n = ecaches[d]->load_prefetch(path);
+            if (n == 0 && multi_gpu()) {
+                path = cfg.cache_profile;
+                n = ecaches[d]->load_prefetch(path);
+            }
+            if (n > 0)
+                fprintf(stderr, "expert cache: prefetched %zu experts from profile '%s'\n",
+                        n, path.c_str());
+        }
     }
 }
 
@@ -740,8 +1710,11 @@ void Runtime::Impl::zero_states() {
             zeros.assign((n + sizeof(float) - 1) / sizeof(float), 0.0f);   // round up: n need not be a multiple of 4 (F16 KV)
         ggml_backend_tensor_set(t, zeros.data(), 0, n);
     };
-    for (auto * t : conv_state) zero(t);
-    for (auto * t : ssm_state)  zero(t);
+    for (auto * t : conv_state)     zero(t);
+    for (auto * t : ssm_state)      zero(t);
+    for (auto * t : ple_conv_state) zero(t);
+    for (auto * t : idx_k_cache)    zero(t);
+    ngram_hist.clear();
     for (auto * t : k_cache)    zero(t);
     for (auto * t : v_cache)    zero(t);
 }
@@ -795,103 +1768,6 @@ int Runtime::Impl::fill_rope_pos_spans(std::vector<int32_t> & dst, int n_tokens,
 }
 
 // ---- gated attention (shared by qwen3 plain and qwen35 gated paths) ----
-void Runtime::Impl::dump_flush(const char * tag) {
-    if (dump_list.empty()) return;
-    std::vector<float> buf;
-    for (auto & e : dump_list) {
-        ggml_tensor * t = e.second;
-        if (!t->buffer || t->type != GGML_TYPE_F32) continue;
-        const size_t n = ggml_nelements(t);
-        buf.resize(n);
-        ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
-        double sum = 0.0;
-        for (size_t i = 0; i < n; ++i) sum += buf[i];
-        fprintf(stderr, "qw_dump[%s]: %28s = {%lld, %lld, %lld, %lld} sum = %f\n",
-                tag, e.first.c_str(),
-                (long long) t->ne[0], (long long) t->ne[1],
-                (long long) t->ne[2], (long long) t->ne[3], sum);
-    }
-    dump_list.clear();
-}
-
-ggml_tensor * Runtime::Impl::new_swa_inputs(ggml_context * ctx, int n_tokens, int n_kv) {
-    const int rows = swa_ring > 0 ? swa_ring : n_kv;
-    ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, rows, n_tokens);
-    ggml_set_input(m); ggml_set_name(m, "inp_mask_swa");
-    ring_idx = nullptr;
-    if (swa_ring > 0) {
-        if (swa_ring < (int) model.hparams().n_swa + n_tokens) {
-            throw std::runtime_error(
-                "SWA ring holds " + std::to_string(swa_ring) + " rows but this batch of " +
-                std::to_string(n_tokens) + " needs " +
-                std::to_string((int) model.hparams().n_swa + n_tokens) +
-                " -- raise QWEN_PREFILL_CHUNK/QWEN_SEGA_CHUNK before load, or QWEN_SWA_RING=0");
-        }
-        ring_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
-        ggml_set_input(ring_idx); ggml_set_name(ring_idx, "inp_kvidx_swa");
-    }
-    return m;
-}
-
-void Runtime::Impl::fill_masks(ggml_cgraph * gf, int n_tokens, int n_kv, int pos0) {
-    const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
-    std::vector<ggml_fp16_t> mask((size_t) n_kv * n_tokens);
-
-    for (int i = 0; i < n_tokens; ++i) {
-        const int abs_i = pos0 + i;
-        for (int j = 0; j < n_kv; ++j)
-            mask[(size_t) i * n_kv + j] = (j <= abs_i) ? z : ninf;
-    }
-    if (ggml_tensor * t = ggml_graph_get_tensor(gf, "inp_mask"))
-        ggml_backend_tensor_set(t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
-
-    // The offload path builds one graph per layer and names its single mask
-    // after that layer's attention type, so a graph may carry only this one.
-    ggml_tensor * t_swa = ggml_graph_get_tensor(gf, "inp_mask_swa");
-    if (!t_swa) return;
-
-    // A sliding layer's query at position p sees keys in (p - n_swa, p]: the
-    // window spans n_swa positions, the query's own included.
-    const int n_swa = (int) model.hparams().n_swa;
-    const int rows  = swa_ring > 0 ? swa_ring : n_kv;
-    mask.assign((size_t) rows * n_tokens, ninf);
-
-    if (swa_ring <= 0) {
-        for (int i = 0; i < n_tokens; ++i) {
-            const int abs_i = pos0 + i;
-            const int lo    = abs_i - n_swa + 1;
-            for (int j = 0; j < rows; ++j)
-                mask[(size_t) i * rows + j] = (j <= abs_i && j >= lo) ? z : ninf;
-        }
-    } else {
-        // Ring: a row's absolute position is only known modulo the ring size, so
-        // recover it as the newest position <= the last one this batch writes
-        // that lands on that row. Rows outside every query's window keep -inf,
-        // which is also what an as-yet-unwritten row gets.
-        const int last = pos0 + n_tokens - 1;
-        std::vector<int> row_pos(rows);
-        for (int r = 0; r < rows; ++r) {
-            const int back = ((last - r) % rows + rows) % rows;
-            row_pos[r] = last - back;                 // < 0 => never written
-        }
-        for (int i = 0; i < n_tokens; ++i) {
-            const int abs_i = pos0 + i;
-            for (int r = 0; r < rows; ++r) {
-                const int p = row_pos[r];
-                if (p >= 0 && p <= abs_i && abs_i - p < n_swa)
-                    mask[(size_t) i * rows + r] = z;
-            }
-        }
-
-        if (ggml_tensor * ki = ggml_graph_get_tensor(gf, "inp_kvidx_swa")) {
-            std::vector<int64_t> idx(n_tokens);
-            for (int i = 0; i < n_tokens; ++i) idx[i] = (pos0 + i) % rows;
-            ggml_backend_tensor_set(ki, idx.data(), 0, idx.size() * sizeof(int64_t));
-        }
-    }
-    ggml_backend_tensor_set(t_swa, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
-}
-
 ggml_tensor * Runtime::Impl::build_attn(ggml_context * ctx, ggml_cgraph * gf, int il,
         ggml_tensor * Q, ggml_tensor * K, ggml_tensor * V,
         ggml_tensor * mask, int n_tokens, int n_kv, int kv_pos) {
@@ -903,13 +1779,11 @@ ggml_tensor * Runtime::Impl::build_attn(ggml_context * ctx, ggml_cgraph * gf, in
     const int n_embd_gqa  = n_head_kv * n_embd_head;
     const float kq_scale  = 1.0f / sqrtf((float) n_embd_head);
 
-    // Rows this layer's cache actually has, and how many the attention reads.
     // A ring layer always reads the whole ring: which rows are live for a given
     // query is the mask's job, because a row's absolute position is only
     // recoverable modulo the ring size.
-    const int rows = kv_rows(il);
     const bool ring = kv_is_ring(il);
-    if (ring) n_kv = rows;
+    if (ring) n_kv = kv_rows(il);
 
     // store K, V into cache
     ggml_tensor * Kflat = ggml_reshape_2d(ctx, K, n_embd_gqa, n_tokens);
@@ -960,11 +1834,99 @@ ggml_tensor * Runtime::Impl::build_attn(ggml_context * ctx, ggml_cgraph * gf, in
     return kqv;  // [n_embd_head*n_head, n_tokens]
 }
 
+ggml_tensor * Runtime::Impl::new_swa_inputs(ggml_context * ctx, int n_tokens, int n_kv) {
+    const int rows = swa_ring > 0 ? swa_ring : n_kv;
+    ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, rows, n_tokens);
+    ggml_set_input(m); ggml_set_name(m, "inp_mask_swa");
+    ring_idx = nullptr;
+    if (swa_ring > 0) {
+        if (swa_ring < (int) model.hparams().n_swa + n_tokens) {
+            throw std::runtime_error(
+                "SWA ring holds " + std::to_string(swa_ring) + " rows but this batch of " +
+                std::to_string(n_tokens) + " needs " +
+                std::to_string((int) model.hparams().n_swa + n_tokens) +
+                " -- raise QWEN_PREFILL_CHUNK/QWEN_SEGA_CHUNK before load, or QWEN_SWA_RING=0");
+        }
+        ring_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+        ggml_set_input(ring_idx); ggml_set_name(ring_idx, "inp_kvidx_swa");
+    }
+    return m;
+}
+
+ggml_tensor * Runtime::Impl::new_layer_mask(ggml_context * ctx, int il, int n_tokens, int n_kv) {
+    if (model.hparams().is_swa(il)) return new_swa_inputs(ctx, n_tokens, n_kv);
+    ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_tokens);
+    ggml_set_input(m); ggml_set_name(m, "inp_mask");
+    ring_idx = nullptr;
+    return m;
+}
+
+void Runtime::Impl::fill_masks(ggml_cgraph * gf, int n_tokens, int n_kv, int pos0) {
+    const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+    std::vector<ggml_fp16_t> mask;
+
+    if (ggml_tensor * t = ggml_graph_get_tensor(gf, "inp_mask")) {
+        mask.resize((size_t) n_kv * n_tokens);
+        for (int i = 0; i < n_tokens; ++i) {
+            const int abs_i = pos0 + i;
+            for (int j = 0; j < n_kv; ++j)
+                mask[(size_t) i * n_kv + j] = (j <= abs_i) ? z : ninf;
+        }
+        ggml_backend_tensor_set(t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    }
+
+    // The offload path builds one graph per layer and names its single mask
+    // after that layer's attention type, so a graph may carry only this one.
+    ggml_tensor * t_swa = ggml_graph_get_tensor(gf, "inp_mask_swa");
+    if (!t_swa) return;
+
+    // A sliding layer's query at position p sees keys in (p - n_swa, p]: the
+    // window spans n_swa positions, the query's own included.
+    const int n_swa = (int) model.hparams().n_swa;
+    const int rows  = swa_ring > 0 ? swa_ring : n_kv;
+    mask.assign((size_t) rows * n_tokens, ninf);
+
+    if (swa_ring <= 0) {
+        for (int i = 0; i < n_tokens; ++i) {
+            const int abs_i = pos0 + i;
+            const int lo    = abs_i - n_swa + 1;
+            for (int j = 0; j < rows; ++j)
+                mask[(size_t) i * rows + j] = (j <= abs_i && j >= lo) ? z : ninf;
+        }
+    } else {
+        // Ring: a row's absolute position is only known modulo the ring size, so
+        // recover it as the newest position <= the last one this batch writes
+        // that lands on that row. Rows outside every query's window keep -inf,
+        // which is also what an as-yet-unwritten row gets.
+        const int last = pos0 + n_tokens - 1;
+        std::vector<int> row_pos(rows);
+        for (int r = 0; r < rows; ++r) {
+            const int back = ((last - r) % rows + rows) % rows;
+            row_pos[r] = last - back;                 // < 0 => never written
+        }
+        for (int i = 0; i < n_tokens; ++i) {
+            const int abs_i = pos0 + i;
+            for (int r = 0; r < rows; ++r) {
+                const int p = row_pos[r];
+                if (p >= 0 && p <= abs_i && abs_i - p < n_swa)
+                    mask[(size_t) i * rows + r] = z;
+            }
+        }
+
+        if (ggml_tensor * ki = ggml_graph_get_tensor(gf, "inp_kvidx_swa")) {
+            std::vector<int64_t> idx(n_tokens);
+            for (int i = 0; i < n_tokens; ++i) idx[i] = (pos0 + i) % rows;
+            ggml_backend_tensor_set(ki, idx.data(), 0, idx.size() * sizeof(int64_t));
+        }
+    }
+    ggml_backend_tensor_set(t_swa, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+}
+
 // step35 head-wise attention gate: sigmoid(g_proj . x) scales each head's slice
 // of the attention output. `x` is the post-attn_norm input -- the same tensor
 // Q/K/V are projected from -- not the attention output. This is a separate
 // weight, unlike qwen35's gate, which is packed into attn_q. Returns `att`
-// unchanged on models without blk.N.attn_gate.weight.
+// unchanged on models without blk.N.attn_gate.weight on an attention layer.
 ggml_tensor * Runtime::Impl::apply_attn_gate(ggml_context * ctx, int il, ggml_tensor * att,
                                              ggml_tensor * x, int n_head_l, int n_tokens) {
     ggml_tensor * w = Wopt("blk.%d.attn_gate.weight", il);
@@ -1089,19 +2051,472 @@ ggml_tensor * Runtime::Impl::build_gdn(ggml_context * ctx, ggml_cgraph * gf, int
                 ggml_reshape_3d(ctx, ssm_state[il], S, S, H_v)));
     }
 
-    // gated RMSNorm with z: rms_norm(output)*ssm_norm * silu(z)
+    // gated RMSNorm with z: rms_norm(output)*ssm_norm * gate(z)
     output = ggml_cont(ctx, output);
     output = ggml_rms_norm(ctx, output, eps);
     output = ggml_mul(ctx, output, W("blk.%d.ssm_norm.weight", il));   // broadcast [S]
     ggml_tensor * zr = ggml_reshape_4d(ctx, z, S, H_v, n_tokens, 1);
-    output = ggml_mul(ctx, output, ggml_silu(ctx, zr));
+    // qwen4exp is Qwen3.5's GDN with one numerical difference: the output gate
+    // is a sigmoid rather than a silu.
+    output = ggml_mul(ctx, output, hp.arch == Arch::QWEN4EXP ? ggml_sigmoid(ctx, zr)
+                                                             : ggml_silu(ctx, zr));
 
     output = ggml_reshape_2d(ctx, output, S * H_v, n_tokens);
     ggml_tensor * cur = ggml_mul_mat(ctx, W("blk.%d.ssm_out.weight", il), output);  // [n_embd, n_tokens]
     return cur;
 }
 
-// ---- MoE FFN (qwen3moe / qwen35moe): softmax gating, top-k, normalized weights ----
+// ---- qwen4exp hyper-connections ----
+//
+// The residual stream is `hc` parallel copies of the model width. A block does
+// not read it directly: build_hc_mix normalizes each stream, gates them with a
+// low-rank projection of the whole thing, and averages them into one n_embd-wide
+// block input. build_hc_combine then adds the block's output back into every
+// stream, weighted per stream by the same mixer's `inject` head.
+//
+// The 2*sigmoid in combine centres the scatter weights on 1, so a zero
+// injection matrix degenerates to the ordinary residual add -- which is the
+// clearest way to read what the mechanism is doing.
+ggml_tensor * Runtime::Impl::build_hc_mix(ggml_context * ctx, ggml_tensor * res_hc,
+        ggml_tensor * w_norm, ggml_tensor * w_down, ggml_tensor * w_up,
+        ggml_tensor * w_inject, ggml_tensor ** inject) {
+    const auto & hp   = model.hparams();
+    const int n_embd  = hp.n_embd;
+    const int hc      = hp.hc_count;
+    const int hc_dim  = hc * n_embd;
+    const int64_t T   = res_hc->ne[2];
+
+    // grouped RMSNorm: rms_norm reduces over ne[0] = one stream, then the
+    // [hc_dim] gamma scales all of them. The converter folded the gammas to
+    // (1 + w), so this is a plain multiply.
+    ggml_tensor * xn = ggml_rms_norm(ctx, res_hc, hp.rms_eps);
+    xn = ggml_reshape_2d(ctx, xn, hc_dim, T);
+    xn = ggml_mul(ctx, xn, w_norm);
+
+    ggml_tensor * lo = ggml_mul_mat(ctx, w_down, xn);                  // [low_rank, T]
+    lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float) hc));
+    ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_up, lo)); // [hc_dim, T]
+
+    ggml_tensor * gated = ggml_reshape_3d(ctx, ggml_mul(ctx, xn, gate), n_embd, hc, T);
+
+    // collapse the streams by their mean. hc is 4, so an explicit sum of views
+    // is both shorter and cheaper than a reduction op.
+    const size_t stride = ggml_row_size(gated->type, n_embd) * hc;
+    ggml_tensor * mixed = ggml_cont(ctx,
+            ggml_view_2d(ctx, gated, n_embd, T, stride, 0));
+    for (int c = 1; c < hc; ++c) {
+        mixed = ggml_add(ctx, mixed,
+                ggml_view_2d(ctx, gated, n_embd, T, stride,
+                             ggml_row_size(gated->type, n_embd) * c));
+    }
+    mixed = ggml_scale(ctx, mixed, 1.0f / (float) hc);
+
+    if (inject) {
+        *inject = ggml_mul_mat(ctx, w_inject, xn);                     // [hc, T]
+    }
+    return mixed;
+}
+
+ggml_tensor * Runtime::Impl::build_hc_combine(ggml_context * ctx, ggml_tensor * res_hc,
+        ggml_tensor * block_out, ggml_tensor * inject) {
+    const auto & hp  = model.hparams();
+    const int n_embd = hp.n_embd;
+    const int hc     = hp.hc_count;
+    const int64_t T  = res_hc->ne[2];
+
+    ggml_tensor * w = ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) hc));
+    w = ggml_reshape_3d(ctx, ggml_scale(ctx, w, 2.0f), 1, hc, T);
+
+    ggml_tensor * b = ggml_repeat_4d(ctx,
+            ggml_reshape_3d(ctx, block_out, n_embd, 1, T), n_embd, hc, T, 1);
+
+    return ggml_add(ctx, res_hc, ggml_mul(ctx, b, w));
+}
+
+// Hash this batch's tokens to n-gram table rows, fetch them and upload the
+// result into the graph's "inp_ple" input. No-op when the graph has none
+// (a model without PLE, or --ngram off).
+void Runtime::Impl::fill_ple_input(ggml_cgraph * gf, const int32_t * tokens, int n_tokens) {
+    if (!use_ple()) return;
+    ggml_tensor * t = ggml_graph_get_tensor(gf, "inp_ple");
+    if (!t) return;
+
+    const auto & hp = model.hparams();
+    ngram_rows.clear();
+    ngram->hash_rows(tokens, n_tokens, ngram_hist, ngram_rows);
+
+    ngram_embd.resize(ngram_rows.size() * hp.ple_head_dim);
+    ngram->gather(ngram_rows.data(), ngram_rows.size(), ngram_embd.data());
+
+    GGML_ASSERT(ggml_nbytes(t) == ngram_embd.size() * sizeof(float));
+    ggml_backend_tensor_set(t, ngram_embd.data(), 0, ggml_nbytes(t));
+}
+
+// ---- qwen4exp QSA (query-sparse attention) ----
+//
+// A full-attention layer does not attend to every cached token. The cache is cut
+// into blocks of `compress_ratio` tokens; each block is scored once, by a small
+// indexer head against the mean of its members' indexer keys; and a query attends
+// to a budget of the best blocks plus the incomplete tail it sits in.
+//
+// Only the mask changes -- the attention itself is the ordinary dense one over
+// the same K/V. Below indexer_top_k + ratio - 1 cached tokens the budget covers
+// everything, so this returns the causal mask untouched and the layer is exactly
+// dense. That is not an optimisation: it is why a short-context run can be
+// validated against the reference before any of this exists.
+//
+// `shared` caches the host-side inputs, which depend on the cache layout and the
+// batch's positions but not on the layer, so every QSA layer in one graph fills
+// them once.
+ggml_tensor * Runtime::Impl::build_qsa_mask(ggml_context * ctx, ggml_cgraph * gf, int il,
+        ggml_tensor * cur, ggml_tensor * inp_pos, ggml_tensor * mask,
+        int n_tokens, int n_kv, int kv_pos, QsaShared & shared) {
+    const auto & hp = model.hparams();
+    const int r = (int) hp.compress_ratio(il);
+    if (!hp.has_qsa() || r <= 0 || !idx_k_cache[il]) return mask;
+
+    // QWEN_QSA_DEBUG=1 exposes the indexer's intermediates so they can be diffed
+    // against llama-debug --tensor-filter '.*indexer_.*-<il>$'. Everything from
+    // the raw keys to the finished mask is reachable this way, which is how the
+    // one real difference that remains -- see set_qsa_inputs -- was pinned down.
+    const bool dbg_on = getenv("QWEN_QSA_DEBUG") != nullptr;
+    auto dbg = [&](const char * tag, ggml_tensor * t) {
+        if (!dbg_on) return;
+        ggml_tensor * c = ggml_cont(ctx, t);
+        ggml_set_name(c, (std::string("qsa_") + tag + "_" + std::to_string(il)).c_str());
+        ggml_set_output(c);
+        ggml_build_forward_expand(gf, c);
+    };
+
+    const int idx_dim = (int) hp.indexer_head_dim;
+    const int n_idx_h = (int) hp.indexer_n_head;
+    const int width   = std::min(n_kv, (int) hp.indexer_top_k + r - 1);
+    // Blocks cover the graph's whole cache width, not just what is cached right
+    // now. A persistent decode graph is built once per KV bucket and reused for
+    // up to KV_BUCKET more tokens, so a count frozen at build time would leave
+    // every later cell in no block at all -- including the token being decoded,
+    // whose own row would then be selected from stale blocks only. Cells that
+    // hold nothing yet are ruled out by the host-side bias instead, and their
+    // keys read as zero because the indexer cache is cleared with the KV cache.
+    // For a one-shot graph n_kv is exactly what is cached, so this is the same
+    // count as before.
+    const int n_blocks = n_kv / r;              // whole blocks only; the rest is tail
+
+    // this token's raw indexer key, straight into the cache
+    ggml_tensor * k_raw = ggml_mul_mat(ctx, W("blk.%d.indexer.k_proj.weight", il), cur);
+    if (persistent) {
+        // Same reason build_attn writes K/V through an index input: this graph is
+        // built once per KV bucket and replayed, so a write offset baked in at
+        // build time would send every token of the bucket to the first token's
+        // cell -- losing their keys and corrupting the block they pool into.
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, idx_k_cache[il],
+                ggml_reshape_2d(ctx, k_raw, idx_dim, n_tokens), d_kvidx));
+    } else {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, k_raw,
+                ggml_view_2d(ctx, idx_k_cache[il], idx_dim, n_tokens,
+                             idx_k_cache[il]->nb[1],
+                             (size_t) kv_pos * idx_k_cache[il]->nb[1])));
+    }
+
+    if (width >= n_kv || n_blocks == 0) return mask;   // the budget covers everything
+
+    // ---- host-side inputs, shared by every QSA layer in this graph ----
+    if (!shared.cell_blk) {
+        shared.n_blocks = n_blocks;
+        shared.width    = width;
+        shared.cell_blk  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+        shared.blk_cells = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, r * n_blocks);
+        shared.blk_pos   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n_blocks);
+        shared.bias      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, n_tokens);
+        ggml_set_input(shared.cell_blk);  ggml_set_name(shared.cell_blk,  "inp_qsa_cell_blk");
+        ggml_set_input(shared.blk_cells); ggml_set_name(shared.blk_cells, "inp_qsa_blk_cells");
+        ggml_set_input(shared.blk_pos);   ggml_set_name(shared.blk_pos,   "inp_qsa_blk_pos");
+        ggml_set_input(shared.bias);      ggml_set_name(shared.bias,      "inp_qsa_bias");
+    }
+    GGML_ASSERT(shared.n_blocks == n_blocks && shared.width == width &&
+                "QSA layers in one graph must share a compress ratio");
+
+    // ---- pool each block's member keys, then norm and rotate the result ----
+    ggml_tensor * k_all = ggml_view_2d(ctx, idx_k_cache[il], idx_dim, n_kv,
+                                       idx_k_cache[il]->nb[1], 0);
+    ggml_tensor * members = ggml_get_rows(ctx, k_all, shared.blk_cells);
+    members = ggml_reshape_3d(ctx, members, idx_dim, r, n_blocks);
+
+    // r is small (4 in the released model), so summing slices beats transposing
+    // the tensor to reach ggml_sum_rows
+    ggml_tensor * pooled = nullptr;
+    for (int i = 0; i < r; ++i) {
+        ggml_tensor * slice = ggml_cont(ctx,
+                ggml_view_2d(ctx, members, idx_dim, n_blocks,
+                             members->nb[2], (size_t) i * members->nb[1]));
+        pooled = pooled ? ggml_add(ctx, pooled, slice) : slice;
+    }
+    pooled = ggml_scale(ctx, pooled, 1.0f / (float) r);
+    dbg("kraw", k_raw);
+    dbg("pool0", pooled);
+    pooled = ggml_reshape_3d(ctx, pooled, idx_dim, 1, n_blocks);
+    pooled = ggml_mul(ctx, ggml_rms_norm(ctx, pooled, hp.rms_eps),
+                      W("blk.%d.indexer.k_norm.weight", il));
+    pooled = apply_rope(ctx, pooled, shared.blk_pos, il);
+    pooled = ggml_reshape_2d(ctx, pooled, idx_dim, n_blocks);
+
+    ggml_tensor * q = ggml_mul_mat(ctx, W("blk.%d.indexer.q_proj.weight", il), cur);
+    q = ggml_reshape_3d(ctx, q, idx_dim, n_idx_h, n_tokens);
+    q = ggml_mul(ctx, ggml_rms_norm(ctx, q, hp.rms_eps),
+                 W("blk.%d.indexer.q_norm.weight", il));
+    q = apply_rope(ctx, q, inp_pos, il);
+
+    // Each head's dot product is rectified before the heads are summed, as in
+    // DeepSeek's lightning indexer: there is no per-head weight, so nothing can
+    // reorder the sum.
+    ggml_tensor * score = ggml_mul_mat(ctx, pooled,
+            ggml_reshape_2d(ctx, ggml_cont(ctx, q), idx_dim, n_idx_h * n_tokens));
+    score = ggml_reshape_3d(ctx, score, n_blocks, n_idx_h, n_tokens);
+    score = ggml_relu(ctx, score);
+    score = ggml_cont(ctx, ggml_permute(ctx, score, 1, 0, 2, 3));   // [n_idx_h, n_blocks, T]
+    score = ggml_sum_rows(ctx, score);
+    score = ggml_reshape_2d(ctx, score, n_blocks, n_tokens);
+
+    // Give every cell its block's score rather than expanding block indices,
+    // which would need an integer multiply-add ggml has no op for. get_rows
+    // gathers rows, so the scores are transposed on the way in and back out.
+    ggml_tensor * expanded = ggml_get_rows(ctx,
+            ggml_cont(ctx, ggml_transpose(ctx, score)), shared.cell_blk);
+    expanded = ggml_cont(ctx, ggml_transpose(ctx,
+            ggml_reshape_2d(ctx, expanded, n_tokens, n_kv)));       // [n_kv, T]
+    expanded = ggml_add(ctx, expanded, shared.bias);
+
+    dbg("pooled", pooled);
+    dbg("q", q);
+    dbg("bias", expanded);
+    ggml_tensor * top_k = ggml_cont(ctx, ggml_top_k(ctx, expanded, width));  // [width, T]
+    dbg("topk", top_k);
+
+    // Unmask exactly the selected cells: start from all -inf and scatter zeros
+    // into the chosen rows. The rows are size 1, so set_rows writes one cell each.
+    ggml_tensor * um = ggml_fill(ctx,
+            ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_kv, n_tokens), -INFINITY);
+    ggml_tensor * zeros = ggml_fill(ctx,
+            ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, width, n_tokens), 0.0f);
+    um = ggml_set_rows(ctx, um, zeros,
+            ggml_reshape_3d(ctx, top_k, width, n_tokens, 1));
+    um = ggml_reshape_2d(ctx, um, n_kv, n_tokens);
+
+    // Re-apply the causal mask on top: when fewer than `width` cells are
+    // eligible, top_k still returns `width` indices and some of them name cells
+    // the bias had already ruled out.
+    ggml_tensor * combined = ggml_add(ctx, um, ggml_cast(ctx, mask, GGML_TYPE_F32));
+    dbg("mask", combined);
+    return ggml_cast(ctx, combined, mask->type);
+}
+
+// Fill the QSA host inputs of a graph, for a batch whose first token sits at
+// `kv_pos`. Found by name so every call site can use it without threading the
+// QsaShared through; a no-op on a graph that has no QSA layer.
+void Runtime::Impl::set_qsa_inputs(ggml_cgraph * gf, int n_tokens, int n_kv, int kv_pos) {
+    QsaShared shared;
+    shared.cell_blk  = ggml_graph_get_tensor(gf, "inp_qsa_cell_blk");
+    if (!shared.cell_blk) return;
+    shared.blk_cells = ggml_graph_get_tensor(gf, "inp_qsa_blk_cells");
+    shared.blk_pos   = ggml_graph_get_tensor(gf, "inp_qsa_blk_pos");
+    shared.bias      = ggml_graph_get_tensor(gf, "inp_qsa_bias");
+
+    const int n_blocks = (int) (shared.blk_pos->ne[0] / 4);
+    const int r        = (int) (shared.blk_cells->ne[0] / n_blocks);
+    const int n_valid  = kv_pos + n_tokens;
+
+    // block b covers [b*r, (b+1)*r), so it is rotated at the position of its
+    // first token. All four mrope sections carry the same value: exact for text.
+    std::vector<int32_t> blk_pos((size_t) 4 * n_blocks);
+    for (int sec = 0; sec < 4; ++sec)
+        for (int b = 0; b < n_blocks; ++b) blk_pos[(size_t) sec * n_blocks + b] = b * r;
+    ggml_backend_tensor_set(shared.blk_pos, blk_pos.data(), 0, blk_pos.size() * sizeof(int32_t));
+
+    std::vector<int32_t> blk_cells((size_t) r * n_blocks);
+    for (int b = 0; b < n_blocks; ++b)
+        for (int m = 0; m < r; ++m) blk_cells[(size_t) b * r + m] = b * r + m;
+    ggml_backend_tensor_set(shared.blk_cells, blk_cells.data(), 0,
+                            blk_cells.size() * sizeof(int32_t));
+
+    // cell -> block, or 0 for a cell no complete block covers (the gather has to
+    // stay in range; the bias below is what actually rules those cells in or out)
+    std::vector<int32_t> cell_blk((size_t) n_kv, 0);
+    for (int j = 0; j < n_kv && j < n_valid; ++j) {
+        const int b = j / r;
+        if (b < n_blocks) cell_blk[(size_t) j] = b;
+    }
+    ggml_backend_tensor_set(shared.cell_blk, cell_blk.data(), 0, cell_blk.size() * sizeof(int32_t));
+
+    std::vector<float> bias((size_t) n_kv * n_tokens);
+    for (int i = 0; i < n_tokens; ++i) {
+        const int q = kv_pos + i;
+        // whatever follows the last complete block is always attended to, which
+        // is what lands the selection on block boundaries like the reference
+        const int tail_start = (q + 1) / r * r;
+        float * row = bias.data() + (size_t) i * n_kv;
+        for (int j = 0; j < n_kv; ++j) {
+            float v = -INFINITY;
+            if (j < n_valid && j <= q) {
+                // finite, so it can never meet a -inf and produce a nan
+                v = (j >= tail_start) ? 1e9f : (j / r < n_blocks ? 0.0f : -INFINITY);
+            }
+            row[j] = v;
+        }
+    }
+    ggml_backend_tensor_set(shared.bias, bias.data(), 0, bias.size() * sizeof(float));
+}
+
+// ---- qwen4exp PLE: n-gram hash embedding (one designated layer) ----
+//
+// `emb` is the gathered table rows, [n_embd, n_tokens], already dequantised on
+// the host: which rows to fetch is a pure function of the token ids, so the
+// gather never enters the graph and the 26.8 GiB table is not a tensor here.
+// See ngram_table.h for why that matters.
+//
+// The module is a gated additive branch onto the wide residual:
+//   res += sigmoid(<key(emb), query(res)>) * value(emb) + conv(that)
+// which is why dropping it (--ngram off) leaves a stack that still runs.
+ggml_tensor * Runtime::Impl::build_ple(ggml_context * ctx, ggml_cgraph * gf, int il,
+        ggml_tensor * res_hc, ggml_tensor * emb, int n_tokens) {
+    const auto & hp  = model.hparams();
+    const int n_embd = hp.n_embd;
+    const int hc     = hp.hc_count;
+    const int hc_dim = hc * n_embd;
+    const float eps  = hp.rms_eps;
+
+    // grouped RMSNorm over one residual stream, with a gamma spanning all of
+    // them -- the same shape build_hc_mix uses
+    auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * w) {
+        ggml_tensor * t = ggml_rms_norm(ctx, ggml_reshape_3d(ctx, x, n_embd, hc, n_tokens), eps);
+        t = ggml_mul(ctx, ggml_reshape_2d(ctx, t, hc_dim, n_tokens), w);
+        return ggml_reshape_3d(ctx, t, n_embd, hc, n_tokens);
+    };
+
+    ggml_tensor * key   = ggml_mul_mat(ctx, W("blk.%d.ple_key.weight",   il), emb);
+    ggml_tensor * value = ggml_mul_mat(ctx, W("blk.%d.ple_value.weight", il), emb);
+
+    key = grouped_norm(key, W("blk.%d.ple_norm_key.weight", il));
+    ggml_tensor * query = grouped_norm(res_hc, W("blk.%d.ple_norm_query.weight", il));
+
+    // per-stream dot product, then a signed square root before the sigmoid
+    ggml_tensor * sc = ggml_scale(ctx, ggml_sum_rows(ctx, ggml_mul(ctx, key, query)),
+                                  1.0f / sqrtf((float) n_embd));
+    ggml_tensor * mag  = ggml_sqrt(ctx, ggml_clamp(ctx, ggml_abs(ctx, sc), 1e-6f, INFINITY));
+    ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul(ctx, ggml_sgn(ctx, sc), mag));
+
+    // one n_embd-wide value broadcast across the streams, scaled by the gate
+    ggml_tensor * v3 = ggml_repeat_4d(ctx,
+            ggml_reshape_3d(ctx, value, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+    ggml_tensor * gated = ggml_mul(ctx, v3, gate);
+
+    ggml_tensor * normalized = grouped_norm(gated, W("blk.%d.ple_norm_conv.weight", il));
+    normalized = ggml_reshape_2d(ctx, normalized, hc_dim, n_tokens);
+
+    // Depthwise causal conv, dilated by the n-gram size. Written as a sum of
+    // shifted per-channel-scaled copies rather than via ggml_conv_1d_dw, which
+    // upstream flags as suspect; on a tensor this small it is a handful of ops.
+    //   out[c, t] = sum_k w[k, c] * x[c, t - (K-1-k)*dilation]
+    const int kern = (int) hp.ple_conv_kernel;
+    const int dil  = (int) hp.ple_ngram_size;
+    const int hist = (int) hp.ple_conv_state();
+
+    // [hist + n_tokens, hc_dim] with tokens on ne[0], so history concatenates
+    ggml_tensor * padded = ggml_concat(ctx, ple_conv_state[il],
+            ggml_cont(ctx, ggml_transpose(ctx, normalized)), 0);
+    ggml_tensor * tail = ggml_view_2d(ctx, padded, hist, hc_dim, padded->nb[1],
+            ggml_row_size(padded->type, n_tokens));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cont(ctx, tail), ple_conv_state[il]));
+
+    ggml_tensor * conv_out = nullptr;
+    ggml_tensor * kernel   = W("blk.%d.ple_conv1d.weight", il);   // [kern, hc_dim]
+    for (int k = 0; k < kern; ++k) {
+        const int start = hist - (kern - 1 - k) * dil;
+        ggml_tensor * shifted = ggml_cont(ctx, ggml_transpose(ctx,
+                ggml_view_2d(ctx, padded, n_tokens, hc_dim, padded->nb[1],
+                             ggml_row_size(padded->type, start))));
+
+        // column k of the kernel is one weight per channel
+        ggml_tensor * wk = ggml_cont(ctx, ggml_view_2d(ctx, kernel, 1, hc_dim,
+                kernel->nb[1], (size_t) k * kernel->nb[0]));
+        wk = ggml_reshape_1d(ctx, wk, hc_dim);
+        if (wk->type != GGML_TYPE_F32) wk = ggml_cast(ctx, wk, GGML_TYPE_F32);
+
+        ggml_tensor * term = ggml_mul(ctx, shifted, wk);
+        conv_out = conv_out ? ggml_add(ctx, conv_out, term) : term;
+    }
+    conv_out = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_silu(ctx, conv_out)),
+                               n_embd, hc, n_tokens);
+
+    return ggml_add(ctx, res_hc, ggml_add(ctx, gated, conv_out));
+}
+
+// ---- expert routing ----
+void Runtime::Impl::dump_flush(const char * tag) {
+    if (dump_list.empty()) return;
+    std::vector<float> buf;
+    for (auto & e : dump_list) {
+        ggml_tensor * t = e.second;
+        if (!t->buffer || t->type != GGML_TYPE_F32) continue;
+        const size_t n = ggml_nelements(t);
+        buf.resize(n);
+        ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+        double sum = 0.0;
+        for (size_t i = 0; i < n; ++i) sum += buf[i];
+        fprintf(stderr, "qw_dump[%s]: %28s = {%lld, %lld, %lld, %lld} sum = %f\n",
+                tag, e.first.c_str(),
+                (long long) t->ne[0], (long long) t->ne[1],
+                (long long) t->ne[2], (long long) t->ne[3], sum);
+    }
+    dump_list.clear();
+}
+
+ggml_tensor * Runtime::Impl::router_rank(ggml_context * ctx, int il, ggml_tensor * logits) {
+    const auto & hp = model.hparams();
+    ggml_tensor * bias = Wopt("blk.%d.exp_probs_b.bias", il);
+    // softmax is monotonic, so its top-k is the logits' top-k: skip it
+    if (!hp.gating_sigmoid() && !bias) return logits;
+    ggml_tensor * p = hp.gating_sigmoid() ? ggml_sigmoid(ctx, logits) : ggml_soft_max(ctx, logits);
+    return bias ? ggml_add(ctx, p, bias) : p;
+}
+
+Runtime::Impl::Route Runtime::Impl::route_experts(ggml_context * ctx, int il,
+        ggml_tensor * logits, ggml_tensor * rm, int n_tokens) {
+    const auto & hp = model.hparams();
+    const int n_exp  = hp.n_expert;
+    const int n_used = hp.n_expert_used;
+
+    dbg(logits, "ffn_moe_logits", il);
+    if (rm) logits = ggml_add(ctx, logits, rm);
+    ggml_tensor * probs = hp.gating_sigmoid() ? ggml_sigmoid(ctx, logits) : ggml_soft_max(ctx, logits);
+    dbg(probs, "ffn_moe_probs", il);
+
+    ggml_tensor * rank = probs;
+    if (ggml_tensor * bias = Wopt("blk.%d.exp_probs_b.bias", il)) {
+        rank = dbg(ggml_add(ctx, probs, bias), "ffn_moe_probs_biased", il);
+        // The mask drove the logits to -inf, which zeroes probs but leaves the
+        // bias free to rank a non-resident expert first. Re-apply it after the
+        // bias so a masked expert can never win a slot.
+        if (rm) rank = ggml_add(ctx, rank, rm);
+    }
+
+    Route r;
+    r.selected = ggml_argsort_top_k(ctx, rank, n_used);                // [n_used, n_tokens] i32
+
+    ggml_tensor * probs3  = ggml_reshape_3d(ctx, probs, 1, n_exp, n_tokens);
+    ggml_tensor * weights = ggml_get_rows(ctx, probs3, r.selected);   // [1, n_used, n_tokens]
+    if (hp.expert_weights_norm) {
+        weights = ggml_reshape_2d(ctx, weights, n_used, n_tokens);
+        ggml_tensor * wsum = ggml_sum_rows(ctx, weights);              // [1, n_tokens]
+        wsum = ggml_clamp(ctx, wsum, 6.103515625e-5f, INFINITY);
+        weights = ggml_div(ctx, weights, wsum);
+        weights = ggml_reshape_3d(ctx, weights, 1, n_used, n_tokens);
+    }
+    if (hp.expert_weights_scale != 0.0f && hp.expert_weights_scale != 1.0f)
+        weights = ggml_scale(ctx, weights, hp.expert_weights_scale);
+    r.weights = dbg(weights, "ffn_moe_weights_scaled", il);
+    return r;
+}
+
 // SwiGLU with step35's per-layer clamp: silu(gate) is clipped from above and up
 // from both sides before the product. limit <= 0 means no clamp, which is every
 // layer of every other architecture (and all but the last two of step35).
@@ -1112,7 +2527,21 @@ static ggml_tensor * swiglu_limited(ggml_context * ctx, ggml_tensor * gate,
     ggml_tensor * g = ggml_clamp(ctx, ggml_silu(ctx, gate), -INFINITY, limit);
     return ggml_mul(ctx, g, u);
 }
+// The same for the dense and shared-expert FFNs, which have always used the
+// unfused silu*up; kept as is when there is no clamp so their numerics do not move.
+static ggml_tensor * swiglu_ffn(ggml_context * ctx, ggml_tensor * gate,
+                                ggml_tensor * up, float limit) {
+    return limit > 0.0f ? swiglu_limited(ctx, gate, up, limit)
+                        : ggml_mul(ctx, ggml_silu(ctx, gate), up);
+}
 
+ggml_tensor * Runtime::Impl::build_dense_ffn(ggml_context * ctx, int il, ggml_tensor * x) {
+    ggml_tensor * gt = ggml_mul_mat(ctx, W("blk.%d.ffn_gate.weight", il), x);
+    ggml_tensor * up = ggml_mul_mat(ctx, W("blk.%d.ffn_up.weight",   il), x);
+    return ggml_mul_mat(ctx, W("blk.%d.ffn_down.weight", il), swiglu_ffn(ctx, gt, up, model.hparams().swiglu_limit_exp(il)));
+}
+
+// ---- MoE FFN: routed experts (+ shared expert) ----
 ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int il,
         ggml_tensor * x, int n_tokens) {
     const auto & hp = model.hparams();
@@ -1123,53 +2552,20 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
     ggml_tensor * logits = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp.weight", il), x); // [n_exp, n_tokens]
     ggml_tensor * rm = nullptr;   // resident-only routing mask, when in force
     if (cache_fast_build && resident_decode) {
-        // record the unmasked router preference (top-k of the raw logits) so
-        // the host can refill wanted-but-absent experts in the background
-        ggml_tensor * want = ggml_argsort_top_k(ctx, logits, n_used);      // [n_used, 1]
+        // record the unmasked router preference so the host can refill
+        // wanted-but-absent experts in the background
+        ggml_tensor * want = ggml_argsort_top_k(ctx, router_rank(ctx, il, logits), n_used); // [n_used, 1]
         ggml_tensor * want_col = ggml_view_2d(ctx, want_all, n_used, 1,
                                               want_all->nb[1], (size_t) il * want_all->nb[1]);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, want, want_col));
         // resident-only routing: bias non-resident experts to -inf before the
-        // softmax/top-k so the fused graph can never select a cache miss
+        // gating/top-k so the fused graph can never select a cache miss
         rm = ggml_view_2d(ctx, resmask_all, n_exp, 1,
                           resmask_all->nb[1], (size_t) il * resmask_all->nb[1]);
-        logits = ggml_add(ctx, logits, rm);
     }
-
-    // Routing shape. Qwen normalises the logits with a softmax and ranks on the
-    // result; step35 squashes each logit independently with a sigmoid and ranks
-    // on probs + a per-expert selection bias, while the mixing weights come from
-    // the *unbiased* probs (the bias only decides who gets picked).
-    const bool sigmoid_gate = hp.expert_gating_func == 2;
-    ggml_tensor * probs = sigmoid_gate ? ggml_sigmoid(ctx, logits) : ggml_soft_max(ctx, logits);
-    dbg(logits, "ffn_moe_logits", il);
-    dbg(probs,  "ffn_moe_probs",  il);
-
-    ggml_tensor * rank = probs;
-    if (ggml_tensor * bias = Wopt("blk.%d.exp_probs_b.bias", il)) {
-        rank = dbg(ggml_add(ctx, probs, bias), "ffn_moe_probs_biased", il);
-        // The residency mask drives the logits to -inf, which zeroes probs but
-        // leaves the bias free to rank a non-resident expert first. Re-apply it
-        // after the bias so a masked expert can never win a slot.
-        if (rm) rank = ggml_add(ctx, rank, rm);
-    }
-
-    ggml_tensor * selected = ggml_argsort_top_k(ctx, rank, n_used);    // [n_used, n_tokens] i32
-
-    ggml_tensor * probs3 = ggml_reshape_3d(ctx, probs, 1, n_exp, n_tokens);
-    ggml_tensor * weights = ggml_get_rows(ctx, probs3, selected);      // [1, n_used, n_tokens]
-
-    // normalize weights over selected experts (step35 can turn this off)
-    if (hp.arch != Arch::STEP35 || hp.expert_weights_norm) {
-        weights = ggml_reshape_2d(ctx, weights, n_used, n_tokens);
-        ggml_tensor * wsum = ggml_sum_rows(ctx, weights);              // [1, n_tokens]
-        wsum = ggml_clamp(ctx, wsum, 6.103515625e-5f, INFINITY);
-        weights = ggml_div(ctx, weights, wsum);
-        weights = ggml_reshape_3d(ctx, weights, 1, n_used, n_tokens);
-    }
-    if (hp.expert_weights_scale != 0.0f && hp.expert_weights_scale != 1.0f)
-        weights = ggml_scale(ctx, weights, hp.expert_weights_scale);
-    dbg(weights, "ffn_moe_weights_scaled", il);
+    const Route rt = route_experts(ctx, il, logits, rm, n_tokens);
+    ggml_tensor * selected = rt.selected;
+    ggml_tensor * weights  = rt.weights;
 
     // expand early so the CUDA top-k-moe path matches (mirrors llama.cpp)
     ggml_build_forward_expand(gf, weights);
@@ -1197,10 +2593,10 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
         ggml_tensor * slot_d = remap(ExpertCache::DOWN);
 
         ggml_tensor * x3   = ggml_reshape_3d(ctx, x, n_embd, 1, 1);
-        ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3,  slot_u);
-        ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3,  slot_g);
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, ec_of(il)->up(il),   x3,  slot_u);
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, ec_of(il)->gate(il), x3,  slot_g);
         ggml_tensor * act  = swiglu_limited(ctx, gate, up, hp.swiglu_limit_exp(il));
-        ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, slot_d);
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, ec_of(il)->down(il), act, slot_d);
         ggml_tensor * et = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, experts, n_embd, n_used)));
         ggml_tensor * w  = ggml_reshape_2d(ctx, weights, n_used, 1);
         moe_out = ggml_mul_mat(ctx, et, w);   // [n_embd, 1]
@@ -1209,7 +2605,7 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
 
         ggml_tensor * up   = ggml_mul_mat_id(ctx, W("blk.%d.ffn_up_exps.weight",   il), x3, selected);
         ggml_tensor * gate = ggml_mul_mat_id(ctx, W("blk.%d.ffn_gate_exps.weight", il), x3, selected);
-        ggml_tensor * act  = swiglu_limited(ctx, gate, up, hp.swiglu_limit_exp(il));  // silu(gate)*up [ff_exp, n_used, n_tokens]
+        ggml_tensor * act  = swiglu_limited(ctx, gate, up, hp.swiglu_limit_exp(il));            // silu(gate)*up [ff_exp, n_used, n_tokens]
         ggml_tensor * experts = ggml_mul_mat_id(ctx, W("blk.%d.ffn_down_exps.weight", il), act, selected); // [n_embd, n_used, n_tokens]
 
         if (n_tokens == 1) {
@@ -1235,21 +2631,19 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
         }
     }
 
-    // llama.cpp reserves "ffn_moe_out" for the routed experts alone and calls the
-    // routed + shared sum "ffn_out"; dump here so the two captures line up.
+    // llama.cpp reserves "ffn_moe_out" for the routed experts alone; dump here
+    // so the two captures line up.
     dbg(moe_out, "ffn_moe_out", il);
 
-    // shared expert (qwen35moe / qwen3next): gated SwiGLU added to the MoE output
+    // shared expert: SwiGLU added to the MoE output. qwen35moe / qwen3next gate
+    // it with their own sigmoid; a model without that weight adds it as is.
     if (ggml_tensor * up_sh = Wopt("blk.%d.ffn_up_shexp.weight", il)) {
         ggml_tensor * g  = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), x);
         ggml_tensor * u  = ggml_mul_mat(ctx, up_sh, x);
         ggml_tensor * sh = ggml_mul_mat(ctx, W("blk.%d.ffn_down_shexp.weight", il),
-                                        swiglu_limited(ctx, g, u, hp.swiglu_limit_shexp(il)));
-        // qwen35moe / qwen3next gate the shared expert with their own sigmoid;
-        // step35 has no such weight and adds it unconditionally.
+                                        swiglu_ffn(ctx, g, u, hp.swiglu_limit_shexp(il)));
         if (ggml_tensor * gw = Wopt("blk.%d.ffn_gate_inp_shexp.weight", il))
             sh = ggml_mul(ctx, sh, ggml_sigmoid(ctx, ggml_mul_mat(ctx, gw, x)));
-        dbg(sh, "ffn_shared_out", il);
         moe_out = ggml_add(ctx, moe_out, sh);
     }
     return moe_out;
@@ -1259,8 +2653,6 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
                                          bool logits_all) {
     const auto & hp = model.hparams();
     const int n_embd      = hp.n_embd;
-    const int n_head      = hp.n_head;
-    const int n_head_kv   = hp.n_head_kv;
     const int n_embd_head = hp.n_embd_head;
     const float eps       = hp.rms_eps;
     const bool  gated     = hp.has_gdn;   // qwen35 attention layers use gated Q + post norm
@@ -1268,7 +2660,6 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
     dump_list.clear();
-    ring_idx = nullptr;
 
     ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp_tokens); ggml_set_name(inp_tokens, "inp_tokens");
@@ -1280,6 +2671,7 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
     // Sliding-window layers need a second mask (causal AND inside the window).
     // Only step35 has them; every other architecture keeps the single causal
     // mask and never allocates this one.
+    ring_idx = nullptr;
     ggml_tensor * inp_mask_swa = nullptr;
     if (hp.n_swa > 0) inp_mask_swa = new_swa_inputs(ctx, n_tokens, n_kv);
 
@@ -1303,17 +2695,51 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
         }
     }
 
+    // qwen4exp: the residual is hc identical copies of the embedding. There is
+    // no attn_norm / ffn_norm / output_norm anywhere in the file -- the hc
+    // mixers carry every normalization the stack has.
+    const bool hc_on = hp.has_hc();
+    const int  n_hc  = hc_on ? (int) hp.hc_count : 1;
+    // The PLE rows are gathered on the host and arrive as one plain input; the
+    // graph never touches the table. Sized n_embd because ple_head_dim times
+    // ple_n_heads is exactly the model width.
+    QsaShared qsa;
+
+    ggml_tensor * inp_ple = nullptr;
+    if (use_ple()) {
+        inp_ple = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp_ple);
+        ggml_set_name(inp_ple, "inp_ple");
+    }
+
+    ggml_tensor * res_hc = nullptr;
+    if (hc_on) {
+        res_hc = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, inpL, n_embd, 1, n_tokens),
+                                n_embd, n_hc, n_tokens, 1);
+    }
+
     for (int il = 0; il < (int) hp.n_main(); ++il) {
         ggml_tensor * inpSA = inpL;
+        ggml_tensor * inject = nullptr;
+        // per-layer on step35 (64 vs 96 heads); the scalars everywhere else
+        const int n_head    = (int) hp.head_count(il);
+        const int n_head_kv = (int) hp.head_count_kv(il);
 
-        // step35 gives full-attention and sliding layers different head counts
-        // (64 vs 96); everywhere else these equal the scalars.
-        const int n_head_l    = (int) hp.head_count(il);
-        const int n_head_kv_l = (int) hp.head_count_kv(il);
+        if (hc_on && use_ple() && hp.is_ple(il)) {
+            res_hc = build_ple(ctx, gf, il, res_hc, inp_ple, n_tokens);
+        }
 
-        dbg(inpL, "attn_norm_in", il);
-        cur = ggml_rms_norm(ctx, inpL, eps);
-        cur = dbg(ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il)), "attn_norm", il);
+        if (hc_on) {
+            cur = build_hc_mix(ctx, res_hc,
+                    W("blk.%d.hc_attn_norm.weight",   il),
+                    W("blk.%d.hc_attn_down.weight",   il),
+                    W("blk.%d.hc_attn_up.weight",     il),
+                    W("blk.%d.hc_attn_inject.weight", il), &inject);
+        } else {
+            dbg(inpL, "attn_norm_in", il);
+            cur = ggml_rms_norm(ctx, inpL, eps);
+            cur = dbg(ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il)), "attn_norm", il);
+        }
 
         if (hp.is_recurrent(il)) {
             cur = build_gdn(ctx, gf, il, cur, n_tokens);
@@ -1323,22 +2749,22 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
             if (gated) {
                 ggml_tensor * Qf = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur); // [2*hd*nh, T]
                 const size_t es = ggml_element_size(Qf);
-                Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head_l, n_tokens,
-                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head_l, 0);
-                gate = ggml_view_3d(ctx, Qf, n_embd_head, n_head_l, n_tokens,
-                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head_l, es * n_embd_head);
-                gate = ggml_cont_2d(ctx, gate, n_embd_head * n_head_l, n_tokens);
+                Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head, n_tokens,
+                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head, 0);
+                gate = ggml_view_3d(ctx, Qf, n_embd_head, n_head, n_tokens,
+                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head, es * n_embd_head);
+                gate = ggml_cont_2d(ctx, gate, n_embd_head * n_head, n_tokens);
                 K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
                 V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
-                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv_l, n_tokens);
-                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv_l, n_tokens);
+                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, n_tokens);
+                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, n_tokens);
             } else {
-                Q = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur), "Qcur", il);
-                K = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur), "Kcur", il);
-                V = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur), "Vcur", il);
-                Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head_l,    n_tokens);
-                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv_l, n_tokens);
-                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv_l, n_tokens);
+                Q = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur);
+                K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
+                V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
+                Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head,    n_tokens);
+                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, n_tokens);
+                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, n_tokens);
             }
 
             Q = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il)), "Qcur_normed", il);
@@ -1347,41 +2773,56 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
             Q = dbg(apply_rope(ctx, Q, inp_pos, il), "Qcur_pos", il);
             K = dbg(apply_rope(ctx, K, inp_pos, il), "Kcur_pos", il);
 
-            ggml_tensor * att = build_attn(ctx, gf, il,
-                    Q, K, V, hp.is_swa(il) ? inp_mask_swa : inp_mask, n_tokens, n_kv);
+            ggml_tensor * m = build_qsa_mask(ctx, gf, il, cur, inp_pos,
+                                             hp.is_swa(il) ? inp_mask_swa : inp_mask,
+                                             n_tokens, n_kv, n_past, qsa);
+            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, m, n_tokens, n_kv);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate));
             dbg(att, "attn_out", il);
-            att = dbg(apply_attn_gate(ctx, il, att, cur, n_head_l, n_tokens), "attn_gated", il);
+            att = dbg(apply_attn_gate(ctx, il, att, cur, n_head, n_tokens), "attn_gated", il);
             cur = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att), "attn_proj", il);
         }
 
-        cur = dbg(ggml_add(ctx, cur, inpSA), "ffn_inp", il);
-
-        // FFN with (qwen35) post-attention norm placement
-        ggml_tensor * ffn_res = cur;
+        ggml_tensor * ffn_res = nullptr;
         ggml_tensor * ffn_in;
-        if (gated) {
-            ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W(post_norm_name, il));
+        if (hc_on) {
+            res_hc = build_hc_combine(ctx, res_hc, cur, inject);
+            ffn_in = build_hc_mix(ctx, res_hc,
+                    W("blk.%d.hc_ffn_norm.weight",   il),
+                    W("blk.%d.hc_ffn_down.weight",   il),
+                    W("blk.%d.hc_ffn_up.weight",     il),
+                    W("blk.%d.hc_ffn_inject.weight", il), &inject);
         } else {
-            ffn_in = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W("blk.%d.ffn_norm.weight", il)), "ffn_norm", il);
-            ffn_res = cur;  // same residual for qwen3 (norm of cur, add cur)
+            cur = dbg(ggml_add(ctx, cur, inpSA), "ffn_inp", il);
+
+            // FFN with (qwen35) post-attention norm placement
+            ffn_res = cur;
+            if (gated) {
+                ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W(post_norm_name, il));
+            } else {
+                ffn_in = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W("blk.%d.ffn_norm.weight", il)), "ffn_norm", il);
+            }
         }
 
         ggml_tensor * ff;
         if (hp.is_moe_layer(il)) {
             ff = build_moe(ctx, gf, il, ffn_in, n_tokens);
         } else {
-            ggml_tensor * gt = ggml_mul_mat(ctx, W("blk.%d.ffn_gate.weight", il), ffn_in);
-            ggml_tensor * up = ggml_mul_mat(ctx, W("blk.%d.ffn_up.weight",   il), ffn_in);
-            ff = ggml_mul_mat(ctx, W("blk.%d.ffn_down.weight", il), ggml_mul(ctx, ggml_silu(ctx, gt), up));
+            ff = build_dense_ffn(ctx, il, ffn_in);
         }
-
         dbg(ff, "ffn_out", il);
-        cur = dbg(ggml_add(ctx, ff, ffn_res), "l_out", il);
-        inpL = cur;
+
+        if (hc_on) {
+            res_hc = build_hc_combine(ctx, res_hc, ff, inject);
+        } else {
+            inpL = dbg(ggml_add(ctx, ff, ffn_res), "l_out", il);
+        }
     }
 
     // expose the main stack's last hidden (pre-output-norm) for the MTP module
+    // (hc has no single n_embd-wide "last hidden", but no hc model carries an
+    //  MTP block either, so the two never meet)
+    GGML_ASSERT(!(capture_hidden && hc_on) && "MTP capture is not defined for a hyper-connection residual");
     if (capture_hidden) {
         ggml_set_name(inpL, "main_hidden");
         ggml_set_output(inpL);
@@ -1390,17 +2831,33 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
 
     // Narrow to the last token before the output norm when the caller only wants
     // that row: everything downstream then runs once instead of n_tokens times.
-    ggml_tensor * head_in = inpL;
-    if (!logits_all && n_tokens > 1) {
-        head_in = ggml_cont(ctx, ggml_view_2d(ctx, inpL, n_embd, 1, inpL->nb[1],
-                                              (size_t) (n_tokens - 1) * inpL->nb[1]));
+    if (hc_on) {
+        // Narrow the wide residual before the final mixer, not after: the mixer
+        // is two hc_dim matmuls per token and a prefill throws all but the last
+        // row away.
+        ggml_tensor * r = res_hc;
+        if (!logits_all && n_tokens > 1) {
+            r = ggml_cont(ctx, ggml_view_3d(ctx, res_hc, n_embd, n_hc, 1,
+                    res_hc->nb[1], res_hc->nb[2],
+                    (size_t) (n_tokens - 1) * res_hc->nb[2]));
+        }
+        // the final mixer IS the output norm; the file carries no separate one
+        cur = build_hc_mix(ctx, r,
+                model.tensor("output_hc_norm.weight"),
+                model.tensor("output_hc_down.weight"),
+                model.tensor("output_hc_up.weight"), nullptr, nullptr);
+    } else {
+        ggml_tensor * head_in = inpL;
+        if (!logits_all && n_tokens > 1) {
+            head_in = ggml_cont(ctx, ggml_view_2d(ctx, inpL, n_embd, 1, inpL->nb[1],
+                                                  (size_t) (n_tokens - 1) * inpL->nb[1]));
+        }
+
+        cur = ggml_rms_norm(ctx, head_in, eps);
+        cur = dbg(ggml_mul(ctx, cur, out_norm_w()), "result_norm", -1);
     }
 
-    cur = ggml_rms_norm(ctx, head_in, eps);
-    cur = dbg(ggml_mul(ctx, cur, model.tensor("output_norm.weight")), "result_norm", -1);
-
-    ggml_tensor * output_w = model.tensor("output.weight");
-    if (!output_w) output_w = model.tensor("token_embd.weight");
+    ggml_tensor * output_w = out_proj_w();
     cur = ggml_mul_mat(ctx, output_w, cur);
     ggml_set_name(cur, "logits");
 
@@ -1496,8 +2953,7 @@ ggml_tensor * Runtime::Impl::build_mtp(ggml_context * ctx, ggml_cgraph * gf,
     if (mtp_headless) return cur;   // KV-write only (resync); skip the shared head
 
     ggml_tensor * fin = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), W("blk.%d.nextn.shared_head_norm.weight", L));
-    ggml_tensor * lm = model.tensor("output.weight");
-    if (!lm) lm = model.tensor("token_embd.weight");
+    ggml_tensor * lm = out_proj_w();
     ggml_tensor * logits = ggml_mul_mat(ctx, lm, fin);
     ggml_set_name(logits, "mtp_logits");
     ggml_build_forward_expand(gf, logits);
@@ -1528,7 +2984,7 @@ const std::vector<float> & Runtime::Impl::mtp_draft(int32_t token) {
     ggml_tensor * logits_t = build_mtp(ctx, gf, h_in, t_in, p_in, m_in, n_kv);
     n_past = saved;
 
-    if (!ggml_gallocr_alloc_graph(mtp_galloc, gf))
+    if (!alloc_graph(mtp_galloc, gf))
         throw std::runtime_error("mtp_draft: gallocr alloc failed");
 
     ggml_backend_tensor_set(h_in, mtp_hidden.data(), 0, n_embd * sizeof(float));
@@ -1537,7 +2993,7 @@ const std::vector<float> & Runtime::Impl::mtp_draft(int32_t token) {
     std::vector<ggml_fp16_t> mask(n_kv, ggml_fp32_to_fp16(0.0f));   // all past positions visible
     ggml_backend_tensor_set(m_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
 
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+    if (compute_graph(gf) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("mtp_draft: compute failed");
 
     const int n_vocab = (int) logits_t->ne[0];
@@ -1597,7 +3053,7 @@ int32_t Runtime::Impl::mtp_draft_fast(int32_t token, bool need_hidden) {
         ggml_build_forward_expand(m_gf, am);
 
         if (!m_galloc) m_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        if (!ggml_gallocr_alloc_graph(m_galloc, m_gf))
+        if (!alloc_graph(m_galloc, m_gf))
             throw std::runtime_error("mtp_draft_fast: gallocr alloc failed");
     }
 
@@ -1684,7 +3140,7 @@ void Runtime::Impl::mtp_resync(int32_t token) {
         persistent   = false;
 
         if (!r_galloc) r_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        if (!ggml_gallocr_alloc_graph(r_galloc, r_gf))
+        if (!alloc_graph(r_galloc, r_gf))
             throw std::runtime_error("mtp_resync: gallocr alloc failed");
     }
 
@@ -1735,7 +3191,7 @@ void Runtime::Impl::mtp_prefill_batch(const int32_t * toks, const float * hidden
     n_past = saved;
 
     ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_alloc_graph(ga, gf)) {
+    if (!alloc_graph(ga, gf)) {
         ggml_gallocr_free(ga);
         ggml_free(ctx);
         throw std::runtime_error("mtp_prefill_batch: gallocr alloc failed");
@@ -1759,7 +3215,7 @@ void Runtime::Impl::mtp_prefill_batch(const int32_t * toks, const float * hidden
         if (ov) ggml_backend_tensor_set(ov, ovr[k].data, 0, ggml_nbytes(ov));
     }
 
-    const ggml_status st = ggml_backend_graph_compute(backend, gf);
+    const ggml_status st = compute_graph(gf);
     ggml_gallocr_free(ga);
     ggml_free(ctx);
     if (st != GGML_STATUS_SUCCESS)
@@ -1774,7 +3230,7 @@ void Runtime::Impl::decode_verify_cached(const std::vector<int32_t> & toks) {
     const int T = (int) toks.size();
     const int n_used = model.hparams().n_expert_used;
     const bool gdn = model.hparams().has_gdn;
-    if (ecache->min_slots() >= T * n_used) {
+    if (ec_min_slots() >= T * n_used) {
         // batched path: fills vH and vA (GPU argmax, no logits readback).
         // GDN states are checkpointed per verify token so a partial accept can
         // restore an intermediate state instead of re-decoding (same as the
@@ -1832,13 +3288,12 @@ void Runtime::Impl::decode_verify(const std::vector<int32_t> & toks) {
         ggml_set_name(am, "verify_argmax"); ggml_set_output(am);
         ggml_build_forward_expand(v_gf, am);
         if (!v_galloc) v_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        if (!ggml_gallocr_alloc_graph(v_galloc, v_gf))
+        if (!alloc_graph(v_galloc, v_gf))
             throw std::runtime_error("decode_verify: gallocr alloc failed");
     }
 
     ggml_tensor * inp_tokens = ggml_graph_get_tensor(v_gf, "inp_tokens");
     ggml_tensor * inp_pos    = ggml_graph_get_tensor(v_gf, "inp_pos");
-    ggml_tensor * inp_mask   = ggml_graph_get_tensor(v_gf, "inp_mask");
     ggml_tensor * inp_kvidx  = ggml_graph_get_tensor(v_gf, "inp_kvidx");
     ggml_backend_tensor_set(inp_tokens, toks.data(), 0, n_tokens * sizeof(int32_t));
     std::vector<int32_t> pos;
@@ -1848,8 +3303,13 @@ void Runtime::Impl::decode_verify(const std::vector<int32_t> & toks) {
     ggml_backend_tensor_set(inp_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
     ggml_backend_tensor_set(inp_kvidx, kvi.data(), 0, n_tokens * sizeof(int64_t));
     fill_masks(v_gf, n_tokens, v_nkv, n_past);
+    // No released model has both an MTP block and QSA, so this graph has never
+    // had QSA nodes in it -- but leaving the inputs unfilled is what made the
+    // fast decode graph read a garbage cell -> block table and crash, so fill
+    // them here too rather than leave the same hole open.
+    set_qsa_inputs(v_gf, n_tokens, v_nkv, n_past);
 
-    if (ggml_backend_graph_compute(backend, v_gf) != GGML_STATUS_SUCCESS)
+    if (compute_graph(v_gf) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("decode_verify: compute failed");
 
     ggml_tensor * h  = ggml_graph_get_tensor(v_gf, "main_hidden");
@@ -2088,17 +3548,17 @@ const std::vector<float> & Runtime::Impl::decode_reuse(int32_t token) {
         dgf = build_graph(dctx, /*n_tokens=*/1, /*n_kv=*/d_nkv);
         persistent = false;
         dgalloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        if (!ggml_gallocr_alloc_graph(dgalloc, dgf))
+        if (!alloc_graph(dgalloc, dgf))
             throw std::runtime_error("persistent gallocr alloc failed");
     }
     auto pt_build = pnow();
 
     ggml_tensor * inp_tokens = ggml_graph_get_tensor(dgf, "inp_tokens");
     ggml_tensor * inp_pos    = ggml_graph_get_tensor(dgf, "inp_pos");
-    ggml_tensor * inp_mask   = ggml_graph_get_tensor(dgf, "inp_mask");
     ggml_tensor * inp_kvidx  = ggml_graph_get_tensor(dgf, "inp_kvidx");
 
     ggml_backend_tensor_set(inp_tokens, &token, 0, sizeof(int32_t));
+    fill_ple_input(dgf, &token, 1);
     std::vector<int32_t> posv;
     fill_rope_pos(posv, 1, mrope_next);   // generation token: text, sequential
     ggml_backend_tensor_set(inp_pos, posv.data(), 0, posv.size() * sizeof(int32_t));
@@ -2106,9 +3566,10 @@ const std::vector<float> & Runtime::Impl::decode_reuse(int32_t token) {
     ggml_backend_tensor_set(inp_kvidx, &kvidx, 0, sizeof(int64_t));
 
     fill_masks(dgf, 1, d_nkv, n_past);
+    set_qsa_inputs(dgf, 1, d_nkv, n_past);
     auto pt_input = pnow();
 
-    if (ggml_backend_graph_compute(backend, dgf) != GGML_STATUS_SUCCESS)
+    if (compute_graph(dgf) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("persistent graph compute failed");
     auto pt_compute = pnow();
 
@@ -2128,35 +3589,15 @@ const std::vector<float> & Runtime::Impl::decode_reuse(int32_t token) {
     return logits;
 }
 
-// ---- MoE router: softmax gating + top-k + normalized weights (no expert matmul) ----
+// ---- MoE router: gating + top-k + weights (no expert matmul) ----
 ggml_tensor * Runtime::Impl::build_router(ggml_context * ctx, ggml_cgraph * gf, int il,
         ggml_tensor * ffn_in, ggml_tensor * & weights_out) {
-    const auto & hp = model.hparams();
-    const int n_exp  = hp.n_expert;
-    const int n_used = hp.n_expert_used;
+    const int n_used = model.hparams().n_expert_used;
 
-    ggml_tensor * logits   = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp.weight", il), ffn_in); // [n_exp,1]
-    // Must mirror build_moe's routing exactly: step35 squashes each logit with a
-    // sigmoid and ranks on probs + a per-expert selection bias, mixing with the
-    // unbiased probs. Diverging here would pick different experts on the offload
-    // path than on the resident one, and nothing would report it.
-    ggml_tensor * probs    = hp.expert_gating_func == 2 ? ggml_sigmoid(ctx, logits)
-                                                       : ggml_soft_max(ctx, logits);
-    ggml_tensor * rank     = probs;
-    if (ggml_tensor * bias = Wopt("blk.%d.exp_probs_b.bias", il))
-        rank = ggml_add(ctx, probs, bias);
-    ggml_tensor * selected = ggml_argsort_top_k(ctx, rank, n_used);      // [n_used,1] i32
-
-    ggml_tensor * probs3   = ggml_reshape_3d(ctx, probs, 1, n_exp, 1);
-    ggml_tensor * weights  = ggml_get_rows(ctx, probs3, selected);       // [1,n_used,1]
-    weights = ggml_reshape_2d(ctx, weights, n_used, 1);
-    if (hp.arch != Arch::STEP35 || hp.expert_weights_norm) {
-        ggml_tensor * wsum = ggml_sum_rows(ctx, weights);
-        wsum = ggml_clamp(ctx, wsum, 6.103515625e-5f, INFINITY);
-        weights = ggml_div(ctx, weights, wsum);
-    }
-    if (hp.expert_weights_scale != 0.0f && hp.expert_weights_scale != 1.0f)
-        weights = ggml_scale(ctx, weights, hp.expert_weights_scale);
+    ggml_tensor * logits = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp.weight", il), ffn_in); // [n_exp,1]
+    const Route rt = route_experts(ctx, il, logits, nullptr, 1);
+    ggml_tensor * selected = rt.selected;                                // [n_used,1] i32
+    ggml_tensor * weights  = ggml_reshape_2d(ctx, rt.weights, n_used, 1);
 
     ggml_set_output(selected);             // preserve its buffer for host readback
     ggml_build_forward_expand(gf, selected);
@@ -2173,10 +3614,10 @@ ggml_tensor * Runtime::Impl::build_moe_cached(ggml_context * ctx, ggml_cgraph * 
     const int n_used = hp.n_expert_used;
 
     ggml_tensor * x3   = ggml_reshape_3d(ctx, ffn_in, n_embd, 1, 1);
-    ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3,  slot_u);
-    ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3,  slot_g);
-    ggml_tensor * act  = swiglu_limited(ctx, gate, up, hp.swiglu_limit_exp(il));  // [ff_exp,n_used,1]
-    ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, slot_d); // [n_embd,n_used,1]
+    ggml_tensor * up   = ggml_mul_mat_id(ctx, ec_of(il)->up(il),   x3,  slot_u);
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, ec_of(il)->gate(il), x3,  slot_g);
+    ggml_tensor * act  = swiglu_limited(ctx, gate, up, hp.swiglu_limit_exp(il));              // [ff_exp,n_used,1]
+    ggml_tensor * experts = ggml_mul_mat_id(ctx, ec_of(il)->down(il), act, slot_d); // [n_embd,n_used,1]
 
     // weighted sum of the n_used experts as one GEMV
     ggml_tensor * et = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, experts, n_embd, n_used))); // [n_used,n_embd]
@@ -2188,8 +3629,7 @@ ggml_tensor * Runtime::Impl::build_moe_cached(ggml_context * ctx, ggml_cgraph * 
         ggml_tensor * g  = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), ffn_in);
         ggml_tensor * u  = ggml_mul_mat(ctx, up_sh, ffn_in);
         ggml_tensor * sh = ggml_mul_mat(ctx, W("blk.%d.ffn_down_shexp.weight", il),
-                                        swiglu_limited(ctx, g, u, hp.swiglu_limit_shexp(il)));
-        // step35 has no shared-expert gate and adds it unconditionally.
+                                        swiglu_ffn(ctx, g, u, hp.swiglu_limit_shexp(il)));
         if (ggml_tensor * gw = Wopt("blk.%d.ffn_gate_inp_shexp.weight", il))
             sh = ggml_mul(ctx, sh, ggml_sigmoid(ctx, ggml_mul_mat(ctx, gw, ffn_in)));
         moe_out = ggml_add(ctx, moe_out, sh);
@@ -2218,14 +3658,30 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     const int   T         = n_tokens;
     const int   n_kv      = n_past + T;
 
+    // qwen4exp: the residual carried between segments is hc streams wide, and
+    // the per-layer scatter weights ("inject") produced by seg A's second mixer
+    // have to reach seg B, so they join the double-buffered carries.
+    const bool hc_on = hp.has_hc();
+    const int  n_hc  = hc_on ? (int) hp.hc_count : 1;
+    if (hc_on && n_ovr > 0) {
+        throw std::runtime_error("image embeddings are not wired into the "
+                                 "hyper-connection residual yet");
+    }
+
     // temp carry tensors sized for this batch (bridge seg A->B and layer->layer).
     // ffn_in/resid/weights are double-buffered (parity by layer) so the fused
     // segB(L)+segA(L+1) graph has no write-after-read hazard (mirrors decode_cached).
     ggml_init_params tp{};
-    tp.mem_size = ggml_tensor_overhead() * 12 + 256;
+    tp.mem_size = ggml_tensor_overhead() * 16 + 256;
     tp.no_alloc = true;
     ggml_context * tctx = ggml_init(tp);
-    ggml_tensor * h_b       = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
+    ggml_tensor * h_b       = hc_on
+            ? ggml_new_tensor_3d(tctx, GGML_TYPE_F32, n_embd, n_hc, T)
+            : ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
+    ggml_tensor * inject_b  = hc_on ? ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_hc, T) : nullptr;
+    ggml_tensor * inject_b2 = hc_on ? ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_hc, T) : nullptr;
+    // the whole chunk's gathered n-gram rows, filled once on the host below
+    ggml_tensor * ple_b     = use_ple() ? ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T) : nullptr;
     ggml_tensor * ffn_in_b  = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
     ggml_tensor * resid_b   = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_embd, T);
     ggml_tensor * weights_b = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, n_used, T);
@@ -2245,7 +3701,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         return ggml_init(gp);
     };
     auto run = [&](ggml_context * ctx, ggml_cgraph * gf) {
-        if (!ggml_gallocr_alloc_graph(cache_galloc, gf))
+        if (!alloc_graph(cache_galloc, gf))
             throw std::runtime_error("decode_cached_batch: gallocr alloc failed");
     };
 
@@ -2256,12 +3712,28 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_tensor * inp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
         ggml_set_input(inp); ggml_set_name(inp, "inp_tok");
         ggml_tensor * emb = ggml_get_rows(ctx, model.tok_embd_rows(), inp);  // [n_embd, T]
+        if (hc_on) {
+            // the wide residual starts as hc identical copies of the embedding
+            emb = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, emb, n_embd, 1, T),
+                                 n_embd, n_hc, T, 1);
+        }
         ggml_build_forward_expand(gf, ggml_cpy(ctx, emb, h_b));
         run(ctx, gf);
         ggml_backend_tensor_set(inp, toks, 0, T * sizeof(int32_t));
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+        if (compute_graph(gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("decode_cached_batch: embed compute failed");
         ggml_free(ctx);
+    }
+
+    // The n-gram rows for the whole chunk in one host pass: every index is known
+    // before any graph runs, so the misses go to disk in file order (see
+    // NgramTable::gather) instead of one scattered read per seg A slice.
+    if (ple_b) {
+        ngram_rows.clear();
+        ngram->hash_rows(toks, T, ngram_hist, ngram_rows);
+        ngram_embd.resize(ngram_rows.size() * hp.ple_head_dim);
+        ngram->gather(ngram_rows.data(), ngram_rows.size(), ngram_embd.data());
+        ggml_backend_tensor_set(ple_b, ngram_embd.data(), 0, ggml_nbytes(ple_b));
     }
 
     // vision: overwrite the image-span rows of the embed output with the
@@ -2277,6 +3749,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     ggml_tensor * carry_ffn[2] = { ffn_in_b,  ffn_in_b2  };
     ggml_tensor * carry_res[2] = { resid_b,   resid_b2   };
     ggml_tensor * carry_wgt[2] = { weights_b, weights_b2 };
+    ggml_tensor * carry_inj[2] = { inject_b,  inject_b2  };
 
     // Append seg A (attention/GDN + router) for layer `il` over the token slice
     // [tc0, tc0+tlen) of the chunk; writes that slice of the layer's parity carry
@@ -2284,38 +3757,53 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     // lands at n_past+tc0 and the causal mask covers n_kv_c columns, so a layer's
     // sub-chunks processed in order are equivalent to one full-chunk pass (GDN
     // states likewise chain across sub-chunks).
+    // one per seg A call: each builds its own graph, so nothing is shared across them
     auto build_segA = [&](ggml_context * ctx, ggml_cgraph * gf, int il, int tc0, int tlen) -> ggml_tensor * {
+        QsaShared qsa;
         auto tslice = [&](ggml_tensor * t) {   // token-dim slice view [ne0, tlen]
             return ggml_view_2d(ctx, t, t->ne[0], tlen, t->nb[1], (size_t) tc0 * t->nb[1]);
         };
+        // the wide residual has tokens on ne[2], so it slices one dimension over
+        auto hslice = [&](ggml_tensor * t) {
+            return hc_on ? ggml_view_3d(ctx, t, n_embd, n_hc, tlen,
+                                        t->nb[1], t->nb[2], (size_t) tc0 * t->nb[2])
+                         : tslice(t);
+        };
         const int n_kv_c = n_past + tc0 + tlen;
-        const int n_head_l    = (int) hp.head_count(il);      // per-layer on step35
-        const int n_head_kv_l = (int) hp.head_count_kv(il);
+        const int n_head    = (int) hp.head_count(il);       // per-layer on step35
+        const int n_head_kv = (int) hp.head_count_kv(il);
         const bool recurrent = hp.is_recurrent(il);
         ggml_tensor * inp_pos = nullptr, * inp_mask = nullptr;
         if (!recurrent) {
             inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rope_dim(tlen));
             ggml_set_input(inp_pos);  ggml_set_name(inp_pos, "inp_pos");
-            // One graph per layer here, so the layer's attention type picks the
-            // input name and fill_masks() then uploads the matching mask.
-            if (hp.is_swa(il)) {
-                inp_mask = new_swa_inputs(ctx, tlen, n_kv_c);
-            } else {
-                inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv_c, tlen);
-                ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
-                ring_idx = nullptr;
-            }
+            // one graph per layer here, so the layer's attention type picks
+            // the input name and fill_masks() then uploads the matching mask
+            inp_mask = new_layer_mask(ctx, il, tlen, n_kv_c);
         }
 
-        ggml_tensor * h_c = tslice(h_b);
-        // h_c is a view of the persistent carry buffer, which this same graph
-        // overwrites with the layer's output -- dumping it directly would read
-        // back l_out. Copy it when (and only when) the dump is on.
-        // ...and the copy has to be forced into the graph, or it is never computed.
-        if (dump_wants(il))
-            ggml_build_forward_expand(gf, dbg(ggml_cont(ctx, h_c), "attn_norm_in", il));
-        ggml_tensor * cur = ggml_rms_norm(ctx, h_c, eps);
-        cur = dbg(ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il)), "attn_norm", il);
+        ggml_tensor * h_c = hslice(h_b);
+        ggml_tensor * res_hc = nullptr, * inject = nullptr;
+        ggml_tensor * cur;
+        if (hc_on) {
+            res_hc = h_c;
+            if (ple_b && hp.is_ple(il)) {
+                res_hc = build_ple(ctx, gf, il, res_hc, tslice(ple_b), tlen);
+            }
+            cur = build_hc_mix(ctx, res_hc,
+                    W("blk.%d.hc_attn_norm.weight",   il),
+                    W("blk.%d.hc_attn_down.weight",   il),
+                    W("blk.%d.hc_attn_up.weight",     il),
+                    W("blk.%d.hc_attn_inject.weight", il), &inject);
+        } else {
+            // h_c is a view of the carry this graph overwrites with the layer's
+            // output, so dumping it directly would read back l_out: copy it, and
+            // force the copy into the graph, only when the dump is on.
+            if (dump_wants(il))
+                ggml_build_forward_expand(gf, dbg(ggml_cont(ctx, h_c), "attn_norm_in", il));
+            cur = ggml_rms_norm(ctx, h_c, eps);
+            cur = dbg(ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il)), "attn_norm", il);
+        }
 
         if (recurrent) {
             cur = build_gdn(ctx, gf, il, cur, tlen);
@@ -2324,85 +3812,75 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             if (gated) {
                 ggml_tensor * Qf = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur);
                 const size_t es = ggml_element_size(Qf);
-                Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head_l, tlen,
-                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head_l, 0);
-                gate_t = ggml_view_3d(ctx, Qf, n_embd_head, n_head_l, tlen,
-                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head_l, es * n_embd_head);
-                gate_t = ggml_cont_2d(ctx, gate_t, n_embd_head * n_head_l, tlen);
+                Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head, tlen,
+                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head, 0);
+                gate_t = ggml_view_3d(ctx, Qf, n_embd_head, n_head, tlen,
+                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head, es * n_embd_head);
+                gate_t = ggml_cont_2d(ctx, gate_t, n_embd_head * n_head, tlen);
                 K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
                 V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
-                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv_l, tlen);
-                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv_l, tlen);
+                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, tlen);
+                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, tlen);
             } else {
-                Q = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur), "Qcur", il);
-                K = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur), "Kcur", il);
-                V = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur), "Vcur", il);
-                Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head_l,    tlen);
-                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv_l, tlen);
-                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv_l, tlen);
+                Q = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur);
+                K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
+                V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
+                Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head,    tlen);
+                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, tlen);
+                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, tlen);
             }
-            Q = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il)), "Qcur_normed", il);
-            K = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il)), "Kcur_normed", il);
-            Q = dbg(apply_rope(ctx, Q, inp_pos, il), "Qcur_pos", il);
-            K = dbg(apply_rope(ctx, K, inp_pos, il), "Kcur_pos", il);
-            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, tlen, n_kv_c, n_past + tc0);
+            Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il));
+            K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il));
+            Q = apply_rope(ctx, Q, inp_pos, il);
+            K = apply_rope(ctx, K, inp_pos, il);
+            ggml_tensor * m = build_qsa_mask(ctx, gf, il, cur, inp_pos, inp_mask,
+                                             tlen, n_kv_c, n_past + tc0, qsa);
+            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, m, tlen, n_kv_c, n_past + tc0);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
-            dbg(att, "attn_out", il);
-            att = dbg(apply_attn_gate(ctx, il, att, cur, n_head_l, tlen), "attn_gated", il);
-            cur = dbg(ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att), "attn_proj", il);
+            att = apply_attn_gate(ctx, il, att, cur, n_head, tlen);
+            cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
         }
 
-        ggml_tensor * attn_resid = dbg(ggml_add(ctx, cur, h_c), "ffn_inp", il);   // [n_embd, tlen]
+        ggml_tensor * attn_resid = nullptr;
         ggml_tensor * ffn_in;
-        if (gated) ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", il));
-        else       ffn_in = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il)), "ffn_norm", il);
-
-        // Leading dense block (step35 blk.0-2): no routed experts, so the layer
-        // finishes here and its seg B is skipped entirely. Returning nullptr is
-        // how the drivers below learn there is nothing to fetch.
-        if (!hp.is_moe_layer(il)) {
-            ggml_tensor * gt = ggml_mul_mat(ctx, W("blk.%d.ffn_gate.weight", il), ffn_in);
-            ggml_tensor * up = ggml_mul_mat(ctx, W("blk.%d.ffn_up.weight",   il), ffn_in);
-            ggml_tensor * ff = ggml_mul_mat(ctx, W("blk.%d.ffn_down.weight", il),
-                                            swiglu_limited(ctx, gt, up, hp.swiglu_limit_exp(il)));
-            dbg(ff, "ffn_out", il);
-            ggml_tensor * h_new = dbg(ggml_add(ctx, ff, attn_resid), "l_out", il);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, tslice(h_b)));
-            return (ggml_tensor *) nullptr;
+        if (hc_on) {
+            res_hc = build_hc_combine(ctx, res_hc, cur, inject);
+            ffn_in = build_hc_mix(ctx, res_hc,
+                    W("blk.%d.hc_ffn_norm.weight",   il),
+                    W("blk.%d.hc_ffn_down.weight",   il),
+                    W("blk.%d.hc_ffn_up.weight",     il),
+                    W("blk.%d.hc_ffn_inject.weight", il), &inject);
+            // seg B resumes from the residual as it stands after attention
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, res_hc, hslice(h_b)));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, inject, tslice(carry_inj[il & 1])));
+        } else {
+            attn_resid = dbg(ggml_add(ctx, cur, h_c), "ffn_inp", il);   // [n_embd, tlen]
+            if (gated) ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", il));
+            else       ffn_in = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il)), "ffn_norm", il);
+            // A leading dense block (step35, lfm2moe) has no routed experts: the
+            // layer finishes here and seg B is skipped. Returning nullptr is how
+            // the drivers below learn there is nothing to fetch.
+            if (!hp.is_moe_layer(il)) {
+                ggml_tensor * ff    = dbg(build_dense_ffn(ctx, il, ffn_in), "ffn_out", il);
+                ggml_tensor * h_new = dbg(ggml_add(ctx, ff, attn_resid), "l_out", il);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, tslice(h_b)));
+                return (ggml_tensor *) nullptr;
+            }
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, tslice(carry_res[il & 1])));
         }
 
         // multi-token router
         ggml_tensor * logits = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp.weight", il), ffn_in);  // [n_exp, tlen]
-        // Same routing as build_moe / build_router: sigmoid + selection bias on
-        // step35, softmax elsewhere. All four copies have to agree or the paths
-        // silently pick different experts.
-        ggml_tensor * probs = hp.expert_gating_func == 2 ? ggml_sigmoid(ctx, logits)
-                                                        : ggml_soft_max(ctx, logits);
-        dbg(logits, "ffn_moe_logits", il);
-        dbg(probs,  "ffn_moe_probs",  il);
-        ggml_tensor * rank  = probs;
-        if (ggml_tensor * bias = Wopt("blk.%d.exp_probs_b.bias", il))
-            rank = dbg(ggml_add(ctx, probs, bias), "ffn_moe_probs_biased", il);
+        const Route rt = route_experts(ctx, il, logits, nullptr, tlen);
         // argsort_top_k returns a STRIDED view (nb[1] = n_exp*4); make it contiguous
         // so the [n_used, tlen] host readback (ggml_backend_tensor_get) is not corrupted
         // for columns >= 1 (it ignores strides). Single-token path is T=1 so unaffected.
-        ggml_tensor * selected = ggml_cont(ctx, ggml_argsort_top_k(ctx, rank, n_used));  // [n_used, tlen]
-        ggml_tensor * probs3  = ggml_reshape_3d(ctx, probs, 1, n_exp, tlen);
-        ggml_tensor * weights = ggml_get_rows(ctx, probs3, selected);             // [1, n_used, tlen]
-        weights = ggml_reshape_2d(ctx, weights, n_used, tlen);
-        if (hp.arch != Arch::STEP35 || hp.expert_weights_norm) {
-            ggml_tensor * wsum = ggml_sum_rows(ctx, weights);
-            wsum = ggml_clamp(ctx, wsum, 6.103515625e-5f, INFINITY);
-            weights = ggml_div(ctx, weights, wsum);
-        }
-        if (hp.expert_weights_scale != 0.0f && hp.expert_weights_scale != 1.0f)
-            weights = ggml_scale(ctx, weights, hp.expert_weights_scale);
-        dbg(weights, "ffn_moe_weights_scaled", il);
+        ggml_tensor * selected = ggml_cont(ctx, rt.selected);                     // [n_used, tlen]
+        ggml_tensor * weights  = ggml_reshape_2d(ctx, rt.weights, n_used, tlen);
         ggml_set_output(selected);
         ggml_build_forward_expand(gf, selected);
 
         ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, tslice(carry_ffn[il & 1])));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, tslice(carry_res[il & 1])));
         ggml_build_forward_expand(gf, ggml_cpy(ctx, weights, tslice(carry_wgt[il & 1])));
         return selected;
     };
@@ -2418,10 +3896,10 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         };
         ggml_tensor * ffn_l = tslice(carry_ffn[il & 1]);
         ggml_tensor * x3   = ggml_reshape_3d(ctx, ffn_l, n_embd, 1, len);
-        ggml_tensor * up   = ggml_mul_mat_id(ctx, ecache->up(il),   x3, tslice(slot_u_b));
-        ggml_tensor * gate = ggml_mul_mat_id(ctx, ecache->gate(il), x3, tslice(slot_g_b));
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, ec_of(il)->up(il),   x3, tslice(slot_u_b));
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, ec_of(il)->gate(il), x3, tslice(slot_g_b));
         ggml_tensor * act  = swiglu_limited(ctx, gate, up, hp.swiglu_limit_exp(il));
-        ggml_tensor * experts = ggml_mul_mat_id(ctx, ecache->down(il), act, tslice(slot_d_b)); // [n_embd, n_used, len]
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, ec_of(il)->down(il), act, tslice(slot_d_b)); // [n_embd, n_used, len]
         experts = ggml_mul(ctx, experts, ggml_reshape_3d(ctx, tslice(carry_wgt[il & 1]), 1, n_used, len));
         ggml_tensor * moe_out = nullptr;
         for (int i = 0; i < n_used; ++i) {
@@ -2435,15 +3913,21 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             ggml_tensor * g  = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), ffn_l);
             ggml_tensor * u  = ggml_mul_mat(ctx, up_sh, ffn_l);
             ggml_tensor * sh = ggml_mul_mat(ctx, W("blk.%d.ffn_down_shexp.weight", il),
-                                            swiglu_limited(ctx, g, u, hp.swiglu_limit_shexp(il)));
-            // step35 has no shared-expert gate and adds it unconditionally.
+                                            swiglu_ffn(ctx, g, u, hp.swiglu_limit_shexp(il)));
             if (ggml_tensor * gw = Wopt("blk.%d.ffn_gate_inp_shexp.weight", il))
                 sh = ggml_mul(ctx, sh, ggml_sigmoid(ctx, ggml_mul_mat(ctx, gw, ffn_l)));
-            dbg(sh, "ffn_shared_out", il);
-            moe_out = dbg(ggml_add(ctx, moe_out, sh), "ffn_out", il);
+            moe_out = ggml_add(ctx, moe_out, sh);
         }
-        ggml_tensor * h_new = dbg(ggml_add(ctx, moe_out, tslice(carry_res[il & 1])), "l_out", il);  // [n_embd, len]
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, tslice(h_b)));
+        if (hc_on) {
+            ggml_tensor * res_hc = ggml_view_3d(ctx, h_b, n_embd, n_hc, len,
+                    h_b->nb[1], h_b->nb[2], (size_t) t0 * h_b->nb[2]);
+            ggml_tensor * h_new = build_hc_combine(ctx, res_hc, moe_out,
+                                                   tslice(carry_inj[il & 1]));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, res_hc));
+        } else {
+            ggml_tensor * h_new = dbg(ggml_add(ctx, moe_out, tslice(carry_res[il & 1])), "l_out", il);  // [n_embd, len]
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, tslice(h_b)));
+        }
     };
 
     // Set the attention pos/mask inputs of a graph (no-op for GDN-only graphs)
@@ -2464,6 +3948,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             }
         }
         fill_masks(gf, tlen, n_past + tc0 + tlen, n_past + tc0);
+        set_qsa_inputs(gf, tlen, n_past + tc0 + tlen, n_past + tc0);
     };
 
     // QWEN_PREFILL_STATS=1 logs, per (chunk,layer), the distinct-expert union and
@@ -2471,10 +3956,13 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     // plan_slices() below flips quota enforcement per layer; restore whatever
     // the caller had on the way out so a batch cannot leave the mode changed.
     struct QuotaScope {
-        ExpertCache * c; bool prev;
-        explicit QuotaScope(ExpertCache * cc) : c(cc), prev(cc->quotas_active()) {}
-        ~QuotaScope() { c->set_quotas(prev); }
-    } quota_scope(ecache.get());
+        std::vector<ExpertCache *> cs;
+        std::vector<char>          prev;
+        explicit QuotaScope(std::vector<ExpertCache *> v) : cs(std::move(v)) {
+            for (auto * c : cs) prev.push_back((char) c->quotas_active());
+        }
+        ~QuotaScope() { for (size_t i = 0; i < cs.size(); ++i) cs[i]->set_quotas(prev[i] != 0); }
+    } quota_scope(all_ecaches());
 
     static const bool pf_stats = getenv("QWEN_PREFILL_STATS") != nullptr;
     static int      pf_chunk_id = 0;
@@ -2516,12 +4004,12 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         // A batch that does fit (MTP verify, T=2) keeps its quota, so it cannot
         // evict the decode palette. Deciding here rather than at the call site
         // makes prefill and verify come out right without either knowing.
-        ecache->set_quotas(plan_union <= ecache->quota_of(il) - 8);
+        ec_of(il)->set_quotas(plan_union <= ec_of(il)->quota_of(il) - 8);
 
         // Pass 2: cut the chunk so no single ensure() references more distinct
         // experts than the capacity now in force (it would evict its own slots).
         slices.clear();
-        const int cap = std::max(n_used, ecache->capacity(il) - 8);
+        const int cap = std::max(n_used, ec_of(il)->capacity(il) - 8);
         std::fill(seen.begin(), seen.end(), 0);
         int distinct = 0, t0 = 0;
         for (int t = 0; t < T; ++t) {
@@ -2548,7 +4036,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     // Make the slice's selected experts resident and upload its slot-id rows.
     auto ensure_slice = [&](int il, int t0, int len) {
         const size_t off = (size_t) t0 * n_used;
-        ecache->ensure(il, sel.data() + off, n_used * len,
+        ec_of(il)->ensure(il, sel.data() + off, n_used * len,
                        sg.data() + off, su.data() + off, sd.data() + off);
         const size_t ob = off * sizeof(int32_t), nb = (size_t) n_used * len * sizeof(int32_t);
         ggml_backend_tensor_set(slot_g_b, sg.data() + off, ob, nb);
@@ -2560,7 +4048,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
 
     auto log_layer = [&](int il, int nsl, const ExpertCache::Stats & s0) {
         if (!pf_stats) return;
-        const auto s1 = ecache->stats();
+        const auto s1 = ec_stats_sum();
         fprintf(stderr, "prefill-stats: chunk=%d T=%d layer=%d union=%d/%d slices=%d miss=%llu fetch_mb=%.1f fetch_ms=%.1f\n",
                 pf_chunk, T, il, plan_union, n_exp, nsl,
                 (unsigned long long) (s1.misses - s0.misses),
@@ -2600,9 +4088,9 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         for (int e = 0; e < n_exp; ++e) {
             if (mass[e] <= 0.0) continue;
             total += mass[e];
-            const bool res = ecache->resident(ExpertCache::GATE, il, e) &&
-                             ecache->resident(ExpertCache::UP,   il, e) &&
-                             ecache->resident(ExpertCache::DOWN, il, e);
+            const bool res = ec_of(il)->resident(ExpertCache::GATE, il, e) &&
+                             ec_of(il)->resident(ExpertCache::UP,   il, e) &&
+                             ec_of(il)->resident(ExpertCache::DOWN, il, e);
             if (!res) cands.push_back({ e, mass[e] });
         }
         std::sort(cands.begin(), cands.end(),
@@ -2661,6 +4149,33 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                     pf_chunk, il, n_drop, total > 0.0 ? dropped / total : 0.0);
     };
 
+    // QWEN_NAN_CHECK=1: read the running hidden state back after every layer and
+    // report the first one that is not finite. A NaN anywhere in a 48-layer
+    // stack reaches the logits as a uniform NaN, which says nothing about where
+    // it started; this says which layer.
+    static const bool nan_check = getenv("QWEN_NAN_CHECK") != nullptr;
+    bool nan_seen = false;
+    std::vector<float> nan_buf;
+    auto check_nan = [&](int il, const char * where) {
+        if (!nan_check) return;
+        nan_buf.resize(ggml_nelements(h_b));
+        ggml_backend_tensor_get(h_b, nan_buf.data(), 0, ggml_nbytes(h_b));
+        float mx = 0.0f;
+        size_t bad = (size_t) -1;
+        for (size_t i = 0; i < nan_buf.size(); ++i) {
+            const float v = nan_buf[i];
+            if (!std::isfinite(v)) { if (bad == (size_t) -1) bad = i; continue; }
+            mx = std::max(mx, std::fabs(v));
+        }
+        fprintf(stderr, "nan-check: layer %2d after %s  max|h|=%.4g  recr=%d",
+                il, where, mx, (int) hp.is_recurrent(il));
+        if (bad != (size_t) -1) {
+            fprintf(stderr, "  FIRST NON-FINITE at [%zu] = %g", bad, nan_buf[bad]);
+        }
+        fprintf(stderr, "\n");
+        if (bad != (size_t) -1) nan_seen = true;
+    };
+
     if (T > sega_chunk) {
         // ---- Layer-major prefill: for each layer, run seg A over attention-sized
         // token sub-chunks (KV/GDN state chains within the layer), then seg B once
@@ -2675,7 +4190,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                 ggml_tensor * selected = build_segA(ctx, gf, il, tc0, tlen);
                 run(ctx, gf);
                 set_attn_inputs(gf, tc0, tlen);
-                if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+                if (compute_graph(gf) != GGML_STATUS_SUCCESS)
                     throw std::runtime_error("decode_cached_batch: seg A compute failed");
                 dump_flush("segA");
                 if (selected)
@@ -2683,20 +4198,21 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                                             (size_t) n_used * tlen * sizeof(int32_t));
                 ggml_free(ctx);
             }
+            check_nan(il, "seg A");
             if (!hp.is_moe_layer(il)) continue;   // dense block: seg A finished it
             prune_layer(il);
             plan_slices(il);
-            const auto s0 = ecache->stats();
+            const auto s0 = ec_stats_sum();
             const int nsl = (int) slices.size();
             // Prefetch the layer's whole union with one ensure() when it fits
             // the pool: the per-slice ensures below then only hit, so the SSD
             // sweep happens once per layer as one dense coalesced read instead
             // of sparse per-slice residual fetches (which re-read the tensor).
-            if (nsl > 1 && plan_union <= ecache->capacity(il) - 8) {
+            if (nsl > 1 && plan_union <= ec_of(il)->capacity(il) - 8) {
                 pre_g.resize(plan_list.size());
                 pre_u.resize(plan_list.size());
                 pre_d.resize(plan_list.size());
-                ecache->ensure(il, plan_list.data(), (int) plan_list.size(),
+                ec_of(il)->ensure(il, plan_list.data(), (int) plan_list.size(),
                                pre_g.data(), pre_u.data(), pre_d.data());
             }
             for (int k = 0; k < nsl; ++k) {
@@ -2706,12 +4222,13 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                 ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
                 build_segB(ctx, gf, il, st0, slen);
                 run(ctx, gf);
-                if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+                if (compute_graph(gf) != GGML_STATUS_SUCCESS)
                     throw std::runtime_error("decode_cached_batch: seg B compute failed");
                 dump_flush("segB");
                 ggml_free(ctx);
             }
             log_layer(il, nsl, s0);
+            check_nan(il, "seg B");
         }
     } else {
     // seg A(0) on its own, then fuse segB(L)+segA(L+1) per step so each layer
@@ -2723,9 +4240,9 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_tensor * selected = build_segA(ctx, gf, 0, 0, T);
         run(ctx, gf);
         set_attn_inputs(gf, 0, T);
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+        if (compute_graph(gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("decode_cached_batch: seg A0 compute failed");
-                dump_flush("segA");
+        dump_flush("segA");
         if (selected)
             ggml_backend_tensor_get(selected, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
         ggml_free(ctx);
@@ -2734,13 +4251,14 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         if (!hp.is_moe_layer(il)) {
             // Dense block: seg A already finished it, so there is no seg B to
             // fuse the next layer's seg A onto -- run that one on its own.
+            check_nan(il, "seg A");
             if (il + 1 < N) {
                 ggml_context * ctx = new_ctx();
                 ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
                 ggml_tensor * nsel = build_segA(ctx, gf, il + 1, 0, T);
                 run(ctx, gf);
                 set_attn_inputs(gf, 0, T);
-                if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+                if (compute_graph(gf) != GGML_STATUS_SUCCESS)
                     throw std::runtime_error("decode_cached_batch: dense seg A compute failed");
                 dump_flush("segA");
                 if (nsel)
@@ -2750,7 +4268,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             continue;
         }
         plan_slices(il);
-        const auto s0 = ecache->stats();
+        const auto s0 = ec_stats_sum();
         const int nsl = (int) slices.size();
         for (int k = 0; k < nsl; ++k) {
             const auto [st0, slen] = slices[k];
@@ -2761,14 +4279,15 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             ggml_tensor * nsel = (k == nsl - 1 && il + 1 < N) ? build_segA(ctx, gf, il + 1, 0, T) : nullptr;
             run(ctx, gf);
             set_attn_inputs(gf, 0, T);
-            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+            if (compute_graph(gf) != GGML_STATUS_SUCCESS)
                 throw std::runtime_error("decode_cached_batch: fused segB/segA compute failed");
-                dump_flush("segBA");
+            dump_flush("segBA");
             if (nsel)
                 ggml_backend_tensor_get(nsel, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
             ggml_free(ctx);
         }
         log_layer(il, nsl, s0);
+        check_nan(il, "seg B");
     }
     }
 
@@ -2793,22 +4312,31 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     if (want_logits) {
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-        ggml_tensor * last = ggml_view_2d(ctx, h_b, n_embd, 1, h_b->nb[1], (size_t) (T - 1) * h_b->nb[1]);
-        ggml_tensor * cur = ggml_rms_norm(ctx, last, eps);
-        cur = dbg(ggml_mul(ctx, cur, model.tensor("output_norm.weight")), "result_norm", -1);
-        ggml_tensor * output_w = model.tensor("output.weight");
-        if (!output_w) output_w = model.tensor("token_embd.weight");
+        ggml_tensor * cur;
+        if (hc_on) {
+            // the final mixer is the output norm; qwen4exp carries no other one
+            ggml_tensor * last = ggml_view_3d(ctx, h_b, n_embd, n_hc, 1,
+                    h_b->nb[1], h_b->nb[2], (size_t) (T - 1) * h_b->nb[2]);
+            cur = build_hc_mix(ctx, last,
+                    model.tensor("output_hc_norm.weight"),
+                    model.tensor("output_hc_down.weight"),
+                    model.tensor("output_hc_up.weight"), nullptr, nullptr);
+        } else {
+            ggml_tensor * last = ggml_view_2d(ctx, h_b, n_embd, 1, h_b->nb[1],
+                                              (size_t) (T - 1) * h_b->nb[1]);
+            cur = ggml_rms_norm(ctx, last, eps);
+            cur = ggml_mul(ctx, cur, out_norm_w());
+        }
+        ggml_tensor * output_w = out_proj_w();
         cur = ggml_mul_mat(ctx, output_w, cur);
         ggml_set_name(cur, "logits");
         ggml_build_forward_expand(gf, cur);
         run(ctx, gf);
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+        if (compute_graph(gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("decode_cached_batch: output compute failed");
         const int n_vocab = (int) cur->ne[0];
         logits.resize(n_vocab);
         ggml_backend_tensor_get(cur, logits.data(), 0, n_vocab * sizeof(float));
-        dbg(cur, "result_output", -1);
-        dump_flush("out");
         ggml_free(ctx);
     }
 
@@ -2824,15 +4352,14 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
         ggml_tensor * cur = ggml_rms_norm(ctx, h_b, eps);                        // [n_embd, T]
-        cur = ggml_mul(ctx, cur, model.tensor("output_norm.weight"));
-        ggml_tensor * output_w = model.tensor("output.weight");
-        if (!output_w) output_w = model.tensor("token_embd.weight");
+        cur = ggml_mul(ctx, cur, out_norm_w());
+        ggml_tensor * output_w = out_proj_w();
         cur = ggml_mul_mat(ctx, output_w, cur);                                 // [n_vocab, T]
         ggml_tensor * am = ggml_argmax(ctx, cur);                               // [T] i32
         ggml_set_name(am, "verify_argmax");
         ggml_build_forward_expand(gf, am);
         run(ctx, gf);
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+        if (compute_graph(gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("decode_cached_batch: verify output compute failed");
         vA.assign(T, 0);
         ggml_backend_tensor_get(am, vA.data(), 0, T * sizeof(int32_t));
@@ -2859,12 +4386,12 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     const auto & hp = model.hparams();
     const int n_embd      = hp.n_embd;
     const int n_used      = hp.n_expert_used;
-    const int n_head      = hp.n_head;
-    const int n_head_kv   = hp.n_head_kv;
     const int n_embd_head = hp.n_embd_head;
     const float eps       = hp.rms_eps;
     const bool  gated     = hp.has_gdn;
     const int   n_kv      = n_past + 1;
+    const bool  hc_on     = hp.has_hc();
+    const int   n_hc      = hc_on ? (int) hp.hc_count : 1;
 
     auto new_ctx = [&]() {
         ggml_init_params gp{};
@@ -2872,15 +4399,21 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         gp.no_alloc = true;
         return ggml_init(gp);
     };
-    auto run = [&](ggml_context * ctx, ggml_cgraph * gf) {
-        if (!ggml_gallocr_alloc_graph(cache_galloc, gf))
+    // Every segment graph here touches exactly one device -- the layer's weights,
+    // KV rows, expert pool and carries all live together -- so it is allocated
+    // and run directly on that device. Going through the scheduler instead would
+    // re-plan the graph and synchronize per segment, which at one token per
+    // graph costs far more than the segment computes.
+    auto run = [&](ggml_context * ctx, ggml_cgraph * gf, int dev) {
+        if (!ggml_gallocr_alloc_graph(cache_gallocs[(size_t) dev], gf))
             throw std::runtime_error("decode_cached: gallocr alloc failed");
     };
     const bool prof_dc = getenv("QWEN_PROF_DC") != nullptr;
     auto wall0 = std::chrono::steady_clock::now();
-    auto compute = [&](ggml_cgraph * gf, const char * msg) {
+    auto compute = [&](ggml_cgraph * gf, int dev, const char * msg) {
         auto t = std::chrono::steady_clock::now();
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+        ggml_backend_t be = gpus.empty() ? backend : gpus[(size_t) dev];
+        if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error(std::string("decode_cached: ") + msg);
         if (prof_dc) dc_gpu_ms += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t).count();
@@ -2896,42 +4429,66 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         ggml_tensor * inp = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
         ggml_set_input(inp); ggml_set_name(inp, "inp_tok");
         ggml_tensor * emb = ggml_get_rows(ctx, model.tok_embd_rows(), inp);  // [n_embd,1]
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, emb, n_embd), p_h));
-        run(ctx, gf);
+        emb = hp.has_hc()
+                ? ggml_repeat_4d(ctx, ggml_reshape_2d(ctx, emb, n_embd, 1), n_embd, hp.hc_count, 1, 1)
+                : ggml_reshape_1d(ctx, emb, n_embd);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, emb, p_h));
+        run(ctx, gf, 0);
         ggml_backend_tensor_set(inp, &token, 0, sizeof(int32_t));
-        compute(gf, "embed compute failed");
+        compute(gf, 0, "embed compute failed");
         ggml_free(ctx);
+    }
+
+    if (p_ple) {
+        ngram_rows.clear();
+        ngram->hash_rows(&token, 1, ngram_hist, ngram_rows);
+        ngram_embd.resize(ngram_rows.size() * hp.ple_head_dim);
+        ngram->gather(ngram_rows.data(), ngram_rows.size(), ngram_embd.data());
+        ggml_backend_tensor_set(p_ple, ngram_embd.data(), 0, ggml_nbytes(p_ple));
     }
 
     std::vector<int32_t> sel(n_used), slot_g(n_used), slot_u(n_used), slot_d(n_used);
 
     // Double-buffered carry tensors (parity by layer) so a fused segB(L)+segA(L+1)
-    // graph has no write-after-read hazard on the carry buffers.
-    ggml_tensor * carry_ffn[2] = { p_ffn_in, p_ffn_in2 };
-    ggml_tensor * carry_res[2] = { p_resid,  p_resid2  };
-    ggml_tensor * carry_wgt[2] = { p_weights, p_weights2 };
+    // graph has no write-after-read hazard on the carry buffers. These read the
+    // p_* members at call time, so they follow use_carry() to the right device.
+    auto carry_ffn = [&](int il) { return (il & 1) ? p_ffn_in2  : p_ffn_in;  };
+    auto carry_res = [&](int il) { return (il & 1) ? p_resid2   : p_resid;   };
+    auto carry_wgt = [&](int il) { return (il & 1) ? p_weights2 : p_weights; };
+    auto carry_inj = [&](int il) { return (il & 1) ? p_inject2  : p_inject;  };
 
     // Append seg A (attention/GDN + router) for layer `il` to (ctx,gf). Writes the
     // normed FFN input / residual / router weights into the layer's parity carry,
     // and exposes `selected` (router top-k) for host readback. Returns selected.
     auto build_segA = [&](ggml_context * ctx, ggml_cgraph * gf, int il) -> ggml_tensor * {
-        const int n_head_l    = (int) hp.head_count(il);      // per-layer on step35
-        const int n_head_kv_l = (int) hp.head_count_kv(il);
+        QsaShared qsa;
+        const int n_head    = (int) hp.head_count(il);       // per-layer on step35
+        const int n_head_kv = (int) hp.head_count_kv(il);
         const bool recurrent = hp.is_recurrent(il);
         ggml_tensor * inp_pos = nullptr, * inp_mask = nullptr;
         if (!recurrent) {
             inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rope_dim(1));
             ggml_set_input(inp_pos);  ggml_set_name(inp_pos, "inp_pos");
-            if (hp.is_swa(il)) {
-                inp_mask = new_swa_inputs(ctx, 1, n_kv);
-            } else {
-                inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, 1);
-                ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
-                ring_idx = nullptr;
-            }
+            inp_mask = new_layer_mask(ctx, il, 1, n_kv);
         }
-        ggml_tensor * cur = ggml_rms_norm(ctx, p_h, eps);
-        cur = ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il));
+        ggml_tensor * res_hc = nullptr, * inject = nullptr;
+        ggml_tensor * cur;
+        if (hc_on) {
+            res_hc = ggml_reshape_3d(ctx, p_h, n_embd, n_hc, 1);
+            if (p_ple && hp.is_ple(il)) {
+                res_hc = build_ple(ctx, gf, il, res_hc, p_ple, 1);
+            }
+            cur = build_hc_mix(ctx, res_hc,
+                    W("blk.%d.hc_attn_norm.weight",   il),
+                    W("blk.%d.hc_attn_down.weight",   il),
+                    W("blk.%d.hc_attn_up.weight",     il),
+                    W("blk.%d.hc_attn_inject.weight", il), &inject);
+        } else {
+            if (dump_wants(il))
+                ggml_build_forward_expand(gf, dbg(ggml_cont(ctx, p_h), "attn_norm_in", il));
+            cur = ggml_rms_norm(ctx, p_h, eps);
+            cur = dbg(ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il)), "attn_norm", il);
+        }
         if (recurrent) {
             cur = build_gdn(ctx, gf, il, cur, 1);
         } else {
@@ -2939,59 +4496,81 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             if (gated) {
                 ggml_tensor * Qf = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur);
                 const size_t es = ggml_element_size(Qf);
-                Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head_l, 1,
-                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head_l, 0);
-                gate_t = ggml_view_3d(ctx, Qf, n_embd_head, n_head_l, 1,
-                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head_l, es * n_embd_head);
-                gate_t = ggml_cont_2d(ctx, gate_t, n_embd_head * n_head_l, 1);
+                Q = ggml_view_3d(ctx, Qf, n_embd_head, n_head, 1,
+                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head, 0);
+                gate_t = ggml_view_3d(ctx, Qf, n_embd_head, n_head, 1,
+                        es * n_embd_head * 2, es * n_embd_head * 2 * n_head, es * n_embd_head);
+                gate_t = ggml_cont_2d(ctx, gate_t, n_embd_head * n_head, 1);
                 K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
                 V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
-                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv_l, 1);
-                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv_l, 1);
+                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, 1);
+                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, 1);
             } else {
                 Q = ggml_mul_mat(ctx, W("blk.%d.attn_q.weight", il), cur);
                 K = ggml_mul_mat(ctx, W("blk.%d.attn_k.weight", il), cur);
                 V = ggml_mul_mat(ctx, W("blk.%d.attn_v.weight", il), cur);
-                Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head_l,    1);
-                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv_l, 1);
-                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv_l, 1);
+                Q = ggml_reshape_3d(ctx, Q, n_embd_head, n_head,    1);
+                K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, 1);
+                V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, 1);
             }
             Q = ggml_mul(ctx, ggml_rms_norm(ctx, Q, eps), W("blk.%d.attn_q_norm.weight", il));
             K = ggml_mul(ctx, ggml_rms_norm(ctx, K, eps), W("blk.%d.attn_k_norm.weight", il));
             Q = apply_rope(ctx, Q, inp_pos, il);
             K = apply_rope(ctx, K, inp_pos, il);
-            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, inp_mask, 1, n_kv);
+            ggml_tensor * m = build_qsa_mask(ctx, gf, il, cur, inp_pos, inp_mask,
+                                             1, n_kv, n_past, qsa);
+            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, m, 1, n_kv);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
-            att = apply_attn_gate(ctx, il, att, cur, n_head_l, 1);
+            att = apply_attn_gate(ctx, il, att, cur, n_head, 1);
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
         }
-        ggml_tensor * attn_resid = ggml_add(ctx, cur, p_h);
         ggml_tensor * ffn_in;
-        if (gated) ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", il));
-        else       ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il));
-        if (!hp.is_moe_layer(il)) {
-            // Leading dense block: no experts, so there is no seg B for it.
-            ggml_tensor * gt = ggml_mul_mat(ctx, W("blk.%d.ffn_gate.weight", il), ffn_in);
-            ggml_tensor * up = ggml_mul_mat(ctx, W("blk.%d.ffn_up.weight",   il), ffn_in);
-            ggml_tensor * ff = ggml_mul_mat(ctx, W("blk.%d.ffn_down.weight", il),
-                                            swiglu_limited(ctx, gt, up, hp.swiglu_limit_exp(il)));
-            ggml_tensor * h_new = ggml_add(ctx, ff, attn_resid);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, h_new, n_embd), p_h));
-            return (ggml_tensor *) nullptr;
+        if (hc_on) {
+            res_hc = build_hc_combine(ctx, res_hc, cur, inject);
+            ffn_in = build_hc_mix(ctx, res_hc,
+                    W("blk.%d.hc_ffn_norm.weight",   il),
+                    W("blk.%d.hc_ffn_down.weight",   il),
+                    W("blk.%d.hc_ffn_up.weight",     il),
+                    W("blk.%d.hc_ffn_inject.weight", il), &inject);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx,
+                    ggml_reshape_2d(ctx, res_hc, n_embd, n_hc), p_h));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx,
+                    ggml_reshape_1d(ctx, inject, n_hc), carry_inj(il)));
+        } else {
+            ggml_tensor * attn_resid = dbg(ggml_add(ctx, cur, p_h), "ffn_inp", il);
+            if (gated) ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", il));
+            else       ffn_in = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il)), "ffn_norm", il);
+            // Leading dense block: no routed experts, so the layer finishes here
+            // and returns no selection (the driver then skips seg B).
+            if (!hp.is_moe_layer(il)) {
+                ggml_tensor * ff    = dbg(build_dense_ffn(ctx, il, ffn_in), "ffn_out", il);
+                ggml_tensor * h_new = dbg(ggml_add(ctx, ff, attn_resid), "l_out", il);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, h_new, n_embd), p_h));
+                return (ggml_tensor *) nullptr;
+            }
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, carry_res(il)));
         }
         ggml_tensor * weights = nullptr;
         ggml_tensor * selected = build_router(ctx, gf, il, ffn_in, weights);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, carry_ffn[il & 1]));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, attn_resid, carry_res[il & 1]));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, weights, n_used), carry_wgt[il & 1]));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ffn_in, carry_ffn(il)));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, weights, n_used), carry_wgt(il)));
         return selected;
     };
     // Append seg B (cached expert matmul + residual) for layer `il`; writes p_h.
     auto build_segB = [&](ggml_context * ctx, ggml_cgraph * gf, int il) {
-        ggml_tensor * moe_out = build_moe_cached(ctx, gf, il, carry_ffn[il & 1],
-                                                 p_slot_g, p_slot_u, p_slot_d, carry_wgt[il & 1]);
-        ggml_tensor * h_new = ggml_add(ctx, moe_out, carry_res[il & 1]);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, h_new, n_embd), p_h));
+        ggml_tensor * moe_out = build_moe_cached(ctx, gf, il, carry_ffn(il),
+                                                 p_slot_g, p_slot_u, p_slot_d, carry_wgt(il));
+        if (hc_on) {
+            ggml_tensor * res_hc = ggml_reshape_3d(ctx, p_h, n_embd, n_hc, 1);
+            ggml_tensor * h_new = build_hc_combine(ctx, res_hc,
+                    ggml_reshape_2d(ctx, moe_out, n_embd, 1),
+                    ggml_reshape_2d(ctx, carry_inj(il), n_hc, 1));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx,
+                    ggml_reshape_2d(ctx, h_new, n_embd, n_hc), p_h));
+        } else {
+            ggml_tensor * h_new = dbg(ggml_add(ctx, moe_out, carry_res(il)), "l_out", il);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_1d(ctx, h_new, n_embd), p_h));
+        }
     };
     // Set the attention pos/mask inputs of a graph (no-op if it has none, e.g. a
     // segB-only graph or a GDN-only seg A).
@@ -3002,11 +4581,12 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             ggml_backend_tensor_set(ip, posv.data(), 0, posv.size() * sizeof(int32_t));
         }
         fill_masks(gf, 1, n_kv, n_past);
+        set_qsa_inputs(gf, 1, n_kv, n_past);
     };
     // Read back layer `il`'s router selection and make those experts resident.
     auto ensure_layer = [&](ggml_tensor * selected, int il) {
         ggml_backend_tensor_get(selected, sel.data(), 0, n_used * sizeof(int32_t));
-        ecache->ensure(il, sel.data(), n_used, slot_g.data(), slot_u.data(), slot_d.data());
+        ec_of(il)->ensure(il, sel.data(), n_used, slot_g.data(), slot_u.data(), slot_d.data());
         ggml_backend_tensor_set(p_slot_g, slot_g.data(), 0, n_used * sizeof(int32_t));
         ggml_backend_tensor_set(p_slot_u, slot_u.data(), 0, n_used * sizeof(int32_t));
         ggml_backend_tensor_set(p_slot_d, slot_d.data(), 0, n_used * sizeof(int32_t));
@@ -3016,44 +4596,103 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
 
     // seg A(0) on its own, then fuse segB(L)+segA(L+1) per step so each layer
     // boundary is a single GPU submit instead of two (~halves the dispatches).
-    {
+    // Under a layer split the fusion is broken at the one device boundary,
+    // where the two halves belong to different devices: segB finishes on the
+    // old device, the hidden state hops, and segA starts on the new one.
+    // Run seg A for `il` on its attention device, then move the A->B carries to
+    // that layer's pool device and resolve residency there, so the following
+    // seg B finds its inputs and slot ids local. Leaves the carry members
+    // pointing at the pool device.
+    auto do_segA = [&](int il) {
+        const int a = dev_of(il);
+        use_carry(a);
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-        ggml_tensor * selected = build_segA(ctx, gf, 0);
-        run(ctx, gf);
+        ggml_tensor * selected = build_segA(ctx, gf, il);
+        run(ctx, gf, a);
         set_attn_inputs(gf);
-        compute(gf, "seg A0 compute failed");
-        if (selected) ensure_layer(selected, 0);
+        compute(gf, a, "seg A compute failed");
+        dump_flush("segA");
+        if (!selected) { ggml_free(ctx); return; }   // dense block: done on `a`
+        const int p = pdev_of(il);
+        hop_carry_ab(a, p, il);
+        use_carry(p);
+        ensure_layer(selected, il);
         ggml_free(ctx);
-    }
+    };
+
+    // Where the hidden state sits once layer `il` is done: its pool's device,
+    // or for a dense block (no seg B) the device that computed it.
+    auto h_dev = [&](int il) { return hp.is_moe_layer(il) ? pdev_of(il) : dev_of(il); };
+
+    do_segA(0);
     for (int il = 0; il < N; ++il) {
+        const int anxt = (il + 1 < N) ? dev_of(il + 1) : -1;    // next attention device
+        if (!hp.is_moe_layer(il)) {
+            // Dense block: seg A finished it, so there is no seg B to fuse the
+            // next layer's seg A onto -- run that one on its own.
+            if (anxt >= 0) {
+                if (anxt != dev_of(il)) hop_carry(dev_of(il), anxt);
+                do_segA(il + 1);
+            }
+            continue;
+        }
+        const int p    = pdev_of(il);                          // seg B runs at the pool
+        // Keep the segB(L)+segA(L+1) fusion (one submit per layer instead of
+        // two) whenever the next layer's attention runs where this seg B does.
+        const bool fuse = anxt >= 0 && anxt == p;
+
+        use_carry(p);
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-        // A dense block finished inside its own seg A, so it has no seg B; the
-        // next layer's seg A then runs alone instead of fused onto one.
-        if (hp.is_moe_layer(il)) build_segB(ctx, gf, il);
-        ggml_tensor * nsel = (il + 1 < N) ? build_segA(ctx, gf, il + 1) : nullptr;
-        run(ctx, gf);
+        build_segB(ctx, gf, il);
+        ggml_tensor * nsel = fuse ? build_segA(ctx, gf, il + 1) : nullptr;
+        run(ctx, gf, p);
         set_attn_inputs(gf);
-        compute(gf, "fused segB/segA compute failed");
-        if (nsel) ensure_layer(nsel, il + 1);
+        compute(gf, p, "fused segB/segA compute failed");
+        dump_flush("segBA");
+        if (fuse && nsel) {
+            const int p1 = pdev_of(il + 1);
+            hop_carry_ab(p, p1, il + 1);
+            use_carry(p1);
+            ensure_layer(nsel, il + 1);
+        } else if (fuse) {
+            use_carry(dev_of(il + 1));   // fused seg A was a dense block
+        }
         ggml_free(ctx);
+
+        if (!fuse && anxt >= 0) {
+            hop_carry(p, anxt);   // only the hidden state crosses
+            do_segA(il + 1);
+        }
     }
+    // the final norm and output head are model-global, so they live on the primary
+    hop_carry(h_dev(N - 1), 0);
+    use_carry(0);
 
     // ---- final norm + output projection ----
     std::vector<float> out;
     {
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-        ggml_tensor * cur = ggml_rms_norm(ctx, p_h, eps);
-        cur = ggml_mul(ctx, cur, model.tensor("output_norm.weight"));
-        ggml_tensor * output_w = model.tensor("output.weight");
-        if (!output_w) output_w = model.tensor("token_embd.weight");
+        ggml_tensor * cur;
+        if (hc_on) {
+            // the final mixer is the output norm; qwen4exp carries no other one
+            cur = build_hc_mix(ctx, ggml_reshape_3d(ctx, p_h, n_embd, n_hc, 1),
+                    model.tensor("output_hc_norm.weight"),
+                    model.tensor("output_hc_down.weight"),
+                    model.tensor("output_hc_up.weight"), nullptr, nullptr);
+        } else {
+            cur = ggml_rms_norm(ctx, p_h, eps);
+            cur = dbg(ggml_mul(ctx, cur, out_norm_w()), "result_norm", -1);
+        }
+        ggml_tensor * output_w = out_proj_w();
         cur = ggml_mul_mat(ctx, output_w, cur);
         ggml_set_name(cur, "logits");
         ggml_build_forward_expand(gf, cur);
-        run(ctx, gf);
-        compute(gf, "output compute failed");
+        run(ctx, gf, 0);
+        compute(gf, 0, "output compute failed");
+        dump_flush("out");
         const int n_vocab = (int) cur->ne[0];
         logits.resize(n_vocab);
         ggml_backend_tensor_get(cur, logits.data(), 0, n_vocab * sizeof(float));
@@ -3274,8 +4913,23 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
         f_gf = build_graph(f_ctx, /*n_tokens=*/1, /*n_kv=*/f_nkv);
         cache_fast_build = false;
         persistent = false;
-        if (!ggml_gallocr_alloc_graph(f_galloc, f_gf))
+        // This graph is allocated ONCE and reused every token -- that is what
+        // makes it CUDA-graph friendly. With one GPU a gallocr owns its own
+        // buffer and nothing disturbs it. Across devices it needs a scheduler,
+        // but it must NOT be the shared one: any other graph going through that
+        // sched (the fallback decode_cached after a speculative miss, or a
+        // prefill batch) calls ggml_backend_sched_reset and invalidates this
+        // allocation, so the next compute runs on reused memory. Re-allocating
+        // per token is not an alternative -- it changes the tensor addresses the
+        // input uploads below already captured. Hence a dedicated scheduler.
+        if (multi_gpu()) {
+            if (!f_sched) f_sched = make_sched();
+            ggml_backend_sched_reset(f_sched);
+            if (!ggml_backend_sched_alloc_graph(f_sched, f_gf))
+                throw std::runtime_error("decode_cached_fast: sched alloc failed");
+        } else if (!ggml_gallocr_alloc_graph(f_galloc, f_gf)) {
             throw std::runtime_error("decode_cached_fast: gallocr alloc failed");
+        }
     }
 
     // graph inputs
@@ -3283,21 +4937,30 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     ggml_tensor * inp_pos    = ggml_graph_get_tensor(f_gf, "inp_pos");
     ggml_tensor * inp_kvidx  = ggml_graph_get_tensor(f_gf, "inp_kvidx");
     ggml_backend_tensor_set(inp_tokens, &token, 0, sizeof(int32_t));
+    fill_ple_input(f_gf, &token, 1);
     std::vector<int32_t> posv;
     fill_rope_pos(posv, 1, mrope_next);   // generation token: text, sequential
     ggml_backend_tensor_set(inp_pos, posv.data(), 0, posv.size() * sizeof(int32_t));
     int64_t kvidx = n_past; ggml_backend_tensor_set(inp_kvidx, &kvidx, 0, sizeof(int64_t));
     fill_masks(f_gf, 1, f_nkv, n_past);   // causal, sliding-window and ring inputs
+    // QSA selection inputs. Not optional: once the cache passes
+    // indexer_top_k + ratio - 1 the graph grows the indexer nodes, and they read
+    // whatever the buffer held -- a garbage cell -> block table indexes the
+    // gather out of bounds and the run dies in ggml_get_rows.
+    set_qsa_inputs(f_gf, 1, f_nkv, n_past);
+
+    // Layers with routed experts: a leading dense block has no pool, no remap
+    // row and no router, so every residency loop below walks this instead.
+    std::vector<int> moe_il;
+    for (int il = 0; il < n_layer; ++il) if (hp.is_moe_layer(il)) moe_il.push_back(il);
 
     // refresh the in-graph remap table from current residency
     auto fill_g2s = [&]() {
-        for (int il = 0; il < n_layer; ++il) {
-            if (!hp.is_moe_layer(il)) continue;   // dense block: no expert pools
+        for (int il : moe_il)
             for (int r = 0; r < 3; ++r) {
-                const int32_t * row = ecache->slot_of_row((ExpertCache::Role) r, il);
+                const int32_t * row = ec_of(il)->slot_of_row((ExpertCache::Role) r, il);
                 memcpy(&g2s_host[(size_t) (il * 3 + r) * n_exp], row, n_exp * sizeof(int32_t));
             }
-        }
         ggml_backend_tensor_set(g2s_all, g2s_host.data(), 0, g2s_host.size() * sizeof(int32_t));
     };
     // Refresh the router residency mask; true iff every layer is masked. A
@@ -3317,14 +4980,13 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
                               : std::max(n_used, std::min(res_min, n_exp));
     auto fill_resmask = [&]() {
         bool complete = true;
-        for (int il = 0; il < n_layer; ++il) {
-            if (!hp.is_moe_layer(il)) continue;
+        for (int il : moe_il) {
             float * row = &resmask_host[(size_t) il * n_exp];
             int n_res = 0;
             for (int e = 0; e < n_exp; ++e) {
-                const bool res = ecache->resident(ExpertCache::GATE, il, e) &&
-                                 ecache->resident(ExpertCache::UP,   il, e) &&
-                                 ecache->resident(ExpertCache::DOWN, il, e);
+                const bool res = ec_of(il)->resident(ExpertCache::GATE, il, e) &&
+                                 ec_of(il)->resident(ExpertCache::UP,   il, e) &&
+                                 ec_of(il)->resident(ExpertCache::DOWN, il, e);
                 row[e] = res ? 0.0f : -INFINITY;
                 n_res += res;
             }
@@ -3341,15 +5003,13 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     auto verify = [&]() {
         ggml_backend_tensor_get(sel_all, sel_host.data(), 0, sel_host.size() * sizeof(int32_t));
         bool ok = true;
-        for (int il = 0; il < n_layer; ++il) {
-            if (!hp.is_moe_layer(il)) continue;
+        for (int il : moe_il)
             for (int k = 0; k < n_used; ++k) {
                 const int e = sel_host[(size_t) il * n_used + k];
-                if (!ecache->resident(ExpertCache::GATE, il, e) ||
-                    !ecache->resident(ExpertCache::UP,   il, e) ||
-                    !ecache->resident(ExpertCache::DOWN, il, e)) ok = false;
+                if (!ec_of(il)->resident(ExpertCache::GATE, il, e) ||
+                    !ec_of(il)->resident(ExpertCache::UP,   il, e) ||
+                    !ec_of(il)->resident(ExpertCache::DOWN, il, e)) ok = false;
             }
-        }
         return ok;
     };
 
@@ -3358,7 +5018,7 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     // and skipped while stale-free — steady-state resident decode uploads
     // nothing but token/pos/mask.
     ++fast_warm_tokens;
-    const uint64_t stamp = ecache->stats().misses + ecache->stats().evictions;
+    const uint64_t stamp = ec_stats_sum().misses + ec_stats_sum().evictions;
     if (stamp != fast_remap_stamp || floor_res != fast_last_floor) {
         fast_mask_complete = resident_decode && fill_resmask();
         fill_g2s();
@@ -3371,7 +5031,10 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     const bool masked = resident_decode && fast_mask_complete;
 
     if (!masked) backup_states();   // so a speculative miss can be rolled back
-    if (ggml_backend_graph_compute(backend, f_gf) != GGML_STATUS_SUCCESS)
+    // must run on the graph's own scheduler (see the allocation above)
+    const ggml_status f_st = multi_gpu() ? ggml_backend_sched_graph_compute(f_sched, f_gf)
+                                         : ggml_backend_graph_compute(backend, f_gf);
+    if (f_st != GGML_STATUS_SUCCESS)
         throw std::runtime_error("decode_cached_fast: compute failed");
 
     if (!masked) {
@@ -3383,15 +5046,13 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
         }
 
         // accept: bump LRU/frequency for the resident accesses, then read logits
-        for (int il = 0; il < n_layer; ++il) {
-            if (!hp.is_moe_layer(il)) continue;   // dense block: no pools, and
-            for (int k = 0; k < n_used; ++k) {    // sel_all has no row for it
+        for (int il : moe_il)
+            for (int k = 0; k < n_used; ++k) {
                 const int e = sel_host[(size_t) il * n_used + k];
-                ecache->touch(ExpertCache::GATE, il, e);
-                ecache->touch(ExpertCache::UP,   il, e);
-                ecache->touch(ExpertCache::DOWN, il, e);
+                ec_of(il)->touch(ExpertCache::GATE, il, e);
+                ec_of(il)->touch(ExpertCache::UP,   il, e);
+                ec_of(il)->touch(ExpertCache::DOWN, il, e);
             }
-        }
     } else {
         // ---- background refill: keep the frozen palette tracking the input ----
         // The graph recorded what the unmasked router wanted (want_all). Fetch
@@ -3408,30 +5069,26 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
         if (refill_budget > 0) {
             ggml_backend_tensor_get(sel_all,  sel_host.data(),  0, sel_host.size()  * sizeof(int32_t));
             ggml_backend_tensor_get(want_all, want_host.data(), 0, want_host.size() * sizeof(int32_t));
-            for (int il = 0; il < n_layer; ++il) {
-                if (!hp.is_moe_layer(il)) continue;
+            for (int il : moe_il)
                 for (int k = 0; k < n_used; ++k) {
                     const int e = sel_host[(size_t) il * n_used + k];
-                    ecache->touch(ExpertCache::GATE, il, e);
-                    ecache->touch(ExpertCache::UP,   il, e);
-                    ecache->touch(ExpertCache::DOWN, il, e);
+                    ec_of(il)->touch(ExpertCache::GATE, il, e);
+                    ec_of(il)->touch(ExpertCache::UP,   il, e);
+                    ec_of(il)->touch(ExpertCache::DOWN, il, e);
                 }
-            }
             // Instrumentation: how often the layer's frozen palette failed to
             // hold what the *unmasked* router wanted. This is the quality cost
             // of the layer's slot share (masked decode never stalls on a miss).
             static const bool lstats = getenv("QWEN_LAYER_STATS") != nullptr;
             if (lstats) {
-                for (int il = 0; il < n_layer; ++il) {
-                    if (!hp.is_moe_layer(il)) continue;
+                for (int il : moe_il)
                     for (int k = 0; k < n_used; ++k) {
                         const int e = want_host[(size_t) il * n_used + k];
-                        const bool res = ecache->resident(ExpertCache::GATE, il, e) &&
-                                         ecache->resident(ExpertCache::UP,   il, e) &&
-                                         ecache->resident(ExpertCache::DOWN, il, e);
-                        ecache->note_want(il, !res);
+                        const bool res = ec_of(il)->resident(ExpertCache::GATE, il, e) &&
+                                         ec_of(il)->resident(ExpertCache::UP,   il, e) &&
+                                         ec_of(il)->resident(ExpertCache::DOWN, il, e);
+                        ec_of(il)->note_want(il, !res);
                     }
-                }
             }
             int budget = refill_budget;
             for (int step = 0; step < n_layer && budget > 0; ++step) {
@@ -3439,10 +5096,10 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
                 if (!hp.is_moe_layer(il)) continue;
                 for (int k = 0; k < n_used && budget > 0; ++k) {
                     const int e = want_host[(size_t) il * n_used + k];
-                    if (ecache->resident(ExpertCache::GATE, il, e) &&
-                        ecache->resident(ExpertCache::UP,   il, e) &&
-                        ecache->resident(ExpertCache::DOWN, il, e)) continue;
-                    ecache->ensure_resident(il, e);   // async H2D (RAM tier); joins mask next token
+                    if (ec_of(il)->resident(ExpertCache::GATE, il, e) &&
+                        ec_of(il)->resident(ExpertCache::UP,   il, e) &&
+                        ec_of(il)->resident(ExpertCache::DOWN, il, e)) continue;
+                    ec_of(il)->ensure_resident(il, e);   // async H2D (RAM tier); joins mask next token
                     --budget;
                 }
             }
@@ -3502,8 +5159,9 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
         // expert pools. Bigger chunks amortize each layer's expert fetch over
         // more tokens: expert traffic scales with the number of chunks, not T.
         // 4096 tokens ≈ 100 MB of carry tensors (7 x n_embd x T floats).
-        int chunk = 4096;
-        if (const char * c = getenv("QWEN_BATCH_CHUNK")) { int v = atoi(c); if (v >= 1) chunk = v; }
+        // Same reading as compute_headroom()'s: the headroom is reserved for
+        // exactly the graph this chunk builds, so the two must agree.
+        const int chunk = batch_chunk();
         int i = 0;
         while (i < n_tokens) {
             const int t = std::min(chunk, n_tokens - i);
@@ -3521,8 +5179,8 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
             if (progress_cb) progress_cb(i, n_tokens);
         }
         if (getenv("QWEN_LAYER_STATS")) {
-            ecache->dump_layer_stats("prefill");
-            ecache->reset_layer_stats();   // the destructor dump is decode-only
+            for (auto * c : all_ecaches()) c->dump_layer_stats("prefill");
+            for (auto * c : all_ecaches()) c->reset_layer_stats();   // the destructor dump is decode-only
         }
         // How the pool's slots are split across layers. "quota" re-shapes it
         // from the prompt's own routing (the prefill sweep otherwise leaves the
@@ -3547,13 +5205,14 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
         if (alloc_mode == 2 || (alloc_mode == 0 && resident_decode)) {
             const char * c = getenv("QWEN_QUOTA_PREFETCH");
             const long long v = c ? atoll(c) : 0;
-            ecache->rebalance(v > 0 ? (size_t) v : (size_t) -1);
+            // Each device rebalances its own pools over its own layers.
+            for (auto * c : all_ecaches()) c->rebalance(v > 0 ? (size_t) v : (size_t) -1);
             // Forget the prompt's history so the exit dump measures how far the
             // ideal shape drifts once generation takes over.
-            if (getenv("QWEN_LAYER_QUOTA_DRIFT")) ecache->clear_counts();
+            if (getenv("QWEN_LAYER_QUOTA_DRIFT")) for (auto * c : all_ecaches()) c->clear_counts();
             if (getenv("QWEN_LAYER_STATS")) {
-                ecache->dump_layer_stats("rebalanced");
-                ecache->reset_layer_stats();
+                for (auto * c : all_ecaches()) c->dump_layer_stats("rebalanced");
+                for (auto * c : all_ecaches()) c->reset_layer_stats();
             }
         }
         embd_ovr.clear();
@@ -3621,12 +5280,16 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     ggml_tensor * inp_pos_t    = ggml_graph_get_tensor(gf, "inp_pos");
 
     ggml_backend_tensor_set(inp_tokens_t, tokens.data(), 0, n_tokens * sizeof(int32_t));
+    fill_ple_input(gf, tokens.data(), n_tokens);
 
     std::vector<int32_t> pos;
     const int new_mrope = fill_rope_pos(pos, n_tokens, mrope_next);
     ggml_backend_tensor_set(inp_pos_t, pos.data(), 0, pos.size() * sizeof(int32_t));
 
     fill_masks(gf, n_tokens, n_kv, n_past);
+    set_qsa_inputs(gf, n_tokens, n_kv, n_past);
+
+    const bool qsa_dbg = getenv("QWEN_QSA_DEBUG") != nullptr;
 
     // vision: upload the image embeddings for each override span
     for (size_t k = 0; k < embd_ovr.size(); ++k) {
@@ -3639,7 +5302,7 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     if (sched) {
         status = ggml_backend_sched_graph_compute(sched, gf);
     } else {
-        status = ggml_backend_graph_compute(backend, gf);
+        status = compute_graph(gf);
     }
     if (status != GGML_STATUS_SUCCESS) {
         ggml_free(ctx);
@@ -3649,13 +5312,32 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     ggml_tensor * logits_t = ggml_graph_get_tensor(gf, "logits");
     dbg(logits_t, "result_output", -1);   // renames it, so resolve the name first
     dump_flush("decode");
-
     const int n_vocab = (int) logits_t->ne[0];
     logits.resize(n_vocab);
     // one row when the head was narrowed, n_tokens rows otherwise
     const int row = logits_t->ne[1] == 1 ? 0 : n_tokens - 1;
     const size_t off = (size_t) row * logits_t->nb[1];
     ggml_backend_tensor_get(logits_t, logits.data(), off, n_vocab * sizeof(float));
+    if (qsa_dbg) {
+        for (int il = 0; il < (int) model.hparams().n_layer; ++il) {
+            for (const char * tag : { "qsa_kraw_", "qsa_pool0_", "qsa_pooled_", "qsa_q_", "qsa_bias_", "qsa_topk_", "qsa_mask_" }) {
+                ggml_tensor * t = ggml_graph_get_tensor(gf, (std::string(tag) + std::to_string(il)).c_str());
+                if (!t) continue;
+                const int64_t w = t->ne[0];
+                std::vector<int32_t> row((size_t) w);
+                for (int64_t r = std::max<int64_t>(0, t->ne[1] - 3); r < t->ne[1]; ++r) {
+                    ggml_backend_tensor_get(t, row.data(), (size_t) r * w * 4, (size_t) w * 4);
+                    fprintf(stderr, "%s%d[%lld]:", tag, il, (long long) r);
+                    for (int64_t k = 0; k < std::min<int64_t>(22, w); ++k) {
+                        if (t->type == GGML_TYPE_I32) fprintf(stderr, " %d", row[(size_t) k]);
+                        else fprintf(stderr, " %.4g", *(float *) &row[(size_t) k]);
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+    }
+
     capture_main_hidden(gf, n_tokens - 1);
 
     // MTP batched prefill: append every token's final hidden (pre-output-norm)
@@ -3687,6 +5369,7 @@ Runtime::~Runtime() = default;
 const std::vector<float> & Runtime::decode(const std::vector<int32_t> & tokens) {
     const std::vector<float> & l = impl_->decode(tokens);
     impl_->kv_toks.insert(impl_->kv_toks.end(), tokens.begin(), tokens.end());
+    impl_->report_compute_buffers();
     return l;
 }
 void Runtime::set_embd_overrides(std::vector<EmbdOverride> ovr) {
@@ -3702,6 +5385,7 @@ void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int
 void Runtime::prefill(const std::vector<int32_t> & tokens, bool mtp_kv) {
     impl_->prefill(tokens, mtp_kv);
     impl_->kv_toks.insert(impl_->kv_toks.end(), tokens.begin(), tokens.end());
+    impl_->report_compute_buffers();   // the batched prefill graph is the biggest one
 }
 void Runtime::snapshot_ckpt()          { impl_->pk_snapshot(); }
 int  Runtime::best_ckpt(int n) const   { return impl_->pk_best(n); }
@@ -3713,7 +5397,7 @@ bool Runtime::has_expert_cache() const { return impl_->ecache != nullptr; }
 Runtime::CacheStats Runtime::cache_stats() const {
     CacheStats c;
     if (impl_->ecache) {
-        const auto & s = impl_->ecache->stats();
+        const auto & s = impl_->ec_stats_sum();
         c.hits = s.hits; c.misses = s.misses; c.fetch_ms = s.fetch_ms; c.fetch_bytes = s.fetch_bytes;
     }
     return c;
@@ -3854,6 +5538,158 @@ size_t parse_vram_budget_mb(const std::string & arg, bool * legacy_mb) {
         return 0;   // unknown suffix: caller reports it as a bad value
     }
     return (size_t) (mb + 0.5);
+}
+
+// Split "a,b,c" into its fields, trimming surrounding blanks. An empty field is
+// kept so the caller's per-field parser can reject it.
+static std::vector<std::string> split_csv(const std::string & arg) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : arg) {
+        if (c == ',') { out.push_back(cur); cur.clear(); }
+        else          { cur += c; }
+    }
+    out.push_back(cur);
+    for (auto & s : out) {
+        size_t b = s.find_first_not_of(" \t");
+        size_t e = s.find_last_not_of(" \t");
+        s = (b == std::string::npos) ? std::string() : s.substr(b, e - b + 1);
+    }
+    return out;
+}
+
+bool parse_vram_budget_list(const std::string & arg, std::vector<size_t> & out, bool * legacy_mb) {
+    if (legacy_mb) *legacy_mb = false;
+    std::vector<size_t> v;
+    for (const auto & f : split_csv(arg)) {
+        std::string lower;
+        for (char c : f) lower += (char) tolower((unsigned char) c);
+        // "auto" = all the VRAM this device has free.
+        if (lower == "auto") { v.push_back(VRAM_BUDGET_AUTO); continue; }
+        // An explicit 0 turns the device off; build_gpu_plan drops it.
+        {
+            char * end = nullptr;
+            const double d = strtod(f.c_str(), &end);
+            if (end != f.c_str() && d == 0.0) {
+                std::string suf;
+                for (const char * p = end; *p; ++p)
+                    if (!isspace((unsigned char) *p)) suf += (char) tolower((unsigned char) *p);
+                if (suf.empty() || suf == "m" || suf == "mb" || suf == "g" || suf == "gb") {
+                    v.push_back(0);
+                    continue;
+                }
+                return false;
+            }
+        }
+        bool legacy = false;
+        const size_t mb = parse_vram_budget_mb(f, &legacy);
+        if (mb == 0) return false;
+        if (legacy && legacy_mb) *legacy_mb = true;
+        v.push_back(mb);
+    }
+    out.swap(v);
+    return true;
+}
+
+bool parse_gpu_list(const std::string & arg, std::vector<int> & out) {
+    std::vector<int> v;
+    for (const auto & f : split_csv(arg)) {
+        if (f.empty()) return false;
+        char * end = nullptr;
+        const long d = strtol(f.c_str(), &end, 10);
+        if (end == f.c_str() || *end || d < 0) return false;
+        for (int prev : v) if (prev == (int) d) return false;   // a device twice is a typo
+        v.push_back((int) d);
+    }
+    out.swap(v);
+    return true;
+}
+
+bool parse_gpu_split(const std::string & arg, std::vector<float> & out) {
+    std::string lower;
+    for (char c : arg) lower += (char) tolower((unsigned char) c);
+    if (lower == "auto") { out.clear(); return true; }   // ratio decided from budgets / free VRAM
+    std::vector<float> v;
+    double sum = 0.0;
+    for (const auto & f : split_csv(arg)) {
+        if (f.empty()) return false;
+        char * end = nullptr;
+        const double d = strtod(f.c_str(), &end);
+        if (end == f.c_str() || *end || d < 0.0) return false;
+        sum += d;
+        v.push_back((float) d);
+    }
+    if (sum <= 0.0) return false;   // every device an expert pool leaves nothing to compute on
+    out.swap(v);
+    return true;
+}
+
+bool build_gpu_plan(const std::vector<int> & gpu_ids,
+                    const std::vector<float> & gpu_split,
+                    bool split_given,
+                    const std::vector<size_t> & vram_mb,
+                    std::vector<GpuPlan> & out)
+{
+    out.clear();
+
+    // Nothing that names a device: the historical "first device that works".
+    // A lone --vram-budget belongs here too -- one budget has always meant one GPU.
+    if (gpu_ids.empty() && !split_given && vram_mb.size() <= 1) return true;
+
+    // How many GPUs is whatever the user actually named. Naming two devices, or
+    // two budgets, IS the request for two GPUs; --gpu-split only says how to
+    // divide them, and defaults to the budgets (or free VRAM) when omitted.
+    size_t n = std::max(gpu_ids.size(), std::max(gpu_split.size(), vram_mb.size()));
+    // "--gpu-split auto" on its own means every GPU present.
+    if (n <= 1 && split_given && gpu_split.empty() && gpu_ids.empty() && vram_mb.empty())
+        n = gpu_devices().size();
+    if (n == 0) return true;   // no GPU at all: caller falls back to the CPU
+
+    // A single budget cannot be shared across GPUs -- each device has its own
+    // VRAM, so splitting one number between them would be a guess. Likewise a
+    // split must name every device, or the unnamed ones silently get nothing.
+    if (!vram_mb.empty() && vram_mb.size() != n) {
+        fprintf(stderr, "error: --vram-budget has %zu value(s) but the plan has %zu GPU(s); "
+                        "give one budget per GPU (e.g. --vram-budget 13.5,5)\n",
+                vram_mb.size(), n);
+        return false;
+    }
+    if (!gpu_split.empty() && gpu_split.size() != n) {
+        fprintf(stderr, "error: --gpu-split has %zu value(s) but the plan has %zu GPU(s); "
+                        "give one share per GPU (e.g. --gpu-split 0.8,0)\n",
+                gpu_split.size(), n);
+        return false;
+    }
+    if (!gpu_ids.empty() && gpu_ids.size() != n) {
+        fprintf(stderr, "error: --gpus has %zu value(s) but the plan has %zu GPU(s)\n",
+                gpu_ids.size(), n);
+        return false;
+    }
+
+    out.clear();
+    for (size_t i = 0; i < n; ++i) {
+        GpuPlan p;
+        p.device    = gpu_ids.empty()   ? (int) i : gpu_ids[i];
+        p.budget_mb = vram_mb.empty()   ? VRAM_BUDGET_AUTO : vram_mb[i];
+        p.split     = gpu_split.empty() ? -1.0f   : gpu_split[i];
+        // A budget of 0 turns the device off. Asking --gpu-split to put layers
+        // on it anyway is a contradiction, not something to silently resolve.
+        if (p.budget_mb == 0) {
+            if (p.split > 0.0f) {
+                fprintf(stderr, "error: --vram-budget 0 turns GPU%d off, but --gpu-split gives it "
+                                "a share of %g; use 0 in both, or leave the device out of --gpus\n",
+                        p.device, p.split);
+                return false;
+            }
+            continue;   // dropped: not part of the plan at all
+        }
+        out.push_back(p);
+    }
+    if (out.empty()) {
+        fprintf(stderr, "error: --vram-budget turns every GPU off; leave at least one non-zero\n");
+        return false;
+    }
+    return true;
 }
 
 } // namespace questwend
