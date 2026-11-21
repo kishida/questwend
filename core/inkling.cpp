@@ -86,6 +86,8 @@ struct InklingEngine::Impl {
     ggml_context *        scr_ctx = nullptr;
     ggml_backend_buffer_t scr_buf = nullptr;
     std::vector<ggml_tensor *> scr[3];   // per physical layer: gate / up / down views of scr_buf
+    bool scr_shared = true;              // the three roles share one region (staged prefill experts)
+    ggml_tensor * p_tmp = nullptr;       // [n_ff_exp * n_used * UBATCH] f32: gate output, then the activation
     // Static placement never moves an expert, so a fully resident layer needs no
     // host routing: its router picks are turned into slot ids inside the graph
     // through this fixed map, and a run of such visits -- with "core" placement,
@@ -113,10 +115,15 @@ struct InklingEngine::Impl {
     // Fill scratch[ip] with the experts in `want` (all when null): pool -> D2D,
     // host -> H2D, queued on `be`. Returns the copy graph's context (caller frees
     // it once `be` is synchronized) or null.
-    ggml_context * assemble(int ip, const std::vector<uint8_t> * want, ggml_backend_t be, ggml_gallocr_t ga);
+    ggml_context * assemble(int ip, const std::vector<uint8_t> * want, ggml_backend_t be, ggml_gallocr_t ga, int role = -1);
     std::vector<uint32_t> pick_cnt;       // [n_phys * n_exp]
     void replace_by_count();
     void refresh_residency();
+    // Static placements decide the resident set first and size the slot pools
+    // to exactly that set (no role left without its partners), then fill it.
+    size_t pool_bytes = 0;
+    std::vector<uint8_t> plan_set(const std::vector<double> & value) const;
+    void   build_pool(const std::vector<uint8_t> & want);
     int  refill   = 4;          // most-missed experts made resident after each token
     ggml_context *        car_ctx = nullptr;
     ggml_backend_buffer_t car_buf = nullptr;
@@ -862,7 +869,9 @@ void InklingEngine::Impl::init_offload(size_t budget, size_t st_bytes) {
     p.mem_size = ggml_tensor_overhead() * 64;
     p.no_alloc = true;
     car_ctx = ggml_init(p);
-    for (int i = 0; i < 16; ++i) slots.push_back(ggml_new_tensor_2d(car_ctx, GGML_TYPE_F32, E, UBATCH));
+    int n_slots = 11;   // peak live values at a routed visit: blocks, prelude, bank, residual, expert input
+    if (const char * e = getenv("INK_SLOTS")) n_slots = std::max(4, atoi(e));
+    for (int i = 0; i < n_slots; ++i) slots.push_back(ggml_new_tensor_2d(car_ctx, GGML_TYPE_F32, E, UBATCH));
     p_tok       = ggml_new_tensor_1d(car_ctx, GGML_TYPE_I32, UBATCH);
     p_tau       = ggml_new_tensor_1d(car_ctx, GGML_TYPE_F32, UBATCH);
     p_rel_full  = ggml_new_tensor_1d(car_ctx, GGML_TYPE_I32, (int64_t) n_ctx * UBATCH);
@@ -882,6 +891,7 @@ void InklingEngine::Impl::init_offload(size_t budget, size_t st_bytes) {
     p_bpack     = ggml_new_tensor_1d(car_ctx, GGML_TYPE_I32, (int64_t) 4 * n_used * UBATCH);
     p_bw        = ggml_new_tensor_1d(car_ctx, GGML_TYPE_F32, (int64_t) n_used * UBATCH);
     p_rout      = ggml_new_tensor_1d(car_ctx, GGML_TYPE_F32, (int64_t) 2 * n_used + E);
+    p_tmp       = ggml_new_tensor_1d(car_ctx, GGML_TYPE_F32, (int64_t) hp.n_ff_exp * n_used * UBATCH);
     car_buf = ggml_backend_alloc_ctx_tensors(car_ctx, gpu);
     if (!car_buf) throw std::runtime_error("inkling2: cannot allocate offload carries");
     ggml_backend_buffer_clear(car_buf, 0);
@@ -936,7 +946,11 @@ void InklingEngine::Impl::init_offload(size_t budget, size_t st_bytes) {
         for (int ip = 0; ip < n_phys; ++ip)
             for (int r = 0; r < 3; ++r) role_max[r] = std::max(role_max[r], ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(gpu), W(fmt[r], ip)));
         const size_t align = 256;
-        scr_bytes = GGML_PAD(role_max[0], align) + GGML_PAD(role_max[1], align) + GGML_PAD(role_max[2], align);
+        // One role at a time: prefill runs gate, up and down as three stages over
+        // the same region, so the scratch is the largest role, not all three.
+        scr_shared = getenv("INK_SCR_FULL") == nullptr;
+        scr_bytes = scr_shared ? std::max({ GGML_PAD(role_max[0], align), GGML_PAD(role_max[1], align), GGML_PAD(role_max[2], align) })
+                               : GGML_PAD(role_max[0], align) + GGML_PAD(role_max[1], align) + GGML_PAD(role_max[2], align);
         scr_buf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(gpu), scr_bytes);
         if (!getenv("INK_NO_OVERLAP")) {
             gpu2 = ggml_backend_dev_init(ggml_backend_get_device(gpu), nullptr);
@@ -956,7 +970,7 @@ void InklingEngine::Impl::init_offload(size_t budget, size_t st_bytes) {
                 if (ggml_backend_tensor_alloc(scr_buf, t, base + off) != GGML_STATUS_SUCCESS)
                     throw std::runtime_error("inkling2: scratch view alloc failed");
                 scr[r].push_back(t);
-                off += GGML_PAD(role_max[r], align);
+                if (!scr_shared) off += GGML_PAD(role_max[r], align);
             }
         }
     }
@@ -967,7 +981,9 @@ void InklingEngine::Impl::init_offload(size_t budget, size_t st_bytes) {
             gpu_w >> 20, st_bytes >> 20, ggml_backend_buffer_get_size(car_buf) >> 20, reserve >> 20,
             scr_bytes >> 20, pool >> 20,
             cpu_miss ? "misses computed on the CPU" : "misses fetched into VRAM");
-    ec = std::make_unique<ExpertCache>(gpu, model, n_phys, (int) hp.n_expert, n_used, pool);
+    pool_bytes = pool;
+    if (place == "lru")
+        ec = std::make_unique<ExpertCache>(gpu, model, n_phys, (int) hp.n_expert, n_used, pool);
     l_sel.assign((size_t) n_phys, 0);
     l_gpu.assign((size_t) n_phys, 0);
 
@@ -978,22 +994,20 @@ void InklingEngine::Impl::init_offload(size_t budget, size_t st_bytes) {
         // hot: decode may still top the pool up (INK_REFILL); its fused graphs are
         // rebuilt only at re-placement, so refills stay out of fully resident layers
         if (const char * e = getenv("INK_REFILL")) if (place == "hot") refill = atoi(e);
-        // Fill in reverse priority: the slot pools evict least-recently installed,
-        // so whatever goes in last is what stays when a pool runs out.
-        std::vector<int> order;   // highest priority first
+        // value of keeping (layer, expert): its layer's visits per token for
+        // "core" (and hot before any prompt has been seen), the layer index for
+        // "front" (what --n-cpu-moe's complement looks like: last layers first)
         hot = place == "hot";
-        if (place == "core" || hot) {
-            for (int ip = (int) ik.core_start; ip < (int) ik.core_end; ++ip) order.push_back(ip);
-            for (int ip = 0; ip < n_phys; ++ip) if (!ik.in_core((uint32_t) ip)) order.push_back(ip);
-        } else if (place == "front") {   // what --n-cpu-moe's complement looks like: last layers first
-            for (int ip = n_phys - 1; ip >= 0; --ip) order.push_back(ip);
-        } else {
-            throw std::runtime_error("INK_PLACE: core, hot, front or lru");
+        std::vector<double> value((size_t) n_phys * hp.n_expert);
+        for (int ip = 0; ip < n_phys; ++ip) {
+            double v;
+            if (place == "core" || hot) v = (ik.in_core((uint32_t) ip) ? ik.n_pass : 1) * 1000.0 - ip;
+            else if (place == "front")  v = ip;
+            else throw std::runtime_error("INK_PLACE: core, hot, front or lru");
+            for (int e = 0; e < (int) hp.n_expert; ++e) value[(size_t) ip * hp.n_expert + e] = v - e * 1e-3;
         }
         auto t0 = clk::now();
-        for (auto it = order.rbegin(); it != order.rend(); ++it)
-            for (int e = 0; e < (int) hp.n_expert; ++e) ec->ensure_resident(*it, e);
-        ggml_backend_synchronize(gpu);
+        build_pool(plan_set(value));
         fprintf(stderr, "inkling2: static placement '%s' filled in %.0f ms; resident experts per layer:",
                 place.c_str(), ms_since(t0));
         for (int ip = 0; ip < n_phys; ++ip) {
@@ -1271,7 +1285,7 @@ void InklingEngine::Impl::forward_offload(const int32_t * toks, int T, bool want
             for (int e = 0; e < n_exp && full; ++e)
                 for (int r = 0; r < 3 && full; ++r) full = ec->resident((ExpertCache::Role) r, pip, e);
             if (!full) {
-                pf_ctx = assemble(pip, nullptr, gpu2, galloc2);
+                pf_ctx = assemble(pip, nullptr, gpu2, galloc2, scr_shared ? 0 : -1);
                 pf_ip  = pip;
             }
         }
@@ -1458,31 +1472,88 @@ void InklingEngine::Impl::forward_offload(const int32_t * toks, int T, bool want
                 // over PCIe, as before.
                 static const char * fmt[3] = { "blk.%d.ffn_gate_exps.weight", "blk.%d.ffn_up_exps.weight", "blk.%d.ffn_down_exps.weight" };
                 static const bool whole = getenv("INK_STREAM_WHOLE") != nullptr;
-                if (whole) {
+                if (whole && !scr_shared) {   // needs INK_SCR_FULL=1 (three regions)
                     for (int r = 0; r < 3; ++r) {
                         ggml_tensor * src = W(fmt[r], ip);
                         ggml_backend_tensor_set_async(gpu, scr[r][(size_t) ip], src->data, 0, ggml_nbytes(src));
                         stx.streamed_bytes += ggml_nbytes(src);
                     }
-                } else if (pf_ip == ip) {
-                    // filled on the second stream while graph A ran
-                    ggml_backend_synchronize(gpu2);
-                    if (pf_ctx) { ggml_free(pf_ctx); pf_ctx = nullptr; }
-                    pf_ip = -1;
-                } else {
-                    std::vector<uint8_t> want(n_exp, 0);
-                    for (int32_t e : sel) want[(size_t) e] = 1;
-                    if (ggml_context * cc = assemble(ip, &want, gpu, galloc)) ggml_free(cc);
+                } else if (!scr_shared) {
+                    if (pf_ip == ip) {   // filled on the second stream while graph A ran
+                        ggml_backend_synchronize(gpu2);
+                        if (pf_ctx) { ggml_free(pf_ctx); pf_ctx = nullptr; }
+                        pf_ip = -1;
+                    } else {
+                        std::vector<uint8_t> want(n_exp, 0);
+                        for (int32_t e : sel) want[(size_t) e] = 1;
+                        if (ggml_context * cc = assemble(ip, &want, gpu, galloc)) ggml_free(cc);
+                    }
                 }
                 stx.streamed_layers++;
-                Gr g = seg_graph(T, n_kv_full);
-                B.ctx = g.ctx; B.gf = g.gf;
-                ggml_context * c = g.ctx;
-                ggml_tensor * x  = ggml_view_2d(c, slots[(size_t) sst.x], E, T, slots[(size_t) sst.x]->nb[1], 0);
-                ggml_tensor * s2 = ggml_view_2d(c, p_sel, n_used, T, (size_t) n_used * 4, 0);
-                ggml_tensor * w3 = ggml_view_3d(c, p_w, 1, n_used, T, 4, (size_t) n_used * 4, 0);
-                ggml_tensor * r2 = experts(g, ip, x, s2, w3, scr[0][(size_t) ip], scr[1][(size_t) ip], scr[2][(size_t) ip]);
-                ggml_build_forward_expand(g.gf, ggml_cpy(c, r2, ggml_view_2d(c, p_gpu, E, T, (size_t) E * 4, 0)));
+                if (!scr_shared) {
+                    Gr g = seg_graph(T, n_kv_full);
+                    B.ctx = g.ctx; B.gf = g.gf;
+                    ggml_context * c = g.ctx;
+                    ggml_tensor * x  = ggml_view_2d(c, slots[(size_t) sst.x], E, T, slots[(size_t) sst.x]->nb[1], 0);
+                    ggml_tensor * s2 = ggml_view_2d(c, p_sel, n_used, T, (size_t) n_used * 4, 0);
+                    ggml_tensor * w3 = ggml_view_3d(c, p_w, 1, n_used, T, 4, (size_t) n_used * 4, 0);
+                    ggml_tensor * r2 = experts(g, ip, x, s2, w3, scr[0][(size_t) ip], scr[1][(size_t) ip], scr[2][(size_t) ip]);
+                    ggml_build_forward_expand(g.gf, ggml_cpy(c, r2, ggml_view_2d(c, p_gpu, E, T, (size_t) E * 4, 0)));
+                } else {
+                    // gate, up, down in turn through the one region; the gate output
+                    // and then the activation wait in p_tmp between stages
+                    std::vector<uint8_t> want(n_exp, 0);
+                    for (int32_t e : sel) want[(size_t) e] = 1;
+                    const int64_t ff = hp.n_ff_exp;
+                    auto load = [&](int r) {
+                        if (r == 0 && pf_ip == ip) {
+                            ggml_backend_synchronize(gpu2);
+                            if (pf_ctx) { ggml_free(pf_ctx); pf_ctx = nullptr; }
+                            pf_ip = -1;
+                        } else if (ggml_context * cc = assemble(ip, &want, gpu, galloc, r)) {
+                            ggml_free(cc);
+                        }
+                    };
+                    auto scale_rows = [&](Gr & g, const char * fmt, ggml_tensor * s2) -> ggml_tensor * {
+                        ggml_tensor * sc = Wopt(fmt, ip);
+                        if (!sc || getenv("INK_NO_EXP_SCALE")) return nullptr;
+                        ggml_tensor * rr = ggml_repeat_4d(g.ctx, ggml_reshape_3d(g.ctx, sc, 1, n_exp, 1), 1, n_exp, T, 1);
+                        return ggml_get_rows(g.ctx, rr, s2);
+                    };
+                    for (int stage = 0; stage < 3; ++stage) {
+                        load(stage);
+                        Gr g = seg_graph(T, n_kv_full);
+                        ggml_context * c = g.ctx;
+                        ggml_tensor * x  = ggml_view_2d(c, slots[(size_t) sst.x], E, T, slots[(size_t) sst.x]->nb[1], 0);
+                        ggml_tensor * x3 = ggml_reshape_3d(c, x, E, 1, T);
+                        ggml_tensor * s2 = ggml_view_2d(c, p_sel, n_used, T, (size_t) n_used * 4, 0);
+                        ggml_tensor * tmp = ggml_view_3d(c, p_tmp, ff, n_used, T, (size_t) ff * 4, (size_t) ff * n_used * 4, 0);
+                        if (stage == 0) {
+                            ggml_tensor * gt = ggml_mul_mat_id(c, scr[0][(size_t) ip], x3, s2);
+                            if (ggml_tensor * sr = scale_rows(g, "blk.%d.ffn_gate_up_exps.scale", s2)) gt = ggml_mul(c, gt, sr);
+                            ggml_build_forward_expand(g.gf, ggml_cpy(c, gt, tmp));
+                        } else if (stage == 1) {
+                            ggml_tensor * up = ggml_mul_mat_id(c, scr[1][(size_t) ip], x3, s2);
+                            if (ggml_tensor * sr = scale_rows(g, "blk.%d.ffn_gate_up_exps.scale", s2)) up = ggml_mul(c, up, sr);
+                            ggml_build_forward_expand(g.gf, ggml_cpy(c, situ(g, tmp, up), tmp));
+                        } else {
+                            ggml_tensor * ex = ggml_mul_mat_id(c, scr[2][(size_t) ip], tmp, s2);   // [E, n_used, T]
+                            if (scr[2][(size_t) ip]->type == GGML_TYPE_NVFP4 && !getenv("INK_NVFP4_F32")) ggml_prec_set_acc(ex, GGML_PREC_BF16);
+                            if (ggml_tensor * sr = scale_rows(g, "blk.%d.ffn_down_exps.scale", s2)) ex = ggml_mul(c, ex, sr);
+                            ex = ggml_mul(c, ex, ggml_view_3d(c, p_w, 1, n_used, T, 4, (size_t) n_used * 4, 0));
+                            ex = ggml_cont(c, ggml_permute(c, ex, 1, 0, 2, 3));
+                            ggml_tensor * r2 = ggml_reshape_2d(c, ggml_sum_rows(c, ex), E, T);
+                            ggml_build_forward_expand(g.gf, ggml_cpy(c, r2, ggml_view_2d(c, p_gpu, E, T, (size_t) E * 4, 0)));
+                        }
+                        if (stage < 2) {
+                            if (!ggml_gallocr_alloc_graph(galloc, g.gf)) throw std::runtime_error("inkling2: staged experts alloc failed");
+                            if (ggml_backend_graph_compute(gpu, g.gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("inkling2: staged experts failed");
+                            ggml_free(g.ctx);
+                        } else {
+                            B.ctx = g.ctx; B.gf = g.gf;   // the last stage runs below like graph B
+                        }
+                    }
+                }
             }
             if (!ggml_gallocr_alloc_graph(galloc, B.gf)) throw std::runtime_error("inkling2: graph B alloc failed");
             if (ggml_backend_graph_compute(gpu, B.gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("inkling2: graph B failed");
@@ -1572,7 +1643,7 @@ void InklingEngine::Impl::forward_offload(const int32_t * toks, int T, bool want
     n_past_ += T;
 }
 
-ggml_context * InklingEngine::Impl::assemble(int ip, const std::vector<uint8_t> * want, ggml_backend_t be, ggml_gallocr_t ga) {
+ggml_context * InklingEngine::Impl::assemble(int ip, const std::vector<uint8_t> * want, ggml_backend_t be, ggml_gallocr_t ga, int role) {
     static const char * fmt[3] = { "blk.%d.ffn_gate_exps.weight", "blk.%d.ffn_up_exps.weight", "blk.%d.ffn_down_exps.weight" };
     const int n_exp = (int) hp.n_expert;
     // Zero it first when only some experts are written: CUDA mul_mat_id reads
@@ -1591,6 +1662,7 @@ ggml_context * InklingEngine::Impl::assemble(int ip, const std::vector<uint8_t> 
         bool r_all = true;
         for (int r = 0; r < 3 && r_all; ++r) r_all = ec->resident((ExpertCache::Role) r, ip, e);
         for (int r = 0; r < 3; ++r) {
+            if (role >= 0 && r != role) continue;
             ggml_tensor * dst = scr[r][(size_t) ip];
             const size_t nb2 = dst->nb[2];
             if (r_all) {
@@ -1617,6 +1689,21 @@ ggml_context * InklingEngine::Impl::assemble(int ip, const std::vector<uint8_t> 
 
 void InklingEngine::Impl::refresh_residency() {
     const int n_phys = (int) hp.n_layer, n_exp = (int) hp.n_expert;
+    {   // how much of the pool holds experts whose three roles are all resident
+        static const char * fmt[3] = { "blk.%d.ffn_gate_exps.weight", "blk.%d.ffn_up_exps.weight", "blk.%d.ffn_down_exps.weight" };
+        double full_b = 0, part_b = 0;
+        for (int ip = 0; ip < n_phys; ++ip)
+            for (int e = 0; e < n_exp; ++e) {
+                int nr = 0; double b = 0;
+                for (int r = 0; r < 3; ++r) {
+                    const double sb = (double) W(fmt[r], ip)->nb[2];
+                    if (ec->resident((ExpertCache::Role) r, ip, e)) { ++nr; b += sb; }
+                }
+                if (nr == 3) full_b += b; else part_b += b;
+            }
+        fprintf(stderr, "inkling2: pool holds %.0f MB of complete experts and %.0f MB of incomplete ones (unusable)\n",
+                full_b / 1048576.0, part_b / 1048576.0);
+    }
     full_res.assign((size_t) n_phys, 0);
     for (int ip = 0; ip < n_phys; ++ip) {
         int n = 0;
@@ -1640,22 +1727,47 @@ void InklingEngine::Impl::refresh_residency() {
     fprintf(stderr, "inkling2: %d of %u visits fully resident -> decoded inside fused graphs\n", nf, ik.n_visit);
 }
 
-void InklingEngine::Impl::replace_by_count() {
+std::vector<uint8_t> InklingEngine::Impl::plan_set(const std::vector<double> & value) const {
+    static const char * fmt[3] = { "blk.%d.ffn_gate_exps.weight", "blk.%d.ffn_up_exps.weight", "blk.%d.ffn_down_exps.weight" };
     const int n_phys = (int) hp.n_layer, n_exp = (int) hp.n_expert;
+    std::vector<size_t> eb((size_t) n_phys, 0);   // bytes of one expert, all three roles
+    for (int ip = 0; ip < n_phys; ++ip)
+        for (int r = 0; r < 3; ++r) eb[(size_t) ip] += W(fmt[r], ip)->nb[2];
     std::vector<int> keys((size_t) n_phys * n_exp);
     for (size_t k = 0; k < keys.size(); ++k) keys[k] = (int) k;
-    // ascending: the pools keep what goes in last
-    std::stable_sort(keys.begin(), keys.end(), [&](int a, int b) { return pick_cnt[(size_t) a] < pick_cnt[(size_t) b]; });
-    auto t0 = clk::now();
-    const uint64_t m0 = ec->stats().misses;
+    std::stable_sort(keys.begin(), keys.end(), [&](int a, int b) { return value[(size_t) a] > value[(size_t) b]; });
+    std::vector<uint8_t> want(keys.size(), 0);
+    size_t used = 0;
     for (int k : keys) {
-        const int ip = k / n_exp, e = k % n_exp;
-        bool r = true;
-        for (int q = 0; q < 3 && r; ++q) r = ec->resident((ExpertCache::Role) q, ip, e);
-        if (r) for (int q = 0; q < 3; ++q) ec->touch((ExpertCache::Role) q, ip, e);
-        else   ec->ensure_resident(ip, e);
+        const size_t need = eb[(size_t) (k / n_exp)];
+        if (used + need > pool_bytes) continue;   // a smaller expert further down may still fit
+        used += need;
+        want[(size_t) k] = 1;
     }
+    return want;
+}
+
+void InklingEngine::Impl::build_pool(const std::vector<uint8_t> & want) {
+    const int n_phys = (int) hp.n_layer, n_exp = (int) hp.n_expert;
+    // every graph that names a pool tensor goes with the old cache
+    for (auto & sg : segA) free_seg(sg);
+    for (auto & sg : segB) free_seg(sg);
+    seg_bucket = 0;
+    ec.reset();
+    ec = std::make_unique<ExpertCache>(gpu, model, n_phys, n_exp, (int) hp.n_expert_used, pool_bytes,
+                                       false, nullptr, &want);
+    for (int k = 0; k < n_phys * n_exp; ++k)
+        if (want[(size_t) k]) ec->ensure_resident(k / n_exp, k % n_exp);
     ggml_backend_synchronize(gpu);
+}
+
+void InklingEngine::Impl::replace_by_count() {
+    const int n_phys = (int) hp.n_layer, n_exp = (int) hp.n_expert;
+    auto t0 = clk::now();
+    std::vector<double> value((size_t) n_phys * n_exp);
+    for (int k = 0; k < n_phys * n_exp; ++k)
+        value[(size_t) k] = pick_cnt[(size_t) k] + 1e-3 * (ik.in_core((uint32_t) (k / n_exp)) ? ik.n_pass : 1);
+    build_pool(plan_set(value));
     uint64_t total = 0, covered = 0;
     for (int k = 0; k < n_phys * n_exp; ++k) {
         total += pick_cnt[(size_t) k];
@@ -1663,9 +1775,8 @@ void InklingEngine::Impl::replace_by_count() {
         for (int q = 0; q < 3 && r; ++q) r = ec->resident((ExpertCache::Role) q, k / n_exp, k % n_exp);
         if (r) covered += pick_cnt[(size_t) k];
     }
-    fprintf(stderr, "inkling2: pool refilled by prefill pick count in %.0f ms (%llu expert fetches); "
-                    "it covers %.1f%% of the prompt's picks. resident per layer:",
-            ms_since(t0), (unsigned long long) ((ec->stats().misses - m0) / 3), total ? 100.0 * covered / total : 0.0);
+    fprintf(stderr, "inkling2: pool rebuilt by prefill pick count in %.0f ms; it covers %.1f%% of the prompt's picks."
+                    " resident per layer:", ms_since(t0), total ? 100.0 * covered / total : 0.0);
     for (int ip = 0; ip < n_phys; ++ip) {
         int n = 0;
         for (int e = 0; e < n_exp; ++e) {
