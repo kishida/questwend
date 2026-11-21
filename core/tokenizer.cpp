@@ -94,6 +94,16 @@ Tokenizer::Tokenizer(const Vocab & vocab) {
     for (int32_t i = 0; i < (int32_t) vocab.tokens.size(); ++i) {
         token_ids_[vocab.tokens[i]] = i;
     }
+    if (vocab.pre == "inkling2") {
+        // <|message_model|><|content_thinking|>R<|end_message|><|message_model|><|content_text|>C<|end_message|>
+        // reads as <think>R</think>C
+        const std::pair<const char *, const char *> alias[] = {
+            { "<|content_thinking|>", "<think>" }, { "<|content_text|>", "</think>" },
+            { "<|message_model|>", "" }, { "<|end_message|>", "" },
+        };
+        for (const auto & a : alias)
+            if (auto it = token_ids_.find(a.first); it != token_ids_.end()) decode_alias_.push_back({ it->second, a.second });
+    }
     for (int r = 0; r < (int) vocab.merges.size(); ++r) {
         merge_rank_[vocab.merges[r]] = r;
     }
@@ -525,6 +535,7 @@ std::vector<int32_t> Tokenizer::encode(const std::string & text, bool add_bos,
 
 std::string Tokenizer::decode(int32_t token) const {
     if (token < 0 || token >= (int32_t) id_to_token_.size()) return "";
+    for (const auto & a : decode_alias_) if (a.first == token) return a.second;
     const std::string & t = id_to_token_[token];
     std::string out;
     for (auto & cp : utf8_decode(t)) {

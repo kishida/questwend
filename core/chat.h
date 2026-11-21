@@ -74,6 +74,7 @@ struct ChatPrompt {
 // How a model's chat output is marked up, so the server can route it.
 struct ChatFormat {
     bool        lfm2       = false;          // lfm2 template (see build_lfm2_prompt)
+    bool        inkling    = false;          // Inkling 2 template (see build_inkling_prompt)
     std::string tool_open  = "<tool_call>";  // start of a tool-call block
     std::string tool_close = "</tool_call>";
 };

@@ -164,8 +164,74 @@ ChatPrompt build_lfm2_prompt(const Tokenizer & tok,
 
 } // namespace
 
+// Inkling 2 chat template (hand-coded from the GGUF's jinja, text only):
+//   [<|message_system|><|content_text|>{system}<|end_message|>]
+//   <|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>   (before the first non-system turn)
+//   <|message_user|><|content_text|>{content}<|end_message|>
+//   <|message_model|>[<|content_thinking|>{reasoning}<|end_message|><|message_model|>]<|content_text|>{content}<|end_message|><|content_model_end_sampling|>
+// There is no generation prompt: the model opens its own <|message_model|>.
+// Reasoning off is "Thinking effort level: 0".
+ChatPrompt build_inkling_prompt(const Tokenizer & tok,
+                                const std::vector<ChatMessage> & messages,
+                                const ChatPromptOptions & opts) {
+    ChatPrompt out;
+    auto & ids = out.ids;
+    auto sp = [&](const char * name) {
+        const int32_t id = tok.token_to_id(name);
+        if (id < 0) throw std::runtime_error(std::string("chat: inkling2 vocabulary lacks ") + name);
+        ids.push_back(id);
+    };
+    auto text = [&](const std::string & s) {
+        if (s.empty()) return;
+        const auto v = tok.encode(s, false, false);
+        ids.insert(ids.end(), v.begin(), v.end());
+    };
+    auto role_tok = [&](const std::string & r) -> const char * {
+        if (r == "user")      return "<|message_user|>";
+        if (r == "assistant") return "<|message_model|>";
+        if (r == "system")    return "<|message_system|>";
+        if (r == "tool")      return "<|message_tool|>";
+        throw std::runtime_error("chat: unknown role " + r);
+    };
+    bool effort_done = false;
+    auto effort = [&]() {
+        sp("<|message_system|>"); sp("<|content_text|>");
+        text(std::string("Thinking effort level: ") + (opts.reasoning ? "0.9" : "0"));
+        sp("<|end_message|>");
+        effort_done = true;
+    };
+    for (const auto & m : messages) {
+        if (has_image(m)) throw std::runtime_error("chat: image input is not supported for inkling2 yet");
+        if (!effort_done && m.role != "system") effort();
+        std::string content = flat_text(m), reasoning = m.reasoning_content;
+        if (m.role == "assistant") {
+            // a reply stored with its <think> block inline
+            const size_t c = content.find("</think>");
+            if (c != std::string::npos) {
+                std::string r = content.substr(0, c);
+                const size_t o = r.find("<think>");
+                if (o != std::string::npos) r = r.substr(o + 7);
+                if (reasoning.empty()) reasoning = r;
+                content = content.substr(c + 8);
+            }
+            if (opts.preserve_thinking && !reasoning.empty()) {
+                sp(role_tok(m.role)); sp("<|content_thinking|>"); text(reasoning); sp("<|end_message|>");
+            }
+        }
+        sp(role_tok(m.role)); sp("<|content_text|>"); text(content); sp("<|end_message|>");
+        if (m.role == "assistant") sp("<|content_model_end_sampling|>");
+    }
+    if (!effort_done) effort();
+    if (opts.add_generation_prompt) out.gen_prompt_begin = (int) ids.size();
+    return out;
+}
+
 ChatFormat chat_format(const Tokenizer & tok) {
     ChatFormat f;
+    if (tok.token_to_id("<|message_model|>") >= 0 && tok.token_to_id("<|content_thinking|>") >= 0) {
+        f.inkling = true;
+        return f;
+    }
     if (tok.token_to_id("<|tool_call_start|>") >= 0 && tok.token_to_id("<|im_start|>") >= 0) {
         f.lfm2       = true;
         f.tool_open  = "<|tool_call_start|>";
@@ -178,6 +244,7 @@ ChatPrompt build_qwen_prompt(const Tokenizer & tok,
                              const std::vector<ChatMessage> & messages,
                              const ChatPromptOptions & opts) {
     if (chat_format(tok).lfm2) return build_lfm2_prompt(tok, messages, opts);
+    if (chat_format(tok).inkling) return build_inkling_prompt(tok, messages, opts);
 
     const int32_t im_start    = tok.token_to_id("<|im_start|>");
     const int32_t im_end      = tok.token_to_id("<|im_end|>");

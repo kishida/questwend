@@ -53,6 +53,9 @@ private:
     std::unordered_map<uint32_t, uint8_t> uni_to_byte_;
 
     Pre     pre_ = Pre::QWEN;
+    // inkling2: how its structural specials read in generated text (Qwen-style
+    // <think>...</think> so the CLI / server split reasoning as for the others)
+    std::vector<std::pair<int32_t, std::string>> decode_alias_;
     // A pre-token that is itself a vocabulary entry is emitted whole, without
     // running the merges (llama.cpp's ignore_merges; lfm2 sets it).
     bool    ignore_merges_ = false;
