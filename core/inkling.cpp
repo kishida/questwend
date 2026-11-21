@@ -75,6 +75,13 @@ struct InklingEngine::Impl {
     // bytes serves n_pass visits per token.
     bool place_static = false;
     std::string place = "lru";
+    // Static placement's prefill streams a layer that is not fully resident into
+    // this one-layer scratch and runs it on the GPU (as llama.cpp's op offload
+    // does): a 512-token chunk reuses every expert dozens of times, so moving the
+    // weights beats computing on the CPU, and the pinned pool is never disturbed.
+    ggml_context *        scr_ctx = nullptr;
+    ggml_backend_buffer_t scr_buf = nullptr;
+    std::vector<ggml_tensor *> scr[3];   // per physical layer: gate / up / down views of scr_buf
     int  refill   = 4;          // most-missed experts made resident after each token
     ggml_context *        car_ctx = nullptr;
     ggml_backend_buffer_t car_buf = nullptr;
@@ -123,6 +130,7 @@ struct InklingEngine::Impl {
         uint64_t sel = 0, gpu = 0, cpu = 0, fetched = 0;
         uint64_t core_sel = 0, core_repeat = 0;   // core-layer selections; already chosen by an earlier pass this token
         uint64_t tokens = 0;
+        uint64_t streamed_layers = 0, streamed_bytes = 0;   // static prefill
         double t_a = 0, t_b = 0, t_c = 0, t_fetch = 0, t_head = 0;
     } stx;
     std::vector<uint64_t> l_sel, l_gpu;   // per physical layer
@@ -237,6 +245,8 @@ InklingEngine::Impl::~Impl() {
     ec.reset();
     if (car_buf) ggml_backend_buffer_free(car_buf);
     if (pin_buf) ggml_backend_buffer_free(pin_buf);
+    if (scr_buf) ggml_backend_buffer_free(scr_buf);
+    if (scr_ctx) ggml_free(scr_ctx);
     if (car_ctx) ggml_free(car_ctx);
     if (hs_buf) ggml_backend_buffer_free(hs_buf);
     if (hs_ctx) ggml_free(hs_ctx);
@@ -848,17 +858,45 @@ void InklingEngine::Impl::init_offload(size_t budget, size_t st_bytes) {
     for (auto b : wbufs_gpu) gpu_w += ggml_backend_buffer_get_size(b);
     size_t reserve = 900ull << 20;
     if (const char * e = getenv("INK_RESERVE_MB")) reserve = (size_t) atoll(e) << 20;
-    const size_t used = gpu_w + st_bytes + ggml_backend_buffer_get_size(car_buf) + reserve;
+    if (const char * e = getenv("INK_PLACE")) place = e;
+    size_t scr_bytes = 0;
+    if (place != "lru") {
+        static const char * fmt[3] = { "blk.%d.ffn_gate_exps.weight", "blk.%d.ffn_up_exps.weight", "blk.%d.ffn_down_exps.weight" };
+        size_t role_max[3] = { 0, 0, 0 };
+        for (int ip = 0; ip < n_phys; ++ip)
+            for (int r = 0; r < 3; ++r) role_max[r] = std::max(role_max[r], ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(gpu), W(fmt[r], ip)));
+        const size_t align = 256;
+        scr_bytes = GGML_PAD(role_max[0], align) + GGML_PAD(role_max[1], align) + GGML_PAD(role_max[2], align);
+        scr_buf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(gpu), scr_bytes);
+        if (!scr_buf) throw std::runtime_error("inkling2: cannot allocate the prefill expert scratch");
+        ggml_init_params sp{};
+        sp.mem_size = ggml_tensor_overhead() * (3 * n_phys + 4);
+        sp.no_alloc = true;
+        scr_ctx = ggml_init(sp);
+        char * base = (char *) ggml_backend_buffer_get_base(scr_buf);
+        for (int ip = 0; ip < n_phys; ++ip) {
+            size_t off = 0;
+            for (int r = 0; r < 3; ++r) {
+                ggml_tensor * src = W(fmt[r], ip);
+                ggml_tensor * t = ggml_new_tensor(scr_ctx, src->type, ggml_n_dims(src), src->ne);
+                if (ggml_backend_tensor_alloc(scr_buf, t, base + off) != GGML_STATUS_SUCCESS)
+                    throw std::runtime_error("inkling2: scratch view alloc failed");
+                scr[r].push_back(t);
+                off += GGML_PAD(role_max[r], align);
+            }
+        }
+    }
+    const size_t used = gpu_w + st_bytes + ggml_backend_buffer_get_size(car_buf) + reserve + scr_bytes;
     const size_t pool = budget > used ? budget - used : 0;
     fprintf(stderr, "inkling2: offload: GPU weights %zu MB + state %zu MB + carries %zu MB + reserve %zu MB"
-                    " -> expert pool %zu MB (%s)\n",
-            gpu_w >> 20, st_bytes >> 20, ggml_backend_buffer_get_size(car_buf) >> 20, reserve >> 20, pool >> 20,
+                    " + prefill scratch %zu MB -> expert pool %zu MB (%s)\n",
+            gpu_w >> 20, st_bytes >> 20, ggml_backend_buffer_get_size(car_buf) >> 20, reserve >> 20,
+            scr_bytes >> 20, pool >> 20,
             cpu_miss ? "misses computed on the CPU" : "misses fetched into VRAM");
     ec = std::make_unique<ExpertCache>(gpu, model, n_phys, (int) hp.n_expert, n_used, pool);
     l_sel.assign((size_t) n_phys, 0);
     l_gpu.assign((size_t) n_phys, 0);
 
-    if (const char * e = getenv("INK_PLACE")) place = e;
     if (place != "lru") {
         place_static = true;
         cpu_miss = true;
@@ -1248,86 +1286,49 @@ void InklingEngine::Impl::forward_offload(const int32_t * toks, int T, bool want
             // no sync: the next graph A is queued behind graph B and these copies
             stx.t_c += ms_since(t2);
         } else if (place_static) {
-            // ---- prefill, static pool: resident experts on the GPU, the rest on the CPU ----
+            // ---- prefill, static pool: a fully resident layer runs from its slots;
+            // any other layer is streamed whole into the scratch and runs there ----
             auto t1 = clk::now();
-            auto res = [&](int e) {
-                for (int r = 0; r < 3; ++r) if (!ec->resident((ExpertCache::Role) r, ip, e)) return false;
-                return true;
-            };
-            std::vector<int> res_list;
-            for (int e = 0; e < n_exp; ++e) if (res(e)) res_list.push_back(e);
-            const bool gpu_ok = (int) res_list.size() >= n_used;
-            bool any_gpu = false, any_cpu = false;
-            std::vector<float> bw_g((size_t) n_used * T), bw_c((size_t) n_used * T);
-            for (int t = 0; t < T; ++t) {
-                std::vector<uint8_t> in_row(n_exp, 0);
-                for (int k = 0; k < n_used; ++k) in_row[(size_t) sel[(size_t) t * n_used + k]] = 1;
-                size_t next = 0;
-                for (int k = 0; k < n_used; ++k) {
-                    const size_t i = (size_t) t * n_used + k;
-                    int e = sel[i];
-                    const bool r = gpu_ok && res(e);
-                    bw_g[i] = r ? w[i] : 0.0f;
-                    bw_c[i] = r ? 0.0f : w[i];
-                    any_gpu |= r; any_cpu |= !r;
-                    if (!gpu_ok) continue;
-                    if (!r) {   // a distinct resident stand-in with weight 0
-                        while (in_row[(size_t) res_list[next]]) ++next;
-                        e = res_list[next];
-                        in_row[(size_t) e] = 1;
-                    }
-                    slot3[0][i] = ec->slot_of_row(ExpertCache::GATE, ip)[e];
-                    slot3[1][i] = ec->slot_of_row(ExpertCache::UP,   ip)[e];
-                    slot3[2][i] = ec->slot_of_row(ExpertCache::DOWN, ip)[e];
-                }
-            }
+            bool full = true;
+            for (int e = 0; e < n_exp && full; ++e)
+                for (int r = 0; r < 3 && full; ++r) full = ec->resident((ExpertCache::Role) r, ip, e);
             Seg B;
-            if (any_gpu) {
+            if (full) {
+                for (size_t i = 0; i < sel.size(); ++i) {
+                    slot3[0][i] = ec->slot_of_row(ExpertCache::GATE, ip)[sel[i]];
+                    slot3[1][i] = ec->slot_of_row(ExpertCache::UP,   ip)[sel[i]];
+                    slot3[2][i] = ec->slot_of_row(ExpertCache::DOWN, ip)[sel[i]];
+                }
                 std::vector<int32_t> pk;
                 for (int r = 0; r < 3; ++r) pk.insert(pk.end(), slot3[r].begin(), slot3[r].end());
                 pk.insert(pk.end(), sel.begin(), sel.end());
                 ggml_backend_tensor_set(p_bpack, pk.data(), 0, pk.size() * 4);
-                ggml_backend_tensor_set(p_bw, bw_g.data(), 0, bw_g.size() * 4);
+                ggml_backend_tensor_set(p_bw, w.data(), 0, w.size() * 4);
                 build_B(B, iv, n_used, sst.x, false);
-                if (!ggml_gallocr_alloc_graph(galloc, B.gf)) throw std::runtime_error("inkling2: graph B alloc failed");
-                ggml_backend_graph_compute_async(gpu, B.gf);
             } else {
-                ggml_backend_tensor_memset(p_gpu, 0, 0, (size_t) E * T * 4);
+                static const char * fmt[3] = { "blk.%d.ffn_gate_exps.weight", "blk.%d.ffn_up_exps.weight", "blk.%d.ffn_down_exps.weight" };
+                for (int r = 0; r < 3; ++r) {
+                    ggml_tensor * src = W(fmt[r], ip);
+                    ggml_backend_tensor_set_async(gpu, scr[r][(size_t) ip], src->data, 0, ggml_nbytes(src));
+                    stx.streamed_bytes += ggml_nbytes(src);
+                }
+                stx.streamed_layers++;
+                Gr g = seg_graph(T, n_kv_full);
+                B.ctx = g.ctx; B.gf = g.gf;
+                ggml_context * c = g.ctx;
+                ggml_tensor * x  = ggml_view_2d(c, slots[(size_t) sst.x], E, T, slots[(size_t) sst.x]->nb[1], 0);
+                ggml_tensor * s2 = ggml_view_2d(c, p_sel, n_used, T, (size_t) n_used * 4, 0);
+                ggml_tensor * w3 = ggml_view_3d(c, p_w, 1, n_used, T, 4, (size_t) n_used * 4, 0);
+                ggml_tensor * r2 = experts(g, ip, x, s2, w3, scr[0][(size_t) ip], scr[1][(size_t) ip], scr[2][(size_t) ip]);
+                ggml_build_forward_expand(g.gf, ggml_cpy(c, r2, ggml_view_2d(c, p_gpu, E, T, (size_t) E * 4, 0)));
             }
-            if (any_cpu) {
-                std::vector<float> xs((size_t) E * T), out((size_t) E * T);
-                ggml_backend_tensor_get(slots[(size_t) sst.x], xs.data(), 0, xs.size() * 4);
-                Gr g;
-                ggml_init_params cp{};
-                cp.mem_size = ggml_tensor_overhead() * 512 + ggml_graph_overhead_custom(512, false);
-                cp.no_alloc = true;
-                g.ctx = ggml_init(cp);
-                g.gf  = ggml_new_graph_custom(g.ctx, 512, false);
-                g.T = T;
-                ggml_tensor * xin = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, E, T);        ggml_set_input(xin);
-                ggml_tensor * ids = ggml_new_tensor_2d(g.ctx, GGML_TYPE_I32, n_used, T);   ggml_set_input(ids);
-                ggml_tensor * win = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, 1, n_used, T); ggml_set_input(win);
-                ggml_tensor * o = experts(g, ip, xin, ids, win, W("blk.%d.ffn_gate_exps.weight", ip),
-                                          W("blk.%d.ffn_up_exps.weight", ip), W("blk.%d.ffn_down_exps.weight", ip),
-                                          nullptr, nullptr, nullptr, hs_gu[(size_t) ip], hs_dn[(size_t) ip]);
-                ggml_set_output(o);
-                ggml_build_forward_expand(g.gf, o);
-                ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
-                if (!ggml_gallocr_alloc_graph(ga, g.gf)) throw std::runtime_error("inkling2: CPU prefill experts alloc failed");
-                ggml_backend_tensor_set(xin, xs.data(), 0, xs.size() * 4);
-                ggml_backend_tensor_set(ids, sel.data(), 0, sel.size() * 4);
-                ggml_backend_tensor_set(win, bw_c.data(), 0, bw_c.size() * 4);
-                ggml_backend_graph_compute(cpu, g.gf);
-                ggml_backend_tensor_get(o, out.data(), 0, out.size() * 4);
-                ggml_gallocr_free(ga);
-                ggml_free(g.ctx);
-                ggml_backend_tensor_set(p_cpu, out.data(), 0, out.size() * 4);
-            } else {
-                ggml_backend_tensor_memset(p_cpu, 0, 0, (size_t) E * T * 4);
+            if (!ggml_gallocr_alloc_graph(galloc, B.gf)) throw std::runtime_error("inkling2: graph B alloc failed");
+            if (ggml_backend_graph_compute(gpu, B.gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("inkling2: graph B failed");
+            ggml_free(B.ctx);
+            if (!p_cpu_zero) {   // the static tail adds p_cpu; nothing went to the CPU here
+                ggml_backend_tensor_memset(p_cpu, 0, 0, (size_t) E * UBATCH * 4);
+                p_cpu_zero = true;
             }
-            p_cpu_zero = false;
-            ggml_backend_synchronize(gpu);
-            if (B.ctx) ggml_free(B.ctx);
             stx.t_fetch += ms_since(t1);
         } else {
             // ---- prefill: the chunk's union of experts, in groups the pool can hold ----
@@ -1419,6 +1420,9 @@ void InklingEngine::Impl::dump_offload_stats() {
     fprintf(stderr, "  per token: graph A %.2f ms, GPU experts %.2f ms, CPU experts+sync %.2f ms, fetch %.2f ms;"
                     " prefill/fetch total %.0f ms, %llu experts fetched\n",
             stx.t_a / n, stx.t_b / n, stx.t_c / n, 0.0, stx.t_fetch, (unsigned long long) stx.fetched);
+    if (stx.streamed_layers)
+        fprintf(stderr, "  prefill streamed %llu layer visits into the scratch (%.1f GB over PCIe)\n",
+                (unsigned long long) stx.streamed_layers, stx.streamed_bytes / 1e9);
     fprintf(stderr, "  GPU share by physical layer:");
     for (size_t ip = 0; ip < l_sel.size(); ++ip)
         fprintf(stderr, " %zu%s:%.0f", ip, ik.in_core((uint32_t) ip) ? "*" : "", l_sel[ip] ? 100.0 * l_gpu[ip] / l_sel[ip] : 0.0);
