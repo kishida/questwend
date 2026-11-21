@@ -767,9 +767,9 @@ int main(int argc, char ** argv) {
     const bool mtp = use_mtp && rt->has_mtp();
     if (use_mtp && !rt->has_mtp())
         fprintf(stderr, "warning: --mtp requested but model has no nextn block; using plain decode\n");
-    if (mtp) fprintf(stderr, "MTP self-speculative decode ON (draft=%d; %s)\n", n_draft,
-                     rt->set_mtp_sampler(nullptr) ? "samples with each request's settings, exact"
-                                                  : "greedy only - request sampling parameters are ignored");
+    if (mtp) fprintf(stderr, "MTP self-speculative decode ON (draft=%d%s)\n", n_draft,
+                     rt->set_mtp_sampler(nullptr) ? ""
+                                                  : "; greedy only - request sampling parameters are ignored");
 
     // /v1/models id: the model name (general.name) so clients identify the
     // actual model, not the architecture; fall back to "questwend:<arch>".

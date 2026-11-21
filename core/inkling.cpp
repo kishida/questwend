@@ -296,11 +296,66 @@ struct InklingEngine::Impl {
     bool no_keep_now = false;  // forward(): build fresh (the prompt of a speculative run)
     void spec_verify(const int32_t * toks, int T);
     std::function<int32_t(const std::vector<float> &)> spec_pick;   // null: greedy
+
+    // ---- prompt checkpoints (rewind to a position) ----
+    // Full-attention KV and the draft KV are indexed by position, so a rewind
+    // only lowers n_past for them. The conv states and the SWA rings are
+    // overwritten as the sequence moves on, so those are copied to host RAM.
+    struct Ckpt { int pos = 0; std::vector<uint8_t> data; };
+    std::vector<Ckpt> ckpts;   // oldest first
+    std::vector<ggml_tensor *> ckpt_tensors() const {
+        std::vector<ggml_tensor *> v(conv_l.begin(), conv_l.end());
+        for (uint32_t iv = 0; iv < ik.n_visit; ++iv)
+            if (ik.is_swa[iv]) { v.push_back(k_l[iv]); v.push_back(v_l[iv]); }
+        if (ds.on) v.push_back(ds.frnn);
+        return v;
+    }
+    void ckpt_snapshot() {
+        if (n_past_ <= 0 || (!ckpts.empty() && ckpts.back().pos == n_past_)) return;
+        static const int max_n = getenv("INK_CKPTS") ? std::max(0, atoi(getenv("INK_CKPTS"))) : 3;
+        if (max_n == 0) return;
+        Ckpt c;
+        c.pos = n_past_;
+        size_t total = 0;
+        for (ggml_tensor * t : ckpt_tensors()) total += ggml_nbytes(t);
+        c.data.resize(total);
+        size_t off = 0;
+        for (ggml_tensor * t : ckpt_tensors()) {
+            ggml_backend_tensor_get(t, c.data.data() + off, 0, ggml_nbytes(t));
+            off += ggml_nbytes(t);
+        }
+        // a checkpoint past the current position means the state moved on: keep order by pos
+        while (!ckpts.empty() && ckpts.back().pos > c.pos) ckpts.pop_back();
+        ckpts.push_back(std::move(c));
+        while ((int) ckpts.size() > max_n) ckpts.erase(ckpts.begin());
+    }
+    int ckpt_best(int n) const {
+        if (n >= n_past_) return n_past_;
+        for (auto it = ckpts.rbegin(); it != ckpts.rend(); ++it) if (it->pos <= n) return it->pos;
+        return -1;
+    }
+    int ckpt_rewind(int n) {
+        if (n >= n_past_) return n_past_;
+        int k = -1;
+        for (int i = (int) ckpts.size() - 1; i >= 0; --i) if (ckpts[(size_t) i].pos <= n) { k = i; break; }
+        if (k < 0) return -1;
+        const Ckpt & c = ckpts[(size_t) k];
+        size_t off = 0;
+        for (ggml_tensor * t : ckpt_tensors()) {
+            ggml_backend_tensor_set(t, c.data.data() + off, 0, ggml_nbytes(t));
+            off += ggml_nbytes(t);
+        }
+        n_past_ = c.pos;
+        kv_toks.resize((size_t) c.pos);
+        ckpts.resize((size_t) k + 1);
+        return c.pos;
+    }
     void dspark_inject(int pos0, int T);           // ds.feat columns 0..T-1 -> draft KV at pos0..
     void dspark_draft(int32_t anchor, int pos0, int n_steps, std::vector<int32_t> & out);
     void dspark_rollback(int keep_tokens);         // conv states after the first keep_tokens of the verify
     void generate_spec(const std::vector<int32_t> & prompt, int max_new, int n_draft,
-                       const std::function<bool(int32_t)> & on_token, int32_t * out_pending = nullptr);
+                       const std::function<bool(int32_t)> & on_token, int32_t * out_pending = nullptr,
+                       bool ckpt_after_prefill = false);
     void free_kept() {
         if (kept.ga) ggml_gallocr_free(kept.ga);
         if (kept.g.ctx) ggml_free(kept.g.ctx);
@@ -2204,7 +2259,8 @@ void InklingEngine::Impl::dspark_rollback(int keep_tokens) {
 }
 
 void InklingEngine::Impl::generate_spec(const std::vector<int32_t> & prompt, int max_new, int n_draft,
-                                        const std::function<bool(int32_t)> & on_token, int32_t * out_pending) {
+                                        const std::function<bool(int32_t)> & on_token, int32_t * out_pending,
+                                        bool ckpt_after_prefill) {
     if (out_pending) *out_pending = -1;
     n_draft = std::max(1, std::min(n_draft, ds.block - 1));
     static const bool stats = getenv("INK_SPEC_STATS") != nullptr;
@@ -2218,6 +2274,7 @@ void InklingEngine::Impl::generate_spec(const std::vector<int32_t> & prompt, int
         no_keep_now = false;
     }
     kv_toks.insert(kv_toks.end(), prompt.begin(), prompt.end());
+    if (ckpt_after_prefill) ckpt_snapshot();   // the next turn rewinds here
     // Sampling stays exact with a deterministic draft: sample each verified
     // position from the target as usual and keep the draft while they agree.
     auto pick = [&](const std::vector<float> & l) -> int32_t {
@@ -2301,10 +2358,14 @@ InklingEngine::~InklingEngine() {
 const std::vector<float> & InklingEngine::decode(const std::vector<int32_t> & tokens) {
     Impl & m = *impl_;
     const int P = (int) tokens.size();
-    for (int i = 0; i < P; i += UBATCH) {
-        const int T = std::min(UBATCH, P - i);
+    // INK_SPLIT_PREFILL=k: break the chunks at k too (checks chunking against a rewind)
+    static const int split = getenv("INK_SPLIT_PREFILL") ? atoi(getenv("INK_SPLIT_PREFILL")) : 0;
+    for (int i = 0; i < P; ) {
+        int T = std::min(UBATCH, P - i);
+        if (split > i && split < i + T) T = split - i;
         m.forward(tokens.data() + i, T, i + T == P);
         if (m.progress_cb && P > UBATCH) m.progress_cb(i + T, P);
+        i += T;
     }
     m.kv_toks.insert(m.kv_toks.end(), tokens.begin(), tokens.end());
     // INK_VERIFY_BENCH=1: after the prompt, time forwards of 1..8 tokens (what a
@@ -2336,10 +2397,15 @@ void InklingEngine::prefill(const std::vector<int32_t> & tokens) {
 bool InklingEngine::has_draft() const { return impl_->ds.on; }
 void InklingEngine::set_sampler(std::function<int32_t(const std::vector<float> &)> fn) { impl_->spec_pick = std::move(fn); }
 void InklingEngine::generate_spec(const std::vector<int32_t> & prompt, int max_new, int n_draft,
-                                  const std::function<bool(int32_t)> & on_token, int32_t * out_pending) {
-    impl_->generate_spec(prompt, max_new, n_draft, on_token, out_pending);
+                                  const std::function<bool(int32_t)> & on_token, int32_t * out_pending,
+                                  bool ckpt_after_prefill) {
+    impl_->generate_spec(prompt, max_new, n_draft, on_token, out_pending, ckpt_after_prefill);
 }
+void InklingEngine::snapshot_ckpt() { impl_->ckpt_snapshot(); }
+int  InklingEngine::best_ckpt(int n) const { return impl_->ckpt_best(n); }
+int  InklingEngine::rewind_to(int n) { return impl_->ckpt_rewind(n); }
 void InklingEngine::reset() {
+    impl_->ckpts.clear();
     impl_->free_kept();
     impl_->n_past_ = 0;
     impl_->kv_toks.clear();

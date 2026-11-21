@@ -6124,9 +6124,8 @@ void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int
                            const std::function<bool(int32_t)> & on_token,
                            int32_t * out_pending, bool ckpt_after_prefill) {
     if (ink_) {
-        (void) ckpt_after_prefill;
         if (!ink_->has_draft()) ink_unsupported("MTP without a DSpark draft");
-        ink_->generate_spec(prompt, max_new, n_draft, on_token, out_pending);
+        ink_->generate_spec(prompt, max_new, n_draft, on_token, out_pending, ckpt_after_prefill);
         return;
     }
     impl_->generate_mtp(prompt, max_new, n_draft, on_token, out_pending, ckpt_after_prefill);
@@ -6137,13 +6136,9 @@ void Runtime::prefill(const std::vector<int32_t> & tokens, bool mtp_kv) {
     impl_->kv_toks.insert(impl_->kv_toks.end(), tokens.begin(), tokens.end());
     impl_->report_compute_buffers();   // the batched prefill graph is the biggest one
 }
-void Runtime::snapshot_ckpt()          { if (ink_) return; impl_->pk_snapshot(); }
-int  Runtime::best_ckpt(int n) const   { return ink_ ? (n >= ink_->n_past() ? ink_->n_past() : -1) : impl_->pk_best(n); }
-int  Runtime::rewind_to(int n)         {
-    // conv state cannot be truncated and there are no checkpoints: only "no-op" rewinds
-    if (ink_) return n >= ink_->n_past() ? ink_->n_past() : -1;
-    return impl_->pk_rewind(n);
-}
+void Runtime::snapshot_ckpt()          { if (ink_) { ink_->snapshot_ckpt(); return; } impl_->pk_snapshot(); }
+int  Runtime::best_ckpt(int n) const   { return ink_ ? ink_->best_ckpt(n) : impl_->pk_best(n); }
+int  Runtime::rewind_to(int n)         { return ink_ ? ink_->rewind_to(n) : impl_->pk_rewind(n); }
 void Runtime::reset()        { if (ink_) { ink_->reset(); return; } impl_->n_past = 0; impl_->mtp_past = 0; impl_->mrope_next = 0; impl_->kv_toks.clear(); impl_->pk.clear(); impl_->zero_states(); }
 int  Runtime::n_past() const { return ink_ ? ink_->n_past() : impl_->n_past; }
 const std::vector<int32_t> & Runtime::kv_tokens() const { return ink_ ? ink_->kv_tokens() : impl_->kv_toks; }
