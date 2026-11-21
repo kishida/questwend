@@ -130,6 +130,22 @@ static std::vector<uint8_t> base64_decode(const std::string & in) {
     return out;
 }
 
+// Timings in llama.cpp's shape (prompt_n counts the tokens actually prefilled,
+// cache_n the reused prefix), merged with this server's own keys.
+static void add_llama_timings(nlohmann::json & t, int n_prompt, int n_cached, int n_gen,
+                              double prefill_ms, double gen_ms) {
+    const int n_pf = n_prompt - n_cached;
+    t["cache_n"]                = n_cached;
+    t["prompt_n"]               = n_pf;
+    t["prompt_ms"]              = prefill_ms;
+    t["prompt_per_token_ms"]    = n_pf > 0 ? prefill_ms / n_pf : 0.0;
+    t["prompt_per_second"]      = prefill_ms > 0 ? n_pf * 1000.0 / prefill_ms : 0.0;
+    t["predicted_n"]            = n_gen;
+    t["predicted_ms"]           = gen_ms;
+    t["predicted_per_token_ms"] = n_gen > 0 ? gen_ms / n_gen : 0.0;
+    t["predicted_per_second"]   = gen_ms > 0 ? n_gen * 1000.0 / gen_ms : 0.0;
+}
+
 // Split generated text at the first </think>: `reasoning` gets the text before
 // it (the generation prompt pre-opens <think>, so output starts mid-block),
 // the returned string is what follows. No </think> -> everything is content.
@@ -1292,6 +1308,11 @@ int main(int argc, char ** argv) {
         int max_tokens = body.value("max_tokens", body.value("max_completion_tokens", 0));
         if (max_tokens <= 0) max_tokens = n_ctx;
         const bool stream      = body.value("stream", false);
+        // OpenAI: with stream_options.include_usage the stream ends with a chunk
+        // carrying only the usage (choices: [])
+        bool include_usage = false;
+        if (body.contains("stream_options") && body["stream_options"].is_object())
+            include_usage = body["stream_options"].value("include_usage", false);
         const SamplerConfig sc = make_sampler(body);
         const std::string id   = now_id("chatcmpl-");
         const long long created = (long long) std::time(nullptr);
@@ -1460,15 +1481,17 @@ int main(int argc, char ** argv) {
                     {{"index", 0}, {"delta", json::object()}, {"finish_reason", nullptr}}})}}) + "\n\n";
             // the generation prompt pre-opens <think> when reasoning is on, so
             // the stream starts inside the reasoning block
-            st->phase = (reasoning && !cfmt.lfm2 && tok->token_to_id("<think>") >= 0)
+            st->phase = (reasoning && !cfmt.lfm2 && !cfmt.inkling && tok->token_to_id("<think>") >= 0)
                 ? State::Phase::Reason : State::Phase::Content;
             // lfm2 has no pre-opened block (and reasons whether asked to or
             // not): watch the start of the reply instead
-            st->await_think = cfmt.lfm2;
+            // inkling2 opens it with <|content_thinking|> (read as <think>), and
+            // a reply without one starts with <|content_text|> (read as </think>)
+            st->await_think = cfmt.lfm2 || cfmt.inkling;
             st->smp.prime(prompt);   // repetition-penalty window (prompt tail)
 
             res.set_chunked_content_provider("text/event-stream",
-                [&, st, id, created, req_mtp, n_draft](size_t, httplib::DataSink & sink) -> bool {
+                [&, st, id, created, req_mtp, n_draft, include_usage](size_t, httplib::DataSink & sink) -> bool {
                     if (st->finished) return false;
                     auto finish = [&]() -> bool {
                         if (st->holding) { tlock.unlock(); st->holding = false; }
@@ -1487,6 +1510,7 @@ int main(int argc, char ** argv) {
                             {"prefill_tps", prefill_ms > 0 ? n_prefilled  * 1000.0 / prefill_ms : 0.0},
                             {"gen_tps",     gen_ms     > 0 ? st->generated * 1000.0 / gen_ms    : 0.0},
                         };
+                        add_llama_timings(timings, st->prompt_tokens, st->n_cached, st->generated, prefill_ms, gen_ms);
                         log_done(st->prompt_tokens, st->n_cached, st->generated,
                                  prefill_ms, gen_ms, st->cstat0);
                         // tool calls: parse the accumulated text; if any, emit them as a
@@ -1550,7 +1574,17 @@ int main(int argc, char ** argv) {
                                        {"total_tokens", st->prompt_tokens + st->generated}}},
                             {"choices", json::array({
                                 {{"index", 0}, {"delta", json::object()}, {"finish_reason", fr}}})}};
-                        ev += "data: " + dumpj(fin) + "\n\ndata: [DONE]\n\n";
+                        ev += "data: " + dumpj(fin) + "\n\n";
+                        if (include_usage) {
+                            json uchunk = {{"id", id}, {"object", "chat.completion.chunk"},
+                                {"created", created}, {"model", model_id}, {"choices", json::array()},
+                                {"usage", {{"prompt_tokens", st->prompt_tokens},
+                                           {"completion_tokens", st->generated},
+                                           {"total_tokens", st->prompt_tokens + st->generated}}},
+                                {"timings", timings}};
+                            ev += "data: " + dumpj(uchunk) + "\n\n";
+                        }
+                        ev += "data: [DONE]\n\n";
                         sink.write(ev.data(), ev.size());
                         st->finished = true;
                         sink.done();
@@ -1579,9 +1613,14 @@ int main(int argc, char ** argv) {
                             const size_t lead = st->hold.find_first_not_of(" \n");
                             if (lead == std::string::npos) return true;          // only whitespace so far
                             const std::string head = st->hold.substr(lead);
-                            if (head.size() < 7 && std::string("<think>").compare(0, head.size(), head) == 0)
-                                return true;                                      // could still be <think>
+                            if (head.size() < 8 && (std::string("<think>").compare(0, std::min<size_t>(head.size(), 7), head) == 0 ||
+                                                    std::string("</think>").compare(0, head.size(), head) == 0))
+                                return true;                                      // could still be <think> / </think>
                             st->await_think = false;
+                            if (head.compare(0, 8, "</think>") == 0) {            // an empty reasoning block
+                                st->hold = head.substr(8);
+                                st->skip_lead = true;
+                            }
                             if (head.compare(0, 7, "<think>") == 0) {
                                 st->hold = head.substr(7);
                                 st->phase = State::Phase::Reason;
@@ -2027,6 +2066,7 @@ int main(int argc, char ** argv) {
                          {"prefill_tps", prefill_ms > 0 ? (n_prompt_full - n_cached) * 1000.0 / prefill_ms : 0.0},
                          {"gen_tps", gen_ms > 0 ? generated * 1000.0 / gen_ms : 0.0}}}
         };
+        add_llama_timings(resp["timings"], n_prompt_full, n_cached, generated, prefill_ms, gen_ms);
         res.set_content(dumpj(resp), "application/json");
     });
 
