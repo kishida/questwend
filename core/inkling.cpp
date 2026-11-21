@@ -54,6 +54,9 @@ struct InklingEngine::Impl {
     int n_embd_kv = 0, n_head = 0, n_head_kv = 0, n_hd = 0, n_ch = 0;
 
     int n_past_ = 0;
+    // Flash attention with the relative bias folded into a per-head mask (the
+    // default); INK_NO_FLASH=1 falls back to the manual path.
+    bool flash = getenv("INK_NO_FLASH") == nullptr;
     std::vector<int32_t> kv_toks;
     std::vector<float>   logits;
     std::function<void(int, int)> progress_cb;
@@ -318,7 +321,8 @@ void InklingEngine::Impl::init() {
     for (uint32_t iv = 0; iv < ik.n_visit; ++iv) {
         const int cap = ik.is_swa[iv] ? ring : n_ctx;
         k_l.push_back(ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_kv, cap));
-        v_l.push_back(ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, cap, n_embd_kv));   // transposed
+        v_l.push_back(flash ? ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_kv, cap)
+                            : ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, cap, n_embd_kv));   // manual path: transposed
         conv_l.push_back(ggml_new_tensor_2d(st_ctx, GGML_TYPE_F32, ik.n_conv - 1, n_ch));
     }
     st_buf = ggml_backend_alloc_ctx_tensors(st_ctx, gpu);
@@ -487,15 +491,21 @@ ggml_tensor * InklingEngine::Impl::visit_pre(Gr & g, St & st, int iv, ggml_tenso
         const int n_kv = swa ? g.n_kv_swa : g.n_kv_full;
         ggml_tensor * idx = swa ? g.idx_swa : g.idx_full;
         ggml_tensor * kc = ggml_set_rows(ctx, k_l[(size_t) iv], ggml_reshape_2d(ctx, K, n_embd_kv, T), idx);
-        // V is cached transposed ([cap, n_embd_kv]) so attention reads it without a
-        // copy: one element per index, like llama.cpp's v_trans cache.
-        ggml_tensor * vl  = v_l[(size_t) iv];
-        const int64_t cap = vl->ne[0];
-        ggml_tensor * vc = ggml_set_rows(ctx, ggml_reshape_2d(ctx, vl, 1, ggml_nelements(vl)),
-                                         ggml_reshape_2d(ctx, ggml_cont(ctx, V), 1, (int64_t) n_embd_kv * T),
-                                         swa ? g.vidx_swa : g.vidx_full);
         ggml_tensor * k3 = ggml_view_3d(ctx, kc, n_hd, n_head_kv, n_kv, (size_t) n_hd * ggml_element_size(kc), kc->nb[1], 0);
-        ggml_tensor * vT = ggml_view_3d(ctx, vc, n_kv, n_hd, n_head_kv, (size_t) cap * 2, (size_t) cap * 2 * n_hd, 0);
+        ggml_tensor * vl = v_l[(size_t) iv];
+        ggml_tensor * v_att = nullptr;   // flash: [hd, n_kv, n_head_kv]; manual: [n_kv, hd, n_head_kv]
+        if (flash) {
+            ggml_tensor * vc = ggml_set_rows(ctx, vl, ggml_reshape_2d(ctx, V, n_embd_kv, T), idx);
+            v_att = ggml_permute(ctx, ggml_view_3d(ctx, vc, n_hd, n_head_kv, n_kv, (size_t) n_hd * 2, vc->nb[1], 0), 0, 2, 1, 3);
+        } else {
+            // V cached transposed ([cap, n_embd_kv]) so the manual path reads it
+            // without a copy: one element per index, like llama.cpp's v_trans cache
+            const int64_t cap = vl->ne[0];
+            ggml_tensor * vc = ggml_set_rows(ctx, ggml_reshape_2d(ctx, vl, 1, ggml_nelements(vl)),
+                                             ggml_reshape_2d(ctx, ggml_cont(ctx, V), 1, (int64_t) n_embd_kv * T),
+                                             swa ? g.vidx_swa : g.vidx_full);
+            v_att = ggml_view_3d(ctx, vc, n_kv, n_hd, n_head_kv, (size_t) cap * 2, (size_t) cap * 2 * n_hd, 0);
+        }
 
         // relative bias: project R on the bias table, subtract the per-query sink
         // logit, then gather by distance -> [n_kv, T, n_head]
@@ -508,15 +518,22 @@ ggml_tensor * InklingEngine::Impl::visit_pre(Gr & g, St & st, int iv, ggml_tenso
 
         ggml_tensor * q  = ggml_permute(ctx, Q, 0, 2, 1, 3);                         // [hd, T, n_head]
         ggml_tensor * k  = ggml_permute(ctx, k3, 0, 2, 1, 3);                        // [hd, n_kv, n_head_kv]
-        // (flash attention would need a per-head mask, which this ggml's CUDA FA lacks)
-        ggml_tensor * kq = ggml_mul_mat(ctx, k, q);                                  // [n_kv, T, n_head]
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-        kq = ggml_scale(ctx, kq, 1.0f / sqrtf((float) n_hd));
-        kq = ggml_add(ctx, ggml_add(ctx, kq, kq_b), swa ? g.mask_swa : g.mask_full);
-        kq = ggml_soft_max_ext(ctx, kq, nullptr, 1.0f, 0.0f);
-        ggml_soft_max_add_sinks(kq, g.sink0);
-        ggml_tensor * kqv = ggml_mul_mat(ctx, vT, kq);                               // [hd, T, n_head]
-        cur = ggml_cont_2d(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3), n_hd * n_head, T);
+        if (flash) {
+            // the bias rides in a per-head F16 mask, as llama.cpp does for this model
+            ggml_tensor * m  = ggml_cast(ctx, ggml_add(ctx, kq_b, swa ? g.mask_swa : g.mask_full), GGML_TYPE_F16);
+            ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k, v_att, m, 1.0f / sqrtf((float) n_hd), 0.0f, 0.0f);
+            ggml_flash_attn_ext_add_sinks(fa, g.sink0);
+            cur = ggml_reshape_2d(ctx, fa, n_hd * n_head, T);                        // fa: [hd, n_head, T]
+        } else {
+            ggml_tensor * kq = ggml_mul_mat(ctx, k, q);                              // [n_kv, T, n_head]
+            ggml_prec_set_acc(kq, GGML_PREC_F32);
+            kq = ggml_scale(ctx, kq, 1.0f / sqrtf((float) n_hd));
+            kq = ggml_add(ctx, ggml_add(ctx, kq, kq_b), swa ? g.mask_swa : g.mask_full);
+            kq = ggml_soft_max_ext(ctx, kq, nullptr, 1.0f, 0.0f);
+            ggml_soft_max_add_sinks(kq, g.sink0);
+            ggml_tensor * kqv = ggml_mul_mat(ctx, v_att, kq);                        // [hd, T, n_head]
+            cur = ggml_cont_2d(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3), n_hd * n_head, T);
+        }
 
         cur = ggml_mul(ctx, cur, ggml_sigmoid(ctx, ggml_mul_mat(ctx, W("blk.%d.attn_gate.weight", ip), inputs[0])));
         cur = convolve(g, iv, ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", ip), cur),
@@ -538,7 +555,7 @@ void InklingEngine::Impl::route(Gr & g, int ip, ggml_tensor * x, ggml_tensor ** 
     ggml_context * ctx = g.ctx;
     const int n_exp = (int) hp.n_expert, n_used = (int) hp.n_expert_used, T = (int) x->ne[1];
     ggml_tensor * logits = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp.weight", ip), x);   // [n_exp, T]
-    ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
+    ggml_prec_set_acc(logits, GGML_PREC_F32);
     ggml_tensor * probs = ggml_sigmoid(ctx, logits);
     ggml_tensor * rank = probs;
     if (ggml_tensor * b = Wopt("blk.%d.exp_probs_b.bias", ip)) rank = ggml_add(ctx, probs, b);
@@ -590,6 +607,11 @@ ggml_tensor * InklingEngine::Impl::experts(Gr & g, int ip, ggml_tensor * x, ggml
         }
     }
     ggml_tensor * ex = ggml_mul_mat_id(ctx, td, situ(g, gate, up), id);    // [E, n_used, T]
+    // as llama.cpp does for NVFP4 weights (build_lora_mm_id): BF16 accumulation is allowed
+    static const bool nvfp4_bf16 = getenv("INK_NVFP4_F32") == nullptr;
+    if (nvfp4_bf16)
+        for (ggml_tensor * t : { gate, up, ex })
+            if (t->src[0]->type == GGML_TYPE_NVFP4) ggml_prec_set_acc(t, GGML_PREC_BF16);
     if (!no_scale)
         if (ggml_tensor * s = sc_dn) ex = ggml_mul(ctx, ex, scale_of(s));
     ex = ggml_mul(ctx, ex, w);
@@ -619,7 +641,7 @@ ggml_tensor * InklingEngine::Impl::head(Gr & g, St & st, bool last_only) {
     cur = ggml_reshape_2d(ctx, mix(g, blocks, cur, G("output_res_query.weight")), E, T);
     cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, hp.rms_eps), G("output_norm.weight"));
     cur = ggml_mul_mat(ctx, G("output.weight"), cur);
-    ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+    ggml_prec_set_acc(cur, GGML_PREC_F32);
     if (ik.logit_cap != 0.0f)
         cur = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, cur, 1.0f / ik.logit_cap)), ik.logit_cap);
     return ggml_cont(ctx, ggml_view_2d(ctx, cur, ik.n_vocab, T, cur->nb[1], 0));
@@ -686,10 +708,12 @@ void InklingEngine::Impl::set_inputs(Gr & g, int T) {
     for (int i = 0; i < T; ++i) { idf[(size_t) i] = n_past_ + i; ids[(size_t) i] = (n_past_ + i) % ring; }
     ggml_backend_tensor_set(g.idx_full, idf.data(), 0, idf.size() * sizeof(int64_t));
     ggml_backend_tensor_set(g.idx_swa,  ids.data(), 0, ids.size() * sizeof(int64_t));
-    std::vector<int64_t> vf, vs;
-    fill_vidx(T, vf, vs);
-    ggml_backend_tensor_set(g.vidx_full, vf.data(), 0, vf.size() * sizeof(int64_t));
-    ggml_backend_tensor_set(g.vidx_swa,  vs.data(), 0, vs.size() * sizeof(int64_t));
+    if (!flash) {   // only the manual path's transposed V cache reads these
+        std::vector<int64_t> vf, vs;
+        fill_vidx(T, vf, vs);
+        ggml_backend_tensor_set(g.vidx_full, vf.data(), 0, vf.size() * sizeof(int64_t));
+        ggml_backend_tensor_set(g.vidx_swa,  vs.data(), 0, vs.size() * sizeof(int64_t));
+    }
     std::vector<float> z((size_t) n_head, 0.0f);
     ggml_backend_tensor_set(g.sink0, z.data(), 0, z.size() * sizeof(float));
 }
