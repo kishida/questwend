@@ -6114,11 +6114,16 @@ const std::vector<float> & Runtime::mtp_draft(int32_t token) {
     if (ink_) ink_unsupported("MTP");
     return impl_->mtp_draft(token);
 }
-bool Runtime::has_mtp() const { return !ink_ && impl_->model.hparams().has_mtp(); }
+bool Runtime::has_mtp() const { return ink_ ? ink_->has_draft() : impl_->model.hparams().has_mtp(); }
 void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                            const std::function<bool(int32_t)> & on_token,
                            int32_t * out_pending, bool ckpt_after_prefill) {
-    if (ink_) ink_unsupported("MTP");
+    if (ink_) {
+        (void) out_pending; (void) ckpt_after_prefill;
+        if (!ink_->has_draft()) ink_unsupported("MTP without a DSpark draft");
+        ink_->generate_spec(prompt, max_new, n_draft, on_token);
+        return;
+    }
     impl_->generate_mtp(prompt, max_new, n_draft, on_token, out_pending, ckpt_after_prefill);
 }
 void Runtime::prefill(const std::vector<int32_t> & tokens, bool mtp_kv) {

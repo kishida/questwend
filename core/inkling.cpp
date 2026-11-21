@@ -5,6 +5,9 @@
 #include "inkling.h"
 #include "model.h"
 #include "expert_cache.h"
+#include "gguf_util.h"
+#include "gguf.h"
+#include <map>
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -20,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <filesystem>
 
 namespace questwend {
 
@@ -250,6 +254,52 @@ struct InklingEngine::Impl {
         ggml_gallocr_t ga = nullptr; int bucket = 0, T = 0;
     } kept;
     bool all_logits = false;   // head over every token (a verify step), not just the last
+
+    // ---- DSpark speculative decoding (resident path) ----
+    // The draft (arch "dflash", Inkling2 DSpark variant) is a 3-layer transformer
+    // whose KV is built from the target's hidden states at four layer visits; one
+    // pass over [last token, 7 masks] plus a recurrent head proposes a block.
+    struct Dspark {
+        bool on = false;
+        gguf_context * gg = nullptr;
+        ggml_context * wctx = nullptr; ggml_backend_buffer_t wbuf = nullptr;
+        std::map<std::string, ggml_tensor *> w;
+        int n_layer = 0, n_embd = 0, n_head = 0, n_head_kv = 0, hd = 0, n_ff = 0, block = 0, rank = 0;
+        float eps = 1e-6f, rope_base = 1e6f;
+        uint32_t n_swa = 0;
+        std::vector<uint8_t> is_swa;
+        std::vector<int> target;          // visit indices; n_visit means the final normed hidden
+        // state + persistent inputs
+        ggml_context * sctx = nullptr; ggml_backend_buffer_t sbuf = nullptr;
+        std::vector<ggml_tensor *> k, v;  // per draft layer: F16 [n_kv_dim, n_ctx]
+        ggml_tensor * frnn = nullptr;     // [E, 16] ring of the recurrent head's context features
+        ggml_tensor * feat = nullptr;     // [n_target * E, UBATCH] target features of the last forward
+        std::vector<ggml_tensor *> xs;    // per target visit: conv input window [nc-1 + 16, n_ch]
+        ggml_tensor * p_tok = nullptr, * p_pos = nullptr, * p_idx = nullptr, * p_ridx = nullptr;
+        ggml_tensor * p_crow = nullptr, * p_mask_f = nullptr, * p_mask_s = nullptr;
+        ggml_tensor * p_out = nullptr, * p_am = nullptr;
+        // graphs
+        Seg draft; int draft_bucket = -1, draft_steps = -1;
+        std::map<int, Seg> inj;           // by token count
+        ggml_tensor * W(const std::string & n) const {
+            auto it = w.find(n);
+            if (it == w.end()) throw std::runtime_error("dspark: missing tensor " + n);
+            return it->second;
+        }
+        ggml_tensor * Wl(const char * fmt, int il) const { char b[96]; snprintf(b, sizeof(b), fmt, il); return W(b); }
+    } ds;
+    bool cap_feat = false;   // graphs being built store the target features into ds.feat
+    bool xs_save  = false;   // ... and the conv input windows into ds.xs (verify rollback)
+    ggml_tensor * am_out = nullptr;   // verify graph: argmax per position -> ds.p_am
+    void dspark_init(const std::string & path);
+    Kept vkept;                // the verify graph (T = 1 + n_draft), kept per KV bucket
+    bool no_keep_now = false;  // forward(): build fresh (the prompt of a speculative run)
+    void spec_verify(const int32_t * toks, int T);
+    void dspark_inject(int pos0, int T);           // ds.feat columns 0..T-1 -> draft KV at pos0..
+    void dspark_draft(int32_t anchor, int pos0, int n_steps, std::vector<int32_t> & out);
+    void dspark_rollback(int keep_tokens);         // conv states after the first keep_tokens of the verify
+    void generate_spec(const std::vector<int32_t> & prompt, int max_new, int n_draft,
+                       const std::function<bool(int32_t)> & on_token);
     void free_kept() {
         if (kept.ga) ggml_gallocr_free(kept.ga);
         if (kept.g.ctx) ggml_free(kept.g.ctx);
@@ -277,6 +327,15 @@ struct InklingEngine::Impl {
 
 InklingEngine::Impl::~Impl() {
     free_kept();
+    if (vkept.ga) ggml_gallocr_free(vkept.ga);
+    if (vkept.g.ctx) ggml_free(vkept.g.ctx);
+    free_seg(ds.draft);
+    for (auto & kv : ds.inj) free_seg(kv.second);
+    if (ds.sbuf) ggml_backend_buffer_free(ds.sbuf);
+    if (ds.sctx) ggml_free(ds.sctx);
+    if (ds.wbuf) ggml_backend_buffer_free(ds.wbuf);
+    if (ds.wctx) ggml_free(ds.wctx);
+    if (ds.gg) gguf_free(ds.gg);
     if (galloc) ggml_gallocr_free(galloc);
     if (st_buf) ggml_backend_buffer_free(st_buf);
     if (st_ctx) ggml_free(st_ctx);
@@ -385,6 +444,22 @@ void InklingEngine::Impl::init() {
 
     galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu));
     if (offload) init_offload(budget, st_bytes);
+
+    // --mtp: a DSpark draft next to the model (dspark-*.gguf), or INK_DSPARK=<file>
+    if (cfg.use_mtp) {
+        std::string dp = getenv("INK_DSPARK") ? getenv("INK_DSPARK") : "";
+        if (dp.empty()) {
+            namespace fs = std::filesystem;
+            const fs::path dir = fs::path(model.path()).parent_path();
+            for (const auto & e : fs::directory_iterator(dir.empty() ? fs::path(".") : dir)) {
+                const std::string fn = e.path().filename().string();
+                if (fn.rfind("dspark", 0) == 0 && e.path().extension() == ".gguf") { dp = e.path().string(); break; }
+            }
+        }
+        if (dp.empty())      fprintf(stderr, "inkling2: --mtp: no dspark-*.gguf next to the model\n");
+        else if (offload)    fprintf(stderr, "inkling2: --mtp: DSpark runs on the resident path only (offload is on), skipped\n");
+        else                 dspark_init(dp);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +520,10 @@ ggml_tensor * InklingEngine::Impl::convolve(Gr & g, int iv, ggml_tensor * cur, g
     ggml_tensor * x = ggml_concat(ctx, past, ggml_transpose(ctx, cur), 0);          // [nc-1+T, C]
     ggml_tensor * last = ggml_view_2d(ctx, x, nc - 1, C, x->nb[1], (size_t) T * x->nb[0]);
     ggml_build_forward_expand(g.gf, ggml_cpy(ctx, last, past));
+    if (xs_save) {   // keep the whole window: a rejected tail rolls the state back from it
+        ggml_tensor * xsv = ds.xs[(size_t) iv];
+        ggml_build_forward_expand(g.gf, ggml_cpy(ctx, x, ggml_view_2d(ctx, xsv, nc - 1 + T, C, xsv->nb[1], (size_t) offset * xsv->nb[1])));
+    }
 
     ggml_tensor * out = ggml_ssm_conv(ctx, ggml_reshape_3d(ctx, x, nc - 1 + T, C, 1), weight);
     out = ggml_reshape_2d(ctx, out, C, T);
@@ -498,6 +577,10 @@ ggml_tensor * InklingEngine::Impl::visit_pre(Gr & g, St & st, int iv, ggml_tenso
     }
 
     ggml_tensor * inpSA = st.cur;
+    if (cap_feat)
+        for (size_t j = 0; j < ds.target.size(); ++j)
+            if (ds.target[j] == iv)
+                ggml_build_forward_expand(g.gf, ggml_cpy(ctx, inpSA, ggml_view_2d(ctx, ds.feat, E, T, ds.feat->nb[1], j * E * 4)));
     ggml_tensor * inputs[3] = { st.cur, st.cur, st.cur };
     if (ggml_tensor * rq = Wopt("blk.%d.attn_res_query.weight", ip)) {
         ggml_tensor * mixed = mix(g, st.blocks, st.cur, rq);
@@ -686,6 +769,13 @@ ggml_tensor * InklingEngine::Impl::head(Gr & g, St & st, bool last_only) {
     std::vector<ggml_tensor *> blocks = st.blocks;
     ggml_tensor * cur = st.cur;
     int64_t T = cur->ne[1];
+    if (cap_feat && std::find(ds.target.begin(), ds.target.end(), (int) ik.n_visit) != ds.target.end()) {
+        // the draft reads the final normed hidden of every token
+        const size_t j = (size_t) (std::find(ds.target.begin(), ds.target.end(), (int) ik.n_visit) - ds.target.begin());
+        ggml_tensor * fh = ggml_reshape_2d(ctx, mix(g, blocks, cur, G("output_res_query.weight")), E, T);
+        fh = ggml_mul(ctx, ggml_rms_norm(ctx, fh, hp.rms_eps), G("output_norm.weight"));
+        ggml_build_forward_expand(g.gf, ggml_cpy(ctx, fh, ggml_view_2d(ctx, ds.feat, E, T, ds.feat->nb[1], j * E * 4)));
+    }
     if (last_only && T > 1) {
         auto last = [&](ggml_tensor * t) { return ggml_view_2d(ctx, t, E, 1, t->nb[1], (size_t) (T - 1) * t->nb[1]); };
         for (auto & b : blocks) b = ggml_cont(ctx, last(b));
@@ -793,6 +883,7 @@ void InklingEngine::Impl::build_full(Gr & g, ggml_tensor * inp, bool want_logits
         out = head(g, st, !all_logits);
         ggml_set_output(out);
         ggml_build_forward_expand(g.gf, out);
+        if (am_out) ggml_build_forward_expand(g.gf, ggml_cpy(ctx, ggml_argmax(ctx, out), ggml_view_1d(ctx, am_out, out->ne[1], 0)));
     } else {
         ggml_build_forward_expand(g.gf, st.cur);
     }
@@ -807,7 +898,7 @@ void InklingEngine::Impl::forward(const int32_t * toks, int T, bool want_logits)
     auto t0 = clk::now();
     // small batches (a speculative verify) keep their graph too, one per T
     static const bool keep_small = getenv("INK_VERIFY_BENCH") != nullptr;
-    const bool use_kept = (T == 1 || (keep_small && T <= 8)) && want_logits && !no_keep;
+    const bool use_kept = (T == 1 || (keep_small && T <= 8)) && want_logits && !no_keep && !no_keep_now;
     Gr g; ggml_tensor * inp = nullptr, * out = nullptr;
     if (use_kept) {
         const int bucket = std::min(n_ctx, (n_past_ + T + 255) / 256 * 256);
@@ -849,6 +940,29 @@ void InklingEngine::Impl::forward(const int32_t * toks, int T, bool want_logits)
         ggml_backend_tensor_get(out, logits.data(), 0, logits.size() * sizeof(float));
     }
     if (!use_kept) ggml_free(g.ctx);
+    n_past_ += T;
+}
+
+void InklingEngine::Impl::spec_verify(const int32_t * toks, int T) {
+    if (n_past_ + T > n_ctx) throw std::runtime_error("inkling2: context full");
+    const int bucket = std::min(n_ctx, (n_past_ + T + 255) / 256 * 256);
+    if (!vkept.g.gf || vkept.bucket != bucket || vkept.T != T) {
+        if (vkept.ga) ggml_gallocr_free(vkept.ga);
+        if (vkept.g.ctx) ggml_free(vkept.g.ctx);
+        vkept = Kept{};
+        vkept.g = new_graph(T, bucket);
+        vkept.inp = ggml_new_tensor_1d(vkept.g.ctx, GGML_TYPE_I32, T);
+        ggml_set_input(vkept.inp);
+        build_full(vkept.g, vkept.inp, true, &vkept.out);
+        vkept.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu));
+        if (!ggml_gallocr_alloc_graph(vkept.ga, vkept.g.gf)) throw std::runtime_error("inkling2: verify graph alloc failed");
+        vkept.bucket = bucket;
+        vkept.T = T;
+    }
+    ggml_backend_tensor_set(vkept.inp, toks, 0, (size_t) T * sizeof(int32_t));
+    set_inputs(vkept.g, T);
+    if (ggml_backend_graph_compute(gpu, vkept.g.gf) != GGML_STATUS_SUCCESS)
+        throw std::runtime_error("inkling2: verify failed");
     n_past_ += T;
 }
 
@@ -1823,6 +1937,334 @@ void InklingEngine::Impl::dump_offload_stats() {
     fprintf(stderr, "  (* = looped)\n");
 }
 
+// ---------------------------------------------------------------------------
+// DSpark (Inkling2 variant of the dflash draft): llama.cpp's graph_inkling2 in
+// src/models/dspark.cpp, branch pwilkin/inkling2-dspark.
+// ---------------------------------------------------------------------------
+
+void InklingEngine::Impl::dspark_init(const std::string & path) {
+    ggml_context * meta = nullptr;
+    gguf_init_params gp{};
+    gp.no_alloc = true;
+    gp.ctx = &meta;
+    ds.gg = gguf_init_from_file(path.c_str(), gp);
+    if (!ds.gg) throw std::runtime_error("dspark: cannot open " + path);
+    const gguf_context * g = ds.gg;
+    if (gguf_str(g, "general.architecture") != "dflash")
+        throw std::runtime_error("dspark: " + path + " is not a dflash draft");
+    ds.n_layer   = (int) gguf_u32(g, "dflash.block_count");
+    ds.n_embd    = (int) gguf_u32(g, "dflash.embedding_length");
+    ds.n_ff      = (int) gguf_u32(g, "dflash.feed_forward_length");
+    ds.n_head    = (int) gguf_u32(g, "dflash.attention.head_count");
+    ds.n_head_kv = (int) gguf_u32(g, "dflash.attention.head_count_kv");
+    ds.hd        = (int) gguf_u32(g, "dflash.attention.key_length");
+    ds.block     = (int) gguf_u32(g, "dflash.block_size");
+    ds.eps       = gguf_f32(g, "dflash.attention.layer_norm_rms_epsilon", 1e-6f);
+    ds.rope_base = gguf_f32(g, "dflash.rope.freq_base", 1e6f);
+    ds.n_swa     = gguf_u32(g, "dflash.attention.sliding_window") + 1;   // the anchor row includes the anchor
+    for (bool b : gguf_bool_array(g, "dflash.attention.sliding_window_pattern")) ds.is_swa.push_back(b ? 1 : 0);
+    for (int32_t t : gguf_i32_array(g, "dflash.target_layers")) ds.target.push_back(t);
+    if (ds.n_embd != (int) hp.n_embd || ds.block != 8 || (int) ds.is_swa.size() != ds.n_layer || ds.target.empty() ||
+        ds.target.back() != (int) ik.n_visit || gguf_bool(g, "dflash.sample_from_anchor", false))
+        throw std::runtime_error("dspark: " + path + " does not fit this model");
+
+    // weights: one GPU buffer, data read straight from the file
+    ds.wctx = meta;
+    for (ggml_tensor * t = ggml_get_first_tensor(meta); t; t = ggml_get_next_tensor(meta, t)) ds.w[ggml_get_name(t)] = t;
+    ds.wbuf = ggml_backend_alloc_ctx_tensors(meta, gpu);
+    if (!ds.wbuf) throw std::runtime_error("dspark: cannot allocate the draft weights");
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("dspark: cannot read " + path);
+    std::vector<uint8_t> buf;
+    const size_t data0 = gguf_get_data_offset(g);
+    for (auto & kv : ds.w) {
+        const int64_t tid = gguf_find_tensor(g, kv.first.c_str());
+        const size_t nb = ggml_nbytes(kv.second);
+        buf.resize(nb);
+#ifdef _WIN32
+        _fseeki64(f, (long long) (data0 + gguf_get_tensor_offset(g, tid)), SEEK_SET);
+#else
+        fseeko(f, (off_t) (data0 + gguf_get_tensor_offset(g, tid)), SEEK_SET);
+#endif
+        if (fread(buf.data(), 1, nb, f) != nb) { fclose(f); throw std::runtime_error("dspark: short read"); }
+        ggml_backend_tensor_set(kv.second, buf.data(), 0, nb);
+    }
+    fclose(f);
+    ds.rank = (int) ds.W("markov_w1.weight")->ne[0];
+
+    // state
+    const int E = ds.n_embd, nkv = ds.n_head_kv * ds.hd, nt = (int) ds.target.size();
+    ggml_init_params sp{};
+    sp.mem_size = ggml_tensor_overhead() * (2 * ds.n_layer + ik.n_visit + 16);
+    sp.no_alloc = true;
+    ds.sctx = ggml_init(sp);
+    for (int l = 0; l < ds.n_layer; ++l) {
+        ds.k.push_back(ggml_new_tensor_2d(ds.sctx, GGML_TYPE_F16, nkv, n_ctx));
+        ds.v.push_back(ggml_new_tensor_2d(ds.sctx, GGML_TYPE_F16, nkv, n_ctx));
+    }
+    ds.frnn   = ggml_new_tensor_2d(ds.sctx, GGML_TYPE_F32, E, 16);
+    ds.feat   = ggml_new_tensor_2d(ds.sctx, GGML_TYPE_F32, (int64_t) nt * E, UBATCH);
+    for (uint32_t iv = 0; iv < ik.n_visit; ++iv) ds.xs.push_back(ggml_new_tensor_2d(ds.sctx, GGML_TYPE_F32, ik.n_conv - 1 + 16, n_ch));
+    ds.p_tok  = ggml_new_tensor_1d(ds.sctx, GGML_TYPE_I32, 1);
+    ds.p_pos  = ggml_new_tensor_1d(ds.sctx, GGML_TYPE_I32, UBATCH);
+    ds.p_idx  = ggml_new_tensor_1d(ds.sctx, GGML_TYPE_I64, UBATCH);
+    ds.p_ridx = ggml_new_tensor_1d(ds.sctx, GGML_TYPE_I64, UBATCH);
+    ds.p_crow = ggml_new_tensor_1d(ds.sctx, GGML_TYPE_I32, 1);
+    ds.p_mask_f = ggml_new_tensor_1d(ds.sctx, GGML_TYPE_F16, (int64_t) n_ctx * ds.block);
+    ds.p_mask_s = ggml_new_tensor_1d(ds.sctx, GGML_TYPE_F16, (int64_t) n_ctx * ds.block);
+    ds.p_out  = ggml_new_tensor_1d(ds.sctx, GGML_TYPE_I32, ds.block);
+    ds.p_am   = ggml_new_tensor_1d(ds.sctx, GGML_TYPE_I32, 16);
+    ds.sbuf = ggml_backend_alloc_ctx_tensors(ds.sctx, gpu);
+    if (!ds.sbuf) throw std::runtime_error("dspark: cannot allocate the draft state");
+    ggml_backend_buffer_clear(ds.sbuf, 0);
+    ds.on = true;
+    fprintf(stderr, "inkling2: DSpark draft %s: %d layers, block %d, target visits", path.c_str(), ds.n_layer, ds.block);
+    for (int t : ds.target) fprintf(stderr, " %d", t);
+    fprintf(stderr, " (%.0f MB)\n", ggml_backend_buffer_get_size(ds.wbuf) / 1048576.0 + ggml_backend_buffer_get_size(ds.sbuf) / 1048576.0);
+}
+
+// mix the target features with fuse row `row`, then RMS-norm with `norm`
+static ggml_tensor * ds_mix(ggml_context * ctx, ggml_tensor * fuse, ggml_tensor * feat, int nt, int E, int T, int row,
+                            ggml_tensor * norm, float eps) {
+    ggml_tensor * wts = ggml_soft_max(ctx, ggml_view_1d(ctx, fuse, nt, (size_t) row * fuse->nb[1]));
+    ggml_tensor * x = ggml_reshape_3d(ctx, ggml_cont(ctx, feat), E, nt, T);
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));                 // [nt, E, T]
+    x = ggml_sum_rows(ctx, ggml_mul(ctx, x, wts));                        // [1, E, T]
+    return ggml_mul(ctx, ggml_rms_norm(ctx, ggml_reshape_2d(ctx, x, E, T), eps), norm);
+}
+
+void InklingEngine::Impl::dspark_inject(int pos0, int T) {
+    const int E = ds.n_embd, nt = (int) ds.target.size(), nkv = ds.n_head_kv * ds.hd;
+    Seg & sg = ds.inj[T];
+    if (!sg.gf) {
+        ggml_init_params p{};
+        const int nodes = 2048;
+        p.mem_size = ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false);
+        p.no_alloc = true;
+        sg.ctx = ggml_init(p);
+        sg.gf  = ggml_new_graph_custom(sg.ctx, nodes, false);
+        ggml_context * c = sg.ctx;
+        ggml_tensor * feat = ggml_view_2d(c, ds.feat, (int64_t) nt * E, T, ds.feat->nb[1], 0);
+        ggml_tensor * pos  = ggml_view_1d(c, ds.p_pos, T, 0);
+        ggml_tensor * idx  = ggml_view_1d(c, ds.p_idx, T, 0);
+        ggml_tensor * fuse = ds.W("dspark_fuse.weight");
+        for (int l = 0; l < ds.n_layer; ++l) {
+            ggml_tensor * ctxf = ds_mix(c, fuse, feat, nt, E, T, l, ds.Wl("blk.%d.dflare_norm.weight", l), ds.eps);
+            ggml_tensor * k = ggml_reshape_3d(c, ggml_mul_mat(c, ds.Wl("blk.%d.attn_k_ctx.weight", l), ctxf), ds.hd, ds.n_head_kv, T);
+            ggml_tensor * v = ggml_mul_mat(c, ds.Wl("blk.%d.attn_v_ctx.weight", l), ctxf);
+            k = ggml_mul(c, ggml_rms_norm(c, k, ds.eps), ds.Wl("blk.%d.attn_k_ctx_norm.weight", l));
+            k = ggml_rope_ext(c, k, pos, nullptr, ds.hd, GGML_ROPE_TYPE_NEOX, 0, ds.rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            ggml_build_forward_expand(sg.gf, ggml_set_rows(c, ds.k[(size_t) l], ggml_reshape_2d(c, k, nkv, T), idx));
+            ggml_build_forward_expand(sg.gf, ggml_set_rows(c, ds.v[(size_t) l], v, idx));
+        }
+        ggml_tensor * fr = ds_mix(c, fuse, feat, nt, E, T, ds.n_layer, ds.W("dspark_norm.weight"), ds.eps);
+        ggml_build_forward_expand(sg.gf, ggml_set_rows(c, ds.frnn, fr, ggml_view_1d(c, ds.p_ridx, T, 0)));
+        sg.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu));
+        if (!ggml_gallocr_alloc_graph(sg.ga, sg.gf)) throw std::runtime_error("dspark: inject alloc failed");
+    }
+    std::vector<int32_t> pos((size_t) T);
+    std::vector<int64_t> idx((size_t) T), ridx((size_t) T);
+    for (int i = 0; i < T; ++i) { pos[(size_t) i] = pos0 + i; idx[(size_t) i] = pos0 + i; ridx[(size_t) i] = (pos0 + i) % 16; }
+    ggml_backend_tensor_set(ds.p_pos,  pos.data(),  0, pos.size() * 4);
+    ggml_backend_tensor_set(ds.p_idx,  idx.data(),  0, idx.size() * 8);
+    ggml_backend_tensor_set(ds.p_ridx, ridx.data(), 0, ridx.size() * 8);
+    if (ggml_backend_graph_compute(gpu, sg.gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("dspark: inject failed");
+}
+
+void InklingEngine::Impl::dspark_draft(int32_t anchor, int pos0, int n_steps, std::vector<int32_t> & out) {
+    const int E = ds.n_embd, B = ds.block, nkv = ds.n_head_kv * ds.hd;
+    const int bucket = std::min(n_ctx, (pos0 + B + 255) / 256 * 256);
+    if (!ds.draft.gf || ds.draft_bucket != bucket || ds.draft_steps != n_steps) {
+        free_seg(ds.draft);
+        ggml_init_params p{};
+        const int nodes = 4096;
+        p.mem_size = ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false);
+        p.no_alloc = true;
+        ds.draft.ctx = ggml_init(p);
+        ds.draft.gf  = ggml_new_graph_custom(ds.draft.ctx, nodes, false);
+        ggml_context * c = ds.draft.ctx;
+        ggml_cgraph * gf = ds.draft.gf;
+        const int n_kv = bucket;
+        ggml_tensor * pos = ggml_view_1d(c, ds.p_pos, B, 0);
+        ggml_tensor * idx = ggml_view_1d(c, ds.p_idx, B, 0);
+        ggml_tensor * mf  = ggml_view_2d(c, ds.p_mask_f, n_kv, B, (size_t) n_kv * 2, 0);
+        ggml_tensor * ms  = ggml_view_2d(c, ds.p_mask_s, n_kv, B, (size_t) n_kv * 2, 0);
+
+        // [anchor, mask x (B-1)]: the anchor through the target's embedding and its norm
+        ggml_tensor * a = ggml_get_rows(c, model.tok_embd_rows(), ds.p_tok);
+        a = ggml_mul(c, ggml_rms_norm(c, a, hp.rms_eps), G("token_embd_norm.weight"));
+        ggml_tensor * masks = ggml_repeat_4d(c, ggml_reshape_2d(c, ds.W("mask_embd.weight"), E, 1), E, B - 1, 1, 1);
+        ggml_tensor * cur = ggml_concat(c, a, masks, 1);                     // [E, B]
+        for (int l = 0; l < ds.n_layer; ++l) {
+            ggml_tensor * res = cur;
+            ggml_tensor * h = ggml_mul(c, ggml_rms_norm(c, cur, ds.eps), ds.Wl("blk.%d.attn_norm.weight", l));
+            ggml_tensor * q = ggml_reshape_3d(c, ggml_mul_mat(c, ds.Wl("blk.%d.attn_q.weight", l), h), ds.hd, ds.n_head, B);
+            ggml_tensor * k = ggml_reshape_3d(c, ggml_mul_mat(c, ds.Wl("blk.%d.attn_k.weight", l), h), ds.hd, ds.n_head_kv, B);
+            ggml_tensor * v = ggml_mul_mat(c, ds.Wl("blk.%d.attn_v.weight", l), h);
+            q = ggml_mul(c, ggml_rms_norm(c, q, ds.eps), ds.Wl("blk.%d.attn_q_norm.weight", l));
+            k = ggml_mul(c, ggml_rms_norm(c, k, ds.eps), ds.Wl("blk.%d.attn_k_norm.weight", l));
+            q = ggml_rope_ext(c, q, pos, nullptr, ds.hd, GGML_ROPE_TYPE_NEOX, 0, ds.rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            k = ggml_rope_ext(c, k, pos, nullptr, ds.hd, GGML_ROPE_TYPE_NEOX, 0, ds.rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            ggml_tensor * kc = ggml_set_rows(c, ds.k[(size_t) l], ggml_reshape_2d(c, k, nkv, B), idx);
+            ggml_tensor * vc = ggml_set_rows(c, ds.v[(size_t) l], v, idx);
+            ggml_tensor * K = ggml_permute(c, ggml_view_3d(c, kc, ds.hd, ds.n_head_kv, n_kv, (size_t) ds.hd * 2, kc->nb[1], 0), 0, 2, 1, 3);
+            ggml_tensor * V = ggml_permute(c, ggml_view_3d(c, vc, ds.hd, ds.n_head_kv, n_kv, (size_t) ds.hd * 2, vc->nb[1], 0), 0, 2, 1, 3);
+            ggml_tensor * fa = ggml_flash_attn_ext(c, ggml_permute(c, q, 0, 2, 1, 3), K, V, ds.is_swa[(size_t) l] ? ms : mf,
+                                                   1.0f / sqrtf((float) ds.hd), 0.0f, 0.0f);
+            ggml_tensor * o = ggml_mul_mat(c, ds.Wl("blk.%d.attn_output.weight", l), ggml_reshape_2d(c, fa, ds.hd * ds.n_head, B));
+            cur = ggml_add(c, res, o);
+            res = cur;
+            h = ggml_mul(c, ggml_rms_norm(c, cur, ds.eps), ds.Wl("blk.%d.ffn_norm.weight", l));
+            ggml_tensor * ff = ggml_mul_mat(c, ds.Wl("blk.%d.ffn_down.weight", l),
+                ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, ds.Wl("blk.%d.ffn_gate.weight", l), h)), ggml_mul_mat(c, ds.Wl("blk.%d.ffn_up.weight", l), h)));
+            cur = ggml_add(c, res, ff);
+        }
+        cur = ggml_mul(c, ggml_rms_norm(c, cur, ds.eps), ds.W("output_norm.weight"));   // [E, B]
+
+        // recurrent head over block positions 1..n_steps
+        ggml_tensor * out_w = G("output.weight");
+        ggml_tensor * context = ggml_get_rows(c, ds.frnn, ds.p_crow);                   // [E, 1]
+        ggml_tensor * state = ggml_fill(c, ggml_new_tensor_2d(c, GGML_TYPE_F32, ds.rank, 1), 0.0f);
+        ggml_tensor * prev = ds.p_tok;
+        const float cap = ik.logit_cap;
+        for (int i = 1; i <= n_steps; ++i) {
+            ggml_tensor * hi = ggml_cont(c, ggml_view_2d(c, cur, E, 1, cur->nb[1], (size_t) i * cur->nb[1]));
+            ggml_tensor * base = ggml_mul_mat(c, out_w, hi);
+            ggml_prec_set_acc(base, GGML_PREC_F32);
+            ggml_tensor * joint = ggml_concat(c, state, ggml_get_rows(c, ds.W("markov_w1.weight"), prev), 0);
+            joint = ggml_concat(c, joint, ggml_concat(c, hi, context, 0), 0);
+            joint = ggml_add(c, ggml_mul_mat(c, ds.W("joint_proj.weight"), joint), ds.W("joint_proj.bias"));
+            auto chunk = [&](int j) { return ggml_cont(c, ggml_view_2d(c, joint, ds.rank, 1, joint->nb[1], (size_t) j * ds.rank * 4)); };
+            ggml_tensor * gate = ggml_sigmoid(c, chunk(0));
+            ggml_tensor * cand = ggml_tanh(c, chunk(1));
+            state = ggml_add(c, cand, ggml_mul(c, gate, ggml_sub(c, state, cand)));
+            ggml_tensor * latent = ggml_tanh(c, chunk(2));
+            ggml_tensor * corr = ggml_add(c, ggml_mul_mat(c, ds.W("dspark_hidden_out.weight"), latent), ds.W("dspark_hidden_out.bias"));
+            ggml_tensor * bias = ggml_mul_mat(c, out_w, corr);
+            ggml_prec_set_acc(bias, GGML_PREC_F32);
+            ggml_tensor * lg = ggml_add(c, base, bias);
+            lg = ggml_scale(c, ggml_tanh(c, ggml_scale(c, lg, 1.0f / cap)), cap);
+            prev = ggml_argmax(c, ggml_cont(c, ggml_view_2d(c, lg, ik.n_vocab, 1, lg->nb[1], 0)));
+            ggml_build_forward_expand(gf, ggml_cpy(c, prev, ggml_view_1d(c, ds.p_out, 1, (size_t) (i - 1) * 4)));
+        }
+        ds.draft.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu));
+        if (!ggml_gallocr_alloc_graph(ds.draft.ga, gf)) throw std::runtime_error("dspark: draft alloc failed");
+        ds.draft_bucket = bucket;
+        ds.draft_steps = n_steps;
+    }
+    // inputs: positions pos0.., write rows, and the shared mask row of the anchor
+    const int n_kv = bucket;
+    std::vector<int32_t> pos((size_t) B);
+    std::vector<int64_t> idx((size_t) B);
+    for (int i = 0; i < B; ++i) { pos[(size_t) i] = pos0 + i; idx[(size_t) i] = pos0 + i; }
+    std::vector<ggml_fp16_t> mf((size_t) n_kv * B), ms((size_t) n_kv * B);
+    const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+    for (int j = 0; j < n_kv; ++j) {
+        const bool vis  = j < pos0 + B;                                // committed context + the whole block
+        const bool visw = vis && pos0 - j < (int) ds.n_swa;           // ... within the anchor's window
+        for (int r = 0; r < B; ++r) {
+            mf[(size_t) r * n_kv + j] = vis  ? z : ninf;
+            ms[(size_t) r * n_kv + j] = visw ? z : ninf;
+        }
+    }
+    const int32_t crow = (pos0 - 1 + 16) % 16;
+    ggml_backend_tensor_set(ds.p_tok,  &anchor, 0, 4);
+    ggml_backend_tensor_set(ds.p_crow, &crow,   0, 4);
+    ggml_backend_tensor_set(ds.p_pos,  pos.data(), 0, pos.size() * 4);
+    ggml_backend_tensor_set(ds.p_idx,  idx.data(), 0, idx.size() * 8);
+    ggml_backend_tensor_set(ds.p_mask_f, mf.data(), 0, mf.size() * 2);
+    ggml_backend_tensor_set(ds.p_mask_s, ms.data(), 0, ms.size() * 2);
+    if (ggml_backend_graph_compute(gpu, ds.draft.gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("dspark: draft failed");
+    out.resize((size_t) n_steps);
+    ggml_backend_tensor_get(ds.p_out, out.data(), 0, (size_t) n_steps * 4);
+}
+
+void InklingEngine::Impl::dspark_rollback(int keep_tokens) {
+    // state = the conv inputs of the last nc-1 kept tokens: rows keep..keep+nc-2 of each window
+    ggml_init_params p{};
+    const int nodes = 4 * (int) ik.n_visit + 16;
+    p.mem_size = ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false);
+    p.no_alloc = true;
+    ggml_context * c = ggml_init(p);
+    ggml_cgraph * gf = ggml_new_graph_custom(c, nodes, false);
+    for (uint32_t iv = 0; iv < ik.n_visit; ++iv) {
+        ggml_tensor * xsv = ds.xs[iv];
+        ggml_tensor * src = ggml_view_2d(c, xsv, ik.n_conv - 1, n_ch, xsv->nb[1], (size_t) keep_tokens * 4);
+        ggml_build_forward_expand(gf, ggml_cpy(c, src, conv_l[iv]));
+    }
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) throw std::runtime_error("dspark: rollback alloc failed");
+    if (ggml_backend_graph_compute(gpu, gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("dspark: rollback failed");
+    ggml_free(c);
+}
+
+void InklingEngine::Impl::generate_spec(const std::vector<int32_t> & prompt, int max_new, int n_draft,
+                                        const std::function<bool(int32_t)> & on_token) {
+    n_draft = std::max(1, std::min(n_draft, ds.block - 1));
+    static const bool stats = getenv("INK_SPEC_STATS") != nullptr;
+    // prompt: forward with the features captured, every chunk injected
+    const int P = (int) prompt.size();
+    cap_feat = true;
+    for (int i = 0; i < P; i += UBATCH) {
+        const int T = std::min(UBATCH, P - i);
+        const int p0 = n_past_;
+        no_keep_now = true;
+        forward(prompt.data() + i, T, i + T == P);
+        no_keep_now = false;
+        dspark_inject(p0, T);
+    }
+    kv_toks.insert(kv_toks.end(), prompt.begin(), prompt.end());
+    int32_t last = (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+
+    const int T = n_draft + 1;
+    uint64_t steps = 0, drafted = 0, accepted = 0;
+    std::vector<int32_t> draft, toks((size_t) T), am((size_t) T);
+    int produced = 0;
+    while (produced < max_new) {
+        if (!on_token(last)) break;
+        ++produced;
+        if (n_past_ + T + ds.block > n_ctx) break;
+        const int pos0 = n_past_;
+        dspark_draft(last, pos0, n_draft, draft);
+        toks[0] = last;
+        for (int i = 0; i < n_draft; ++i) toks[(size_t) i + 1] = draft[(size_t) i];
+
+        // verify: one kept forward over [last, drafts], every position's argmax
+        // and features, and the conv windows for a rollback
+        xs_save = true;
+        am_out = ds.p_am;
+        all_logits = true;
+        spec_verify(toks.data(), T);
+        all_logits = false;
+        am_out = nullptr;
+        xs_save = false;
+        ggml_backend_tensor_get(ds.p_am, am.data(), 0, (size_t) T * 4);
+        int a = 0;
+        while (a < n_draft && am[(size_t) a] == draft[(size_t) a]) ++a;
+        ++steps; drafted += n_draft; accepted += a;
+
+        // keep [last, drafts 0..a-1]
+        const int keep = a + 1;
+        if (keep < T) {
+            dspark_rollback(keep);
+            n_past_ -= T - keep;
+        }
+        kv_toks.insert(kv_toks.end(), toks.begin(), toks.begin() + keep);
+        dspark_inject(pos0, keep);
+        bool stop = false;
+        for (int i = 0; i < a && !stop; ++i) {
+            if (produced >= max_new || !on_token(draft[(size_t) i])) { stop = true; break; }
+            ++produced;
+        }
+        if (stop) break;
+        last = am[(size_t) a];
+    }
+    cap_feat = false;
+    if (stats && steps)
+        fprintf(stderr, "[dspark] %llu steps, draft %d: accepted %llu of %llu (%.0f%%), %.2f tokens per step\n",
+                (unsigned long long) steps, n_draft, (unsigned long long) accepted, (unsigned long long) drafted,
+                100.0 * accepted / drafted, 1.0 + (double) accepted / steps);
+}
+
 InklingEngine::InklingEngine(Model & model, const RuntimeConfig & cfg)
     : impl_(std::make_unique<Impl>(model, cfg)) { impl_->init(); }
 InklingEngine::~InklingEngine() {
@@ -1863,6 +2305,11 @@ void InklingEngine::prefill(const std::vector<int32_t> & tokens) {
         if (m.progress_cb) m.progress_cb(i + T, P);
     }
     m.kv_toks.insert(m.kv_toks.end(), tokens.begin(), tokens.end());
+}
+bool InklingEngine::has_draft() const { return impl_->ds.on; }
+void InklingEngine::generate_spec(const std::vector<int32_t> & prompt, int max_new, int n_draft,
+                                  const std::function<bool(int32_t)> & on_token) {
+    impl_->generate_spec(prompt, max_new, n_draft, on_token);
 }
 void InklingEngine::reset() {
     impl_->free_kept();

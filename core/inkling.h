@@ -30,6 +30,11 @@ public:
     const std::vector<int32_t> & kv_tokens() const;
 
     bool has_expert_cache() const;
+
+    // DSpark speculative greedy decode (--mtp with a dspark-*.gguf draft)
+    bool has_draft() const;
+    void generate_spec(const std::vector<int32_t> & prompt, int max_new, int n_draft,
+                       const std::function<bool(int32_t)> & on_token);
     Runtime::CacheStats cache_stats() const;
     void set_progress_cb(std::function<void(int, int)> cb);
 
