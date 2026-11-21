@@ -767,8 +767,9 @@ int main(int argc, char ** argv) {
     const bool mtp = use_mtp && rt->has_mtp();
     if (use_mtp && !rt->has_mtp())
         fprintf(stderr, "warning: --mtp requested but model has no nextn block; using plain decode\n");
-    if (mtp) fprintf(stderr, "MTP self-speculative decode ON (draft=%d; greedy only -"
-                             " request sampling parameters are ignored)\n", n_draft);
+    if (mtp) fprintf(stderr, "MTP self-speculative decode ON (draft=%d; %s)\n", n_draft,
+                     rt->set_mtp_sampler(nullptr) ? "samples with each request's settings, exact"
+                                                  : "greedy only - request sampling parameters are ignored");
 
     // /v1/models id: the model name (general.name) so clients identify the
     // actual model, not the architecture; fall back to "questwend:<arch>".
@@ -1837,6 +1838,11 @@ int main(int argc, char ** argv) {
                             // checkpoint once the prompt is fully in KV: the next
                             // request rewinds here if the client rewrites this turn
                             const bool ckpt = st->generated == 0;
+                            rt->set_mtp_sampler([&](const std::vector<float> & l) {
+                                const int32_t t = st->smp.sample(l);
+                                st->smp.accept(t);
+                                return t;
+                            });
                             rt->generate_mtp(rp, st->max_tokens - st->generated, n_draft,
                                              [&](int32_t t) -> bool {
                                 if (is_stop(t) || rt->n_past() + 1 >= n_ctx) { st->done = true; return false; }
@@ -1850,6 +1856,7 @@ int main(int argc, char ** argv) {
                                 st->generated++;
                                 return st->generated < st->max_tokens;
                             }, &pending, ckpt);
+                            rt->set_mtp_sampler(nullptr);
 
                             if (st->paused && !st->done) {              // yield the runtime
                                 st->pending = pending;
@@ -1973,6 +1980,13 @@ int main(int argc, char ** argv) {
                 }
                 bool first = true;
                 clk::time_point glog = clk::now();
+                Sampler msmp(sc);
+                msmp.prime(prompt);
+                rt->set_mtp_sampler([&](const std::vector<float> & l) {
+                    const int32_t t = msmp.sample(l);
+                    msmp.accept(t);
+                    return t;
+                });
                 rt->generate_mtp(prompt, max_tokens, n_draft, [&](int32_t t) -> bool {
                     if (is_stop(t) || rt->n_past() + 1 >= n_ctx) return false;
                     if (first) { t_prefill = clk::now(); glog = t_prefill; first = false; }
@@ -1986,6 +2000,7 @@ int main(int argc, char ** argv) {
                     }
                     return generated < max_tokens;
                 }, nullptr, /*ckpt_after_prefill=*/true);
+                rt->set_mtp_sampler(nullptr);
             } else {
                 Sampler smp(sc);
                 if (!ovr.empty()) rt->set_embd_overrides(ovr);   // vision

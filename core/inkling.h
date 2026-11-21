@@ -33,8 +33,10 @@ public:
 
     // DSpark speculative greedy decode (--mtp with a dspark-*.gguf draft)
     bool has_draft() const;
+    // sampler for generate_spec (null = greedy); it sees each emitted token's logits once
+    void set_sampler(std::function<int32_t(const std::vector<float> &)> fn);
     void generate_spec(const std::vector<int32_t> & prompt, int max_new, int n_draft,
-                       const std::function<bool(int32_t)> & on_token);
+                       const std::function<bool(int32_t)> & on_token, int32_t * out_pending = nullptr);
     Runtime::CacheStats cache_stats() const;
     void set_progress_cb(std::function<void(int, int)> cb);
 

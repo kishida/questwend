@@ -172,6 +172,13 @@ public:
                       int32_t * out_pending = nullptr,
                       bool ckpt_after_prefill = false);
 
+    // Sampler for generate_mtp where the runtime can sample exactly (Inkling 2's
+    // DSpark: each verified position is sampled from the target and the draft is
+    // kept while they agree). Null = greedy. The function sees every emitted
+    // token's logits exactly once, so it may also do the penalty bookkeeping.
+    // Returns false when generate_mtp of this model is greedy-only.
+    bool set_mtp_sampler(std::function<int32_t(const std::vector<float> &)> fn);
+
     void reset();                 // clear KV cache / position
     int  n_past() const;
 

@@ -295,11 +295,12 @@ struct InklingEngine::Impl {
     Kept vkept;                // the verify graph (T = 1 + n_draft), kept per KV bucket
     bool no_keep_now = false;  // forward(): build fresh (the prompt of a speculative run)
     void spec_verify(const int32_t * toks, int T);
+    std::function<int32_t(const std::vector<float> &)> spec_pick;   // null: greedy
     void dspark_inject(int pos0, int T);           // ds.feat columns 0..T-1 -> draft KV at pos0..
     void dspark_draft(int32_t anchor, int pos0, int n_steps, std::vector<int32_t> & out);
     void dspark_rollback(int keep_tokens);         // conv states after the first keep_tokens of the verify
     void generate_spec(const std::vector<int32_t> & prompt, int max_new, int n_draft,
-                       const std::function<bool(int32_t)> & on_token);
+                       const std::function<bool(int32_t)> & on_token, int32_t * out_pending = nullptr);
     void free_kept() {
         if (kept.ga) ggml_gallocr_free(kept.ga);
         if (kept.g.ctx) ggml_free(kept.g.ctx);
@@ -940,7 +941,11 @@ void InklingEngine::Impl::forward(const int32_t * toks, int T, bool want_logits)
         ggml_backend_tensor_get(out, logits.data(), 0, logits.size() * sizeof(float));
     }
     if (!use_kept) ggml_free(g.ctx);
+    const int p0 = n_past_;
     n_past_ += T;
+    // the draft needs the target's features of every committed position, whatever
+    // path processed it (a server prefill, a plain decode, the prompt of a spec run)
+    if (ds.on) dspark_inject(p0, T);
 }
 
 void InklingEngine::Impl::spec_verify(const int32_t * toks, int T) {
@@ -2018,6 +2023,7 @@ void InklingEngine::Impl::dspark_init(const std::string & path) {
     if (!ds.sbuf) throw std::runtime_error("dspark: cannot allocate the draft state");
     ggml_backend_buffer_clear(ds.sbuf, 0);
     ds.on = true;
+    cap_feat = true;   // from here on every target graph stores the draft's features
     fprintf(stderr, "inkling2: DSpark draft %s: %d layers, block %d, target visits", path.c_str(), ds.n_layer, ds.block);
     for (int t : ds.target) fprintf(stderr, " %d", t);
     fprintf(stderr, " (%.0f MB)\n", ggml_backend_buffer_get_size(ds.wbuf) / 1048576.0 + ggml_backend_buffer_get_size(ds.sbuf) / 1048576.0);
@@ -2198,29 +2204,35 @@ void InklingEngine::Impl::dspark_rollback(int keep_tokens) {
 }
 
 void InklingEngine::Impl::generate_spec(const std::vector<int32_t> & prompt, int max_new, int n_draft,
-                                        const std::function<bool(int32_t)> & on_token) {
+                                        const std::function<bool(int32_t)> & on_token, int32_t * out_pending) {
+    if (out_pending) *out_pending = -1;
     n_draft = std::max(1, std::min(n_draft, ds.block - 1));
     static const bool stats = getenv("INK_SPEC_STATS") != nullptr;
     // prompt: forward with the features captured, every chunk injected
     const int P = (int) prompt.size();
-    cap_feat = true;
+    if (P == 0) throw std::runtime_error("inkling2: speculative decode needs at least one new token");
     for (int i = 0; i < P; i += UBATCH) {
         const int T = std::min(UBATCH, P - i);
-        const int p0 = n_past_;
         no_keep_now = true;
-        forward(prompt.data() + i, T, i + T == P);
+        forward(prompt.data() + i, T, i + T == P);   // injects the draft features itself
         no_keep_now = false;
-        dspark_inject(p0, T);
     }
     kv_toks.insert(kv_toks.end(), prompt.begin(), prompt.end());
-    int32_t last = (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+    // Sampling stays exact with a deterministic draft: sample each verified
+    // position from the target as usual and keep the draft while they agree.
+    auto pick = [&](const std::vector<float> & l) -> int32_t {
+        if (spec_pick) return spec_pick(l);
+        return (int32_t) (std::max_element(l.begin(), l.end()) - l.begin());
+    };
+    int32_t last = pick(logits);
+    std::vector<float> all, row;
 
     const int T = n_draft + 1;
     uint64_t steps = 0, drafted = 0, accepted = 0;
     std::vector<int32_t> draft, toks((size_t) T), am((size_t) T);
     int produced = 0;
     while (produced < max_new) {
-        if (!on_token(last)) break;
+        if (!on_token(last)) { if (out_pending) *out_pending = last; break; }   // not decoded yet
         ++produced;
         if (n_past_ + T + ds.block > n_ctx) break;
         const int pos0 = n_past_;
@@ -2237,9 +2249,23 @@ void InklingEngine::Impl::generate_spec(const std::vector<int32_t> & prompt, int
         all_logits = false;
         am_out = nullptr;
         xs_save = false;
-        ggml_backend_tensor_get(ds.p_am, am.data(), 0, (size_t) T * 4);
         int a = 0;
-        while (a < n_draft && am[(size_t) a] == draft[(size_t) a]) ++a;
+        int32_t bonus = -1;
+        if (spec_pick) {
+            all.resize((size_t) ik.n_vocab * T);
+            ggml_backend_tensor_get(vkept.out, all.data(), 0, all.size() * sizeof(float));
+            for (int i = 0; i <= n_draft; ++i) {
+                row.assign(all.begin() + (size_t) i * ik.n_vocab, all.begin() + (size_t) (i + 1) * ik.n_vocab);
+                const int32_t t = spec_pick(row);
+                if (i < n_draft && t == draft[(size_t) i]) { ++a; continue; }
+                bonus = t;
+                break;
+            }
+        } else {
+            ggml_backend_tensor_get(ds.p_am, am.data(), 0, (size_t) T * 4);
+            while (a < n_draft && am[(size_t) a] == draft[(size_t) a]) ++a;
+            bonus = am[(size_t) a];
+        }
         ++steps; drafted += n_draft; accepted += a;
 
         // keep [last, drafts 0..a-1]
@@ -2252,13 +2278,14 @@ void InklingEngine::Impl::generate_spec(const std::vector<int32_t> & prompt, int
         dspark_inject(pos0, keep);
         bool stop = false;
         for (int i = 0; i < a && !stop; ++i) {
-            if (produced >= max_new || !on_token(draft[(size_t) i])) { stop = true; break; }
+            if (produced >= max_new) { stop = true; break; }
+            // the rest of the accepted drafts are in kv_tokens(); the bonus is the next undecoded one
+            if (!on_token(draft[(size_t) i])) { if (out_pending) *out_pending = bonus; stop = true; break; }
             ++produced;
         }
         if (stop) break;
-        last = am[(size_t) a];
+        last = bonus;
     }
-    cap_feat = false;
     if (stats && steps)
         fprintf(stderr, "[dspark] %llu steps, draft %d: accepted %llu of %llu (%.0f%%), %.2f tokens per step\n",
                 (unsigned long long) steps, n_draft, (unsigned long long) accepted, (unsigned long long) drafted,
@@ -2307,9 +2334,10 @@ void InklingEngine::prefill(const std::vector<int32_t> & tokens) {
     m.kv_toks.insert(m.kv_toks.end(), tokens.begin(), tokens.end());
 }
 bool InklingEngine::has_draft() const { return impl_->ds.on; }
+void InklingEngine::set_sampler(std::function<int32_t(const std::vector<float> &)> fn) { impl_->spec_pick = std::move(fn); }
 void InklingEngine::generate_spec(const std::vector<int32_t> & prompt, int max_new, int n_draft,
-                                  const std::function<bool(int32_t)> & on_token) {
-    impl_->generate_spec(prompt, max_new, n_draft, on_token);
+                                  const std::function<bool(int32_t)> & on_token, int32_t * out_pending) {
+    impl_->generate_spec(prompt, max_new, n_draft, on_token, out_pending);
 }
 void InklingEngine::reset() {
     impl_->free_kept();
