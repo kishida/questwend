@@ -95,6 +95,15 @@ struct InklingEngine::Impl {
     ggml_backend_buffer_t map_buf = nullptr;
     ggml_tensor *         p_slotmap = nullptr;   // i32 [n_exp, 3 * n_phys]: (role, layer) rows
     bool fuse = false;
+    // INK_PLACE=hot: prefill runs on the "core" placement and counts every pick
+    // per (layer, expert) -- a looped layer's three passes add up on their own --
+    // then, before the first decode token, the pool is refilled by that count
+    // and stays fixed. The count is the expected value of a slot: picks per
+    // token times visits, which is what pinning whole loop layers approximated.
+    bool hot = false, replace_pending = false;
+    std::vector<uint32_t> pick_cnt;       // [n_phys * n_exp]
+    void replace_by_count();
+    void refresh_residency();
     int  refill   = 4;          // most-missed experts made resident after each token
     ggml_context *        car_ctx = nullptr;
     ggml_backend_buffer_t car_buf = nullptr;
@@ -940,13 +949,14 @@ void InklingEngine::Impl::init_offload(size_t budget, size_t st_bytes) {
         // Fill in reverse priority: the slot pools evict least-recently installed,
         // so whatever goes in last is what stays when a pool runs out.
         std::vector<int> order;   // highest priority first
-        if (place == "core") {
+        hot = place == "hot";
+        if (place == "core" || hot) {
             for (int ip = (int) ik.core_start; ip < (int) ik.core_end; ++ip) order.push_back(ip);
             for (int ip = 0; ip < n_phys; ++ip) if (!ik.in_core((uint32_t) ip)) order.push_back(ip);
         } else if (place == "front") {   // what --n-cpu-moe's complement looks like: last layers first
             for (int ip = n_phys - 1; ip >= 0; --ip) order.push_back(ip);
         } else {
-            throw std::runtime_error("INK_PLACE: core, front or lru");
+            throw std::runtime_error("INK_PLACE: core, hot, front or lru");
         }
         auto t0 = clk::now();
         for (auto it = order.rbegin(); it != order.rend(); ++it)
@@ -976,17 +986,9 @@ void InklingEngine::Impl::init_offload(size_t budget, size_t st_bytes) {
             p_slotmap = ggml_new_tensor_2d(map_ctx, GGML_TYPE_I32, hp.n_expert, 3 * n_phys);
             map_buf = ggml_backend_alloc_ctx_tensors(map_ctx, gpu);
             if (!map_buf) throw std::runtime_error("inkling2: cannot allocate the slot map");
-            std::vector<int32_t> mv((size_t) hp.n_expert * 3 * n_phys, 0);
-            for (int r = 0; r < 3; ++r)
-                for (int ip = 0; ip < n_phys; ++ip) {
-                    const int32_t * row = ec->slot_of_row((ExpertCache::Role) r, ip);
-                    std::copy(row, row + hp.n_expert, mv.begin() + ((size_t) r * n_phys + ip) * hp.n_expert);
-                }
-            ggml_backend_tensor_set(p_slotmap, mv.data(), 0, mv.size() * 4);
-            int nf = 0;
-            for (uint32_t iv = 0; iv < ik.n_visit; ++iv) nf += full_res[ik.phys(iv)];
-            fprintf(stderr, "inkling2: %d of %u visits fully resident -> decoded inside fused graphs\n", nf, ik.n_visit);
         }
+        pick_cnt.assign((size_t) n_phys * hp.n_expert, 0);
+        refresh_residency();
     }
 }
 
@@ -1060,6 +1062,12 @@ void InklingEngine::Impl::forward_offload(const int32_t * toks, int T, bool want
     const bool keep   = decode && want_logits && !no_keep;
     const int  n_kv_full = keep ? std::min(n_ctx, (n_past_ + 1 + 255) / 256 * 256) : n_past_ + T;
 
+    if (decode && replace_pending) {
+        replace_pending = false;
+        replace_by_count();
+        for (auto & sg : segA) free_seg(sg);   // the routed visits changed
+        segA.assign((size_t) NV + 1, Seg{});
+    }
     if (keep && seg_bucket != n_kv_full) {
         for (auto & sg : segA) free_seg(sg);
         segA.assign((size_t) NV + 1, Seg{});
@@ -1379,6 +1387,8 @@ void InklingEngine::Impl::forward_offload(const int32_t * toks, int T, bool want
             // ---- prefill, static pool: a fully resident layer runs from its slots;
             // any other layer is streamed whole into the scratch and runs there ----
             auto t1 = clk::now();
+            for (int32_t e : sel) pick_cnt[(size_t) ip * n_exp + e]++;
+            if (hot) replace_pending = true;
             bool full = true;
             for (int e = 0; e < n_exp && full; ++e)
                 for (int r = 0; r < 3 && full; ++r) full = ec->resident((ExpertCache::Role) r, ip, e);
@@ -1498,6 +1508,70 @@ void InklingEngine::Impl::forward_offload(const int32_t * toks, int T, bool want
     }
     (void) t_tok;
     n_past_ += T;
+}
+
+void InklingEngine::Impl::refresh_residency() {
+    const int n_phys = (int) hp.n_layer, n_exp = (int) hp.n_expert;
+    full_res.assign((size_t) n_phys, 0);
+    for (int ip = 0; ip < n_phys; ++ip) {
+        int n = 0;
+        for (int e = 0; e < n_exp; ++e) {
+            bool r = true;
+            for (int k = 0; k < 3 && r; ++k) r = ec->resident((ExpertCache::Role) k, ip, e);
+            n += r;
+        }
+        full_res[(size_t) ip] = n == n_exp ? 1 : 0;
+    }
+    if (!fuse || !p_slotmap) return;
+    std::vector<int32_t> mv((size_t) n_exp * 3 * n_phys, 0);
+    for (int r = 0; r < 3; ++r)
+        for (int ip = 0; ip < n_phys; ++ip) {
+            const int32_t * row = ec->slot_of_row((ExpertCache::Role) r, ip);
+            std::copy(row, row + n_exp, mv.begin() + ((size_t) r * n_phys + ip) * n_exp);
+        }
+    ggml_backend_tensor_set(p_slotmap, mv.data(), 0, mv.size() * 4);
+    int nf = 0;
+    for (uint32_t iv = 0; iv < ik.n_visit; ++iv) nf += full_res[ik.phys(iv)];
+    fprintf(stderr, "inkling2: %d of %u visits fully resident -> decoded inside fused graphs\n", nf, ik.n_visit);
+}
+
+void InklingEngine::Impl::replace_by_count() {
+    const int n_phys = (int) hp.n_layer, n_exp = (int) hp.n_expert;
+    std::vector<int> keys((size_t) n_phys * n_exp);
+    for (size_t k = 0; k < keys.size(); ++k) keys[k] = (int) k;
+    // ascending: the pools keep what goes in last
+    std::stable_sort(keys.begin(), keys.end(), [&](int a, int b) { return pick_cnt[(size_t) a] < pick_cnt[(size_t) b]; });
+    auto t0 = clk::now();
+    const uint64_t m0 = ec->stats().misses;
+    for (int k : keys) {
+        const int ip = k / n_exp, e = k % n_exp;
+        bool r = true;
+        for (int q = 0; q < 3 && r; ++q) r = ec->resident((ExpertCache::Role) q, ip, e);
+        if (r) for (int q = 0; q < 3; ++q) ec->touch((ExpertCache::Role) q, ip, e);
+        else   ec->ensure_resident(ip, e);
+    }
+    ggml_backend_synchronize(gpu);
+    uint64_t total = 0, covered = 0;
+    for (int k = 0; k < n_phys * n_exp; ++k) {
+        total += pick_cnt[(size_t) k];
+        bool r = true;
+        for (int q = 0; q < 3 && r; ++q) r = ec->resident((ExpertCache::Role) q, k / n_exp, k % n_exp);
+        if (r) covered += pick_cnt[(size_t) k];
+    }
+    fprintf(stderr, "inkling2: pool refilled by prefill pick count in %.0f ms (%llu expert fetches); "
+                    "it covers %.1f%% of the prompt's picks. resident per layer:",
+            ms_since(t0), (unsigned long long) ((ec->stats().misses - m0) / 3), total ? 100.0 * covered / total : 0.0);
+    for (int ip = 0; ip < n_phys; ++ip) {
+        int n = 0;
+        for (int e = 0; e < n_exp; ++e) {
+            bool r = true;
+            for (int q = 0; q < 3 && r; ++q) r = ec->resident((ExpertCache::Role) q, ip, e);
+            n += r;
+        }
+        fprintf(stderr, " %d%s:%d", ip, ik.in_core((uint32_t) ip) ? "*" : "", n);
+    }
+    fprintf(stderr, "\n");
+    refresh_residency();
 }
 
 void InklingEngine::Impl::dump_offload_stats() {
