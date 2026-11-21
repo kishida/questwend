@@ -247,8 +247,9 @@ struct InklingEngine::Impl {
     // can replay it as a CUDA graph instead of launching ~11k kernels.
     struct Kept {
         Gr g; ggml_tensor * inp = nullptr, * out = nullptr;
-        ggml_gallocr_t ga = nullptr; int bucket = 0;
+        ggml_gallocr_t ga = nullptr; int bucket = 0, T = 0;
     } kept;
+    bool all_logits = false;   // head over every token (a verify step), not just the last
     void free_kept() {
         if (kept.ga) ggml_gallocr_free(kept.ga);
         if (kept.g.ctx) ggml_free(kept.g.ctx);
@@ -789,7 +790,7 @@ void InklingEngine::Impl::build_full(Gr & g, ggml_tensor * inp, bool want_logits
     }
     ggml_tensor * out = nullptr;
     if (want_logits) {
-        out = head(g, st, true);
+        out = head(g, st, !all_logits);
         ggml_set_output(out);
         ggml_build_forward_expand(g.gf, out);
     } else {
@@ -804,16 +805,21 @@ void InklingEngine::Impl::forward(const int32_t * toks, int T, bool want_logits)
     static const bool prof = getenv("INK_PROF") != nullptr;
     static const bool no_keep = getenv("INK_NO_KEEP") != nullptr;
     auto t0 = clk::now();
-    const bool use_kept = T == 1 && want_logits && !no_keep;
+    // small batches (a speculative verify) keep their graph too, one per T
+    static const bool keep_small = getenv("INK_VERIFY_BENCH") != nullptr;
+    const bool use_kept = (T == 1 || (keep_small && T <= 8)) && want_logits && !no_keep;
     Gr g; ggml_tensor * inp = nullptr, * out = nullptr;
     if (use_kept) {
-        const int bucket = std::min(n_ctx, (n_past_ + 1 + 255) / 256 * 256);
-        if (kept.bucket != bucket) {
+        const int bucket = std::min(n_ctx, (n_past_ + T + 255) / 256 * 256);
+        if (kept.bucket != bucket || kept.T != T) {
             free_kept();
-            kept.g = new_graph(1, bucket);
-            kept.inp = ggml_new_tensor_1d(kept.g.ctx, GGML_TYPE_I32, 1);
+            kept.g = new_graph(T, bucket);
+            kept.inp = ggml_new_tensor_1d(kept.g.ctx, GGML_TYPE_I32, T);
             ggml_set_input(kept.inp); ggml_set_name(kept.inp, "ink_tokens");
+            all_logits = T > 1;
             build_full(kept.g, kept.inp, true, &kept.out);
+            all_logits = false;
+            kept.T = T;
             kept.ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu));
             if (!ggml_gallocr_alloc_graph(kept.ga, kept.g.gf)) throw std::runtime_error("inkling2: graph alloc failed");
             kept.bucket = bucket;
@@ -1832,6 +1838,20 @@ const std::vector<float> & InklingEngine::decode(const std::vector<int32_t> & to
         if (m.progress_cb && P > UBATCH) m.progress_cb(i + T, P);
     }
     m.kv_toks.insert(m.kv_toks.end(), tokens.begin(), tokens.end());
+    // INK_VERIFY_BENCH=1: after the prompt, time forwards of 1..8 tokens (what a
+    // speculative verify step costs). It advances the state; for measuring only.
+    if (P > 1 && getenv("INK_VERIFY_BENCH")) {
+        for (int k : { 1, 2, 3, 4, 5, 8, 1 }) {
+            std::vector<int32_t> t((size_t) k, tokens.back());
+            double best = 1e9;
+            for (int rep = 0; rep < 4; ++rep) {
+                auto t0 = clk::now();
+                m.forward(t.data(), k, true);
+                best = std::min(best, ms_since(t0));
+            }
+            fprintf(stderr, "[verify bench] %d token(s): %.1f ms (%.1f ms/token)\n", k, best, best / k);
+        }
+    }
     return m.logits;
 }
 void InklingEngine::prefill(const std::vector<int32_t> & tokens) {
