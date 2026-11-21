@@ -2,6 +2,7 @@
 #include "model.h"
 #include "ngram_table.h"
 #include "expert_cache.h"
+#include "inkling.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -6084,41 +6085,61 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
 }
 
 // ---- public wrappers ----
-Runtime::Runtime(Model & model, const RuntimeConfig & cfg)
-    : impl_(std::make_unique<Impl>(model, cfg)) {
+Runtime::Runtime(Model & model, const RuntimeConfig & cfg) {
+    if (model.hparams().arch == Arch::INKLING2) {
+        ink_ = std::make_unique<InklingEngine>(model, cfg);
+        return;
+    }
+    impl_ = std::make_unique<Impl>(model, cfg);
     impl_->init();
 }
 Runtime::~Runtime() = default;
 
+static void ink_unsupported(const char * what) {
+    throw std::runtime_error(std::string("inkling2: ") + what + " is not supported for this architecture");
+}
+
 const std::vector<float> & Runtime::decode(const std::vector<int32_t> & tokens) {
+    if (ink_) return ink_->decode(tokens);
     const std::vector<float> & l = impl_->decode(tokens);
     impl_->kv_toks.insert(impl_->kv_toks.end(), tokens.begin(), tokens.end());
     impl_->report_compute_buffers();
     return l;
 }
 void Runtime::set_embd_overrides(std::vector<EmbdOverride> ovr) {
+    if (ink_) { if (!ovr.empty()) ink_unsupported("image input"); return; }
     impl_->embd_ovr = std::move(ovr);
 }
-const std::vector<float> & Runtime::mtp_draft(int32_t token) { return impl_->mtp_draft(token); }
-bool Runtime::has_mtp() const { return impl_->model.hparams().has_mtp(); }
+const std::vector<float> & Runtime::mtp_draft(int32_t token) {
+    if (ink_) ink_unsupported("MTP");
+    return impl_->mtp_draft(token);
+}
+bool Runtime::has_mtp() const { return !ink_ && impl_->model.hparams().has_mtp(); }
 void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                            const std::function<bool(int32_t)> & on_token,
                            int32_t * out_pending, bool ckpt_after_prefill) {
+    if (ink_) ink_unsupported("MTP");
     impl_->generate_mtp(prompt, max_new, n_draft, on_token, out_pending, ckpt_after_prefill);
 }
 void Runtime::prefill(const std::vector<int32_t> & tokens, bool mtp_kv) {
+    if (ink_) { ink_->prefill(tokens); return; }
     impl_->prefill(tokens, mtp_kv);
     impl_->kv_toks.insert(impl_->kv_toks.end(), tokens.begin(), tokens.end());
     impl_->report_compute_buffers();   // the batched prefill graph is the biggest one
 }
-void Runtime::snapshot_ckpt()          { impl_->pk_snapshot(); }
-int  Runtime::best_ckpt(int n) const   { return impl_->pk_best(n); }
-int  Runtime::rewind_to(int n)         { return impl_->pk_rewind(n); }
-void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->mrope_next = 0; impl_->kv_toks.clear(); impl_->pk.clear(); impl_->zero_states(); }
-int  Runtime::n_past() const { return impl_->n_past; }
-const std::vector<int32_t> & Runtime::kv_tokens() const { return impl_->kv_toks; }
-bool Runtime::has_expert_cache() const { return impl_->ecache != nullptr; }
+void Runtime::snapshot_ckpt()          { if (ink_) return; impl_->pk_snapshot(); }
+int  Runtime::best_ckpt(int n) const   { return ink_ ? (n >= ink_->n_past() ? ink_->n_past() : -1) : impl_->pk_best(n); }
+int  Runtime::rewind_to(int n)         {
+    // conv state cannot be truncated and there are no checkpoints: only "no-op" rewinds
+    if (ink_) return n >= ink_->n_past() ? ink_->n_past() : -1;
+    return impl_->pk_rewind(n);
+}
+void Runtime::reset()        { if (ink_) { ink_->reset(); return; } impl_->n_past = 0; impl_->mtp_past = 0; impl_->mrope_next = 0; impl_->kv_toks.clear(); impl_->pk.clear(); impl_->zero_states(); }
+int  Runtime::n_past() const { return ink_ ? ink_->n_past() : impl_->n_past; }
+const std::vector<int32_t> & Runtime::kv_tokens() const { return ink_ ? ink_->kv_tokens() : impl_->kv_toks; }
+bool Runtime::has_expert_cache() const { return ink_ ? ink_->has_expert_cache() : impl_->ecache != nullptr; }
 Runtime::CacheStats Runtime::cache_stats() const {
+    if (ink_) return ink_->cache_stats();
     CacheStats c;
     if (impl_->ecache) {
         const auto & s = impl_->ec_stats_sum();
@@ -6126,7 +6147,9 @@ Runtime::CacheStats Runtime::cache_stats() const {
     }
     return c;
 }
-void Runtime::set_progress_cb(std::function<void(int, int)> cb) { impl_->progress_cb = std::move(cb); }
+void Runtime::set_progress_cb(std::function<void(int, int)> cb) {
+    if (ink_) { ink_->set_progress_cb(std::move(cb)); return; }
+    impl_->progress_cb = std::move(cb); }
 
 // ---- prompt-cache slot state save/load ----
 // Sequential stream: header, kv_toks, mtp_hidden, then per layer either the
@@ -6144,6 +6167,7 @@ constexpr uint32_t STATE_MAGIC = 0x33535351;   // "QSS3" little-endian
 }
 
 size_t Runtime::state_bytes() const {
+    if (ink_) ink_unsupported("saving state");
     const auto & hp = impl_->model.hparams();
     size_t n = sizeof(StateHeader);
     n += impl_->kv_toks.size() * sizeof(int32_t);
@@ -6160,6 +6184,7 @@ size_t Runtime::state_bytes() const {
 }
 
 void Runtime::save_state(const std::function<void(const void *, size_t)> & sink) const {
+    if (ink_) ink_unsupported("saving state");
     const auto & hp = impl_->model.hparams();
     StateHeader h{};
     h.magic      = STATE_MAGIC;
@@ -6195,6 +6220,7 @@ void Runtime::save_state(const std::function<void(const void *, size_t)> & sink)
 }
 
 void Runtime::load_state(const std::function<void(void *, size_t)> & src) {
+    if (ink_) ink_unsupported("loading state");
     const auto & hp = impl_->model.hparams();
     StateHeader h{};
     src(&h, sizeof(h));

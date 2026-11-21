@@ -2,6 +2,7 @@
 #include "model.h"   // Vocab
 
 #include <algorithm>
+#include <cwctype>
 #include <limits>
 
 namespace questwend {
@@ -82,7 +83,10 @@ Tokenizer::Tokenizer(const Vocab & vocab) {
     }
     pre_     = vocab.pre == "deepseek-v3" ? Pre::DEEPSEEK3
              : vocab.pre == "lfm2"        ? Pre::LLAMA3
+             : vocab.pre == "inkling2" || vocab.pre == "gpt-4o" ? Pre::GPT4O
              :                              Pre::QWEN;
+    // llama.cpp clears the BOS for inkling2 whatever the file says
+    if (vocab.pre == "inkling2") { bos_ = -1; add_bos_ = false; }
     ignore_merges_ = pre_ == Pre::LLAMA3;
 
     id_to_token_ = vocab.tokens;
@@ -262,6 +266,7 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string & text) const 
     switch (pre_) {
         case Pre::DEEPSEEK3: return pretokenize_deepseek3(text);
         case Pre::LLAMA3:    return pretokenize_qwen(text, 3);
+        case Pre::GPT4O:     return pretokenize_gpt4o(text);
         default:             return pretokenize_qwen(text);
     }
 }
@@ -329,6 +334,101 @@ std::vector<std::string> Tokenizer::pretokenize_qwen(const std::string & text, i
         if (nl_end > i)         { emit(i, nl_end); i = nl_end; continue; }  // \s*[\r\n]+
         if (j < n && j - i > 1) { emit(i, j - 1); i = j - 1; continue; }    // \s+(?!\S)
         emit(i, j); i = j;                                                  // \s+
+    }
+    return pieces;
+}
+
+// GPT-4o / o200k pretokenization (llama.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O):
+//   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+// | [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+// | \p{N}{1,3}
+// |  ?[^\s\p{L}\p{N}]+[\r\n/]*
+// | \s*[\r\n]+ | \s+(?!\S) | \s+
+// Words split at case changes ("CamelCase" -> "Camel", "Case"). Case is exact
+// for ASCII; beyond it iswupper/iswlower decide (BMP), and a letter that is
+// neither counts as Lo, which both classes accept.
+std::vector<std::string> Tokenizer::pretokenize_gpt4o(const std::string & text) const {
+    auto cps = utf8_decode(text);
+    std::vector<std::string> pieces;
+    const size_t n = cps.size();
+    auto is_space  = [](uint32_t c){ return c==' '||c=='\t'||c=='\n'||c=='\r'||c==0x0b||c==0x0c||(c>=0x80 && cp_is_space(c)); };
+    auto is_letter = [](uint32_t c){
+        if (c < 0x80) return (c>='A'&&c<='Z')||(c>='a'&&c<='z');
+        return cp_is_letter(c);
+    };
+    auto is_mark   = [](uint32_t c){ return c >= 0x80 && cp_is_mark(c); };
+    auto is_digit  = [](uint32_t c){ return cp_is_number(c); };
+    // 1 = upper only, 2 = lower only, 3 = both (Lm / Lo / M), 0 = not a word char
+    auto wclass = [&](uint32_t c) -> int {
+        if (c < 0x80) return (c>='A'&&c<='Z') ? 1 : (c>='a'&&c<='z') ? 2 : 0;
+        if (is_mark(c)) return 3;
+        if (!is_letter(c)) return 0;
+        if (c <= 0xFFFF) {
+            if (iswupper((wint_t) c)) return 1;
+            if (iswlower((wint_t) c)) return 2;
+        }
+        return 3;
+    };
+    auto lower = [](uint32_t c){ return c>='A'&&c<='Z' ? c+32 : c; };
+    auto contraction = [&](size_t j) -> size_t {   // length of (?i:'s|...) at j, or 0
+        if (j >= n || cps[j].cp != '\'' || j + 1 >= n) return 0;
+        const uint32_t d = lower(cps[j+1].cp);
+        if (d=='s'||d=='t'||d=='m'||d=='d') return 2;
+        if (j + 2 < n) {
+            const uint32_t e = lower(cps[j+2].cp);
+            if ((d=='r'&&e=='e')||(d=='v'&&e=='e')||(d=='l'&&e=='l')) return 3;
+        }
+        return 0;
+    };
+    // U*L+ from s; returns end or 0
+    auto alt1 = [&](size_t s) -> size_t {
+        size_t j = s; while (j < n && (wclass(cps[j].cp) & 1)) ++j;
+        size_t k = j; while (k < n && (wclass(cps[k].cp) & 2)) ++k;
+        if (k > j) return k;
+        if (j > s && (wclass(cps[j-1].cp) & 2)) return j;
+        return 0;
+    };
+    // U+L* from s
+    auto alt2 = [&](size_t s) -> size_t {
+        size_t j = s; while (j < n && (wclass(cps[j].cp) & 1)) ++j;
+        if (j == s) return 0;
+        size_t k = j; while (k < n && (wclass(cps[k].cp) & 2)) ++k;
+        return k;
+    };
+    auto emit = [&](size_t a, size_t b){
+        if (b <= a) return;
+        pieces.emplace_back(text.substr(cps[a].off, cps[b-1].off + cps[b-1].len - cps[a].off));
+    };
+
+    size_t i = 0;
+    while (i < n) {
+        const uint32_t c = cps[i].cp;
+        const bool can_prefix = c != '\r' && c != '\n' && !is_letter(c) && !is_digit(c);
+        size_t end = 0;
+        for (int alt = 1; alt <= 2 && !end; ++alt) {
+            auto f = [&](size_t s) { return alt == 1 ? alt1(s) : alt2(s); };
+            if (can_prefix && i + 1 < n) end = f(i + 1);
+            if (!end) end = f(i);
+        }
+        if (end) { end += contraction(end); emit(i, end); i = end; continue; }
+        if (is_digit(c)) {
+            size_t j = i + 1;
+            while (j < n && j - i < 3 && is_digit(cps[j].cp)) ++j;
+            emit(i, j); i = j; continue;
+        }
+        auto is_punct = [&](uint32_t d){ return !is_space(d) && !is_letter(d) && !is_digit(d); };
+        if (is_punct(c) || (c == ' ' && i + 1 < n && is_punct(cps[i+1].cp))) {
+            size_t j = c == ' ' ? i + 1 : i;
+            while (j < n && is_punct(cps[j].cp)) ++j;
+            while (j < n && (cps[j].cp=='\n' || cps[j].cp=='\r' || cps[j].cp=='/')) ++j;
+            emit(i, j); i = j; continue;
+        }
+        size_t j = i; while (j < n && is_space(cps[j].cp)) ++j;
+        size_t nl_end = i;
+        for (size_t k = i; k < j; ++k) if (cps[k].cp=='\n' || cps[k].cp=='\r') nl_end = k + 1;
+        if (nl_end > i)         { emit(i, nl_end); i = nl_end; continue; }
+        if (j < n && j - i > 1) { emit(i, j - 1); i = j - 1; continue; }
+        emit(i, j); i = j;
     }
     return pieces;
 }

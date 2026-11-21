@@ -37,6 +37,49 @@ enum class Arch {
     QWEN4EXP,     // Qwen3.8-Flash-Next: GDN + MoE + hyper-connections + QSA + PLE
     LFM2,         // LiquidAI LFM2 / LFM2.5: short-conv + GQA hybrid, dense
     LFM2MOE,      // LiquidAI LFM2-MoE: the same hybrid with sigmoid-routed experts
+    INKLING2,     // Thinking Machines Inkling 2: depth-attention residuals, relative bias,
+                  // short convs on K/V/outputs, looped core (see core/inkling.cpp)
+};
+
+// Inkling 2 hyper-parameters. Kept apart from HParams' shared fields because
+// almost none of them mean anything to the other architectures, and the
+// looped core changes what "a layer" is: the GGUF stores n_phys physical
+// blocks, the forward pass makes n_visit layer visits (the core
+// [core_start, core_end) runs n_pass times), and every visit has its own KV
+// cache and conv state while the weights stay per physical layer.
+struct InklingParams {
+    uint32_t n_visit      = 0;
+    uint32_t core_start   = 0, core_end = 0;
+    uint32_t n_pass       = 1;   // < 2: no loop
+    uint32_t gate_rank    = 0;   // loop message controllers' rank
+    std::vector<uint8_t> is_swa; // per visit
+    uint32_t n_swa        = 0;
+    uint32_t n_rel        = 0;   // relative-position bias rank
+    uint32_t rel_extent   = 0;   // distances >= this share one (zero) bias row
+    float    rel_clip     = 0.0f;
+    float    qk_clip      = 0.0f;
+    uint32_t log_floor    = 0;
+    float    log_alpha    = 0.0f;
+    uint32_t block_size   = 0;   // attention-residual block size (layers)
+    uint32_t n_conv       = 0;   // short-conv taps
+    float    situ_beta    = 0.0f, situ_lin_beta = 0.0f;
+    float    logit_cap    = 0.0f;
+    uint32_t n_vocab_pad  = 0, n_vocab = 0;   // padded rows in embd/output vs real tokens
+
+    bool     looped() const { return n_pass > 1; }
+    uint32_t n_core() const { return core_end - core_start; }
+    // physical layer of visit `iv`
+    uint32_t phys(uint32_t iv) const {
+        if (!looped() || iv < core_start) return iv;
+        if (iv < core_start + n_pass * n_core()) return core_start + (iv - core_start) % n_core();
+        return iv - (n_pass - 1) * n_core();
+    }
+    // loop pass of visit `iv` (0 outside the core)
+    uint32_t pass(uint32_t iv) const {
+        if (!looped() || iv < core_start || iv >= core_start + n_pass * n_core()) return 0;
+        return (iv - core_start) / n_core();
+    }
+    bool in_core(uint32_t ip) const { return looped() && ip >= core_start && ip < core_end; }
 };
 
 const char * arch_name(Arch a);
@@ -145,6 +188,8 @@ struct HParams {
     uint32_t ple_conv_state() const {
         return has_ple() ? (ple_conv_kernel - 1) * ple_ngram_size : 0;
     }
+
+    InklingParams ink;   // arch == INKLING2 only; n_layer is then the PHYSICAL count
 
     // GGUF metadata (display / identification)
     std::string  general_name;  // general.name
@@ -333,7 +378,10 @@ private:
 
     // Per-tensor data source (shard file + absolute offset). One entry per tensor;
     // for a single-file model all entries share path_.
-    struct Src { std::string path; size_t off = 0; };
+    // half >= 0: one half of a fused per-expert tensor (Inkling's ffn_gate_up_exps
+    // split into gate = half 0, up = half 1). Each expert's slab of `stride`
+    // bytes holds both halves back to back, so the data is n_exp strided reads.
+    struct Src { std::string path; size_t off = 0; int half = -1; size_t stride = 0; int64_t n_exp = 0; };
     std::map<std::string, Src> src_;
 
     // F32 token-embedding fallback for ggml_get_rows (see tok_embd_rows()).
@@ -343,6 +391,7 @@ private:
 
     void load_hparams();
     void load_qwen4exp_hparams(const std::string & arch);
+    void load_inkling2_hparams(const std::string & arch);
     void load_vocab();
 
     // Read nb bytes of tensor `name` from its (possibly sharded) source file into

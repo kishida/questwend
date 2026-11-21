@@ -221,6 +221,8 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    // Inkling 2 runs on its own engine (core/inkling.cpp); impl_ is then null.
+    std::unique_ptr<class InklingEngine> ink_;
 };
 
 } // namespace questwend

@@ -18,7 +18,7 @@ public:
     // subtly different ids for digits, CJK and punctuation runs.
     // LLAMA3 is the qwen2 split with digits grouped in threes (\p{N}{1,3});
     // llama.cpp uses it for lfm2, together with ignore_merges.
-    enum class Pre { QWEN, DEEPSEEK3, LLAMA3 };
+    enum class Pre { QWEN, DEEPSEEK3, LLAMA3, GPT4O };
 
     explicit Tokenizer(const Vocab & vocab);
 
@@ -69,6 +69,7 @@ private:
     std::vector<std::string> pretokenize(const std::string & text) const;
     std::vector<std::string> pretokenize_qwen(const std::string & text, int max_digits = 1) const;
     std::vector<std::string> pretokenize_deepseek3(const std::string & text) const;
+    std::vector<std::string> pretokenize_gpt4o(const std::string & text) const;
     std::vector<int32_t>     bpe_encode_piece(const std::string & piece) const;
 };
 

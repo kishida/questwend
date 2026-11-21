@@ -51,6 +51,7 @@ add_library(questwend_core STATIC
     core/model.cpp
     core/tokenizer.cpp
     core/runtime.cpp
+    core/inkling.cpp
     core/expert_cache.cpp
     core/ngram_table.cpp
     core/sampler.cpp
