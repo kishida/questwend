@@ -245,6 +245,16 @@ struct InklingEngine::Impl {
     // the whole stack for T tokens on the GPU (resident weights)
     void build_full(Gr & g, ggml_tensor * inp, bool want_logits, ggml_tensor ** out);
     void forward(const int32_t * toks, int T, bool want_logits);
+    // Prefill chunk: UBATCH, halved while the per-head attention mask of the
+    // full-attention visits ([n_kv, T, n_head], gathered in F32 then copied to
+    // F16) would pass INK_ATTN_MB (default 400). Its size grows with the KV, so
+    // a long context takes shorter chunks instead of running out of VRAM.
+    int chunk_len(int remaining) const {
+        static const double budget = (getenv("INK_ATTN_MB") ? atof(getenv("INK_ATTN_MB")) : 400.0) * 1048576.0;
+        int T = std::min(UBATCH, remaining);
+        while (T > 16 && (double) (n_past_ + T) * T * n_head * 6.0 > budget) T /= 2;
+        return std::max(1, std::min(T, remaining));
+    }
 
     // Decode graph kept across tokens: sized for a KV bucket (rows past
     // n_past are masked), so its topology and shapes stay fixed and ggml-cuda
@@ -542,7 +552,7 @@ ggml_tensor * InklingEngine::Impl::mix(Gr & g, const std::vector<ggml_tensor *> 
         states = ggml_concat(ctx, ggml_reshape_3d(ctx, b, E, 1, T), states, 1);
     states = ggml_rms_norm(ctx, states, 1e-6f);
     const int64_t nq = query->ne[1];
-    ggml_tensor * queries = ggml_repeat(ctx, query, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, nq, T));
+    ggml_tensor * queries = ggml_repeat_4d(ctx, query, E, nq, T, 1);
     ggml_tensor * scores = ggml_mul_mat(ctx, states, queries);
     scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f / sqrtf((float) E), 0.0f);
     return ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);   // [E, nq, T]
@@ -705,15 +715,20 @@ ggml_tensor * InklingEngine::Impl::visit_pre(Gr & g, St & st, int iv, ggml_tenso
         ggml_tensor * sinks = ggml_mul_mat(ctx, W("blk.%d.attn_sink_proj.weight", ip), inputs[0]);   // [n_head, T]
         ggml_tensor * table = ggml_mul_mat(ctx, ggml_pad(ctx, W("blk.%d.attn_rel_bias.weight", ip), 0, 1, 0, 0), R);
         table = ggml_sub(ctx, table, ggml_reshape_3d(ctx, sinks, 1, n_head, T));
-        table = ggml_cont(ctx, ggml_permute(ctx, table, 1, 0, 2, 3));                // [n_head, ext+1, T]
+        // row ext+1 = -inf: a masked cell gathers it (the inputs encode masking as
+        // that index), so the per-head mask is the gather alone, never a sum
+        table = ggml_concat(ctx, table, ggml_fill(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_head, T), -INFINITY), 0);
+        table = ggml_cont(ctx, ggml_permute(ctx, table, 1, 0, 2, 3));                // [n_head, ext+2, T]
         ggml_tensor * kq_b = ggml_get_rows(ctx, table, swa ? g.rel_swa : g.rel_full);  // [n_head, n_kv, T]
-        kq_b = ggml_cont(ctx, ggml_permute(ctx, kq_b, 2, 0, 1, 3));                  // [n_kv, T, n_head]
 
         ggml_tensor * q  = ggml_permute(ctx, Q, 0, 2, 1, 3);                         // [hd, T, n_head]
         ggml_tensor * k  = ggml_permute(ctx, k3, 0, 2, 1, 3);                        // [hd, n_kv, n_head_kv]
         if (flash) {
             // the bias rides in a per-head F16 mask, as llama.cpp does for this model
-            ggml_tensor * m  = ggml_cast(ctx, ggml_add(ctx, kq_b, swa ? g.mask_swa : g.mask_full), GGML_TYPE_F16);
+            // one copy: [n_head, n_kv, T] f32 -> [n_kv, T, n_head] f16. A cast, not a
+            // cpy into a fresh tensor: gallocr keeps such a leaf for the whole graph,
+            // so all 48 visits' masks would be alive at once.
+            ggml_tensor * m  = ggml_cast(ctx, ggml_permute(ctx, kq_b, 2, 0, 1, 3), GGML_TYPE_F16);
             ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k, v_att, m, 1.0f / sqrtf((float) n_hd), 0.0f, 0.0f);
             ggml_flash_attn_ext_add_sinks(fa, g.sink0);
             cur = ggml_reshape_2d(ctx, fa, n_hd * n_head, T);                        // fa: [hd, n_head, T]
@@ -721,7 +736,7 @@ ggml_tensor * InklingEngine::Impl::visit_pre(Gr & g, St & st, int iv, ggml_tenso
             ggml_tensor * kq = ggml_mul_mat(ctx, k, q);                              // [n_kv, T, n_head]
             ggml_prec_set_acc(kq, GGML_PREC_F32);
             kq = ggml_scale(ctx, kq, 1.0f / sqrtf((float) n_hd));
-            kq = ggml_add(ctx, ggml_add(ctx, kq, kq_b), swa ? g.mask_swa : g.mask_full);
+            kq = ggml_add(ctx, kq, ggml_cont(ctx, ggml_permute(ctx, kq_b, 2, 0, 1, 3)));   // mask included
             kq = ggml_soft_max_ext(ctx, kq, nullptr, 1.0f, 0.0f);
             ggml_soft_max_add_sinks(kq, g.sink0);
             ggml_tensor * kqv = ggml_mul_mat(ctx, v_att, kq);                        // [hd, T, n_head]
@@ -894,12 +909,13 @@ void InklingEngine::Impl::set_inputs(Gr & g, int T) {
                 const int pj = swa ? pos_of_ring(j, n_total) : j;
                 const int d  = pi - pj;
                 const bool vis = pj >= 0 && d >= 0 && (!swa || d < (int) ik.n_swa);
-                r[(size_t) i * n_kv + j] = (d >= 0 && d < ext) ? d : ext;
+                r[(size_t) i * n_kv + j] = !vis ? ext + 1 : (d < ext ? d : ext);
                 m[(size_t) i * n_kv + j] = vis ? 0.0f : -INFINITY;
             }
         }
         ggml_backend_tensor_set(rel,  r.data(), 0, r.size() * sizeof(int32_t));
-        ggml_backend_tensor_set(mask, m.data(), 0, m.size() * sizeof(float));
+        if (mask->buffer)   // the flash path encodes masking in `rel` and never reads it
+            ggml_backend_tensor_set(mask, m.data(), 0, m.size() * sizeof(float));
     };
     fill(g.n_kv_full, false, g.rel_full, g.mask_full);
     fill(g.n_kv_swa,  true,  g.rel_swa,  g.mask_swa);
@@ -987,8 +1003,10 @@ void InklingEngine::Impl::forward(const int32_t * toks, int T, bool want_logits)
     if (ggml_backend_graph_compute(gpu, g.gf) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("inkling2: compute failed");
     if (prof)
-        fprintf(stderr, "[ink T=%d nodes=%d build %.1f alloc %.1f inputs %.1f compute %.1f ms]\n", T,
-                ggml_graph_n_nodes(g.gf), std::chrono::duration<double, std::milli>(t1 - t0).count(),
+        fprintf(stderr, "[ink T=%d n_kv=%d nodes=%d compute buf %.0f MB build %.1f alloc %.1f inputs %.1f compute %.1f ms]\n", T,
+                g.n_kv_full, ggml_graph_n_nodes(g.gf),
+                ggml_gallocr_get_buffer_size(use_kept ? kept.ga : galloc, 0) / 1048576.0,
+                std::chrono::duration<double, std::milli>(t1 - t0).count(),
                 std::chrono::duration<double, std::milli>(t2 - t1).count(),
                 std::chrono::duration<double, std::milli>(t3 - t2).count(), ms_since(t3));
     if (out) {
@@ -1237,7 +1255,7 @@ void InklingEngine::Impl::upload_inputs(int T, int n_kv_full) {
                 const int pj = swa ? pos_of_ring(j, n_total) : j;
                 const int d  = pi - pj;
                 const bool vis = pj >= 0 && d >= 0 && (!swa || d < (int) ik.n_swa);
-                r[(size_t) i * n_kv + j] = (d >= 0 && d < ext) ? d : ext;
+                r[(size_t) i * n_kv + j] = !vis ? ext + 1 : (d < ext ? d : ext);
                 m[(size_t) i * n_kv + j] = vis ? 0.0f : -INFINITY;
             }
         }
@@ -2267,11 +2285,12 @@ void InklingEngine::Impl::generate_spec(const std::vector<int32_t> & prompt, int
     // prompt: forward with the features captured, every chunk injected
     const int P = (int) prompt.size();
     if (P == 0) throw std::runtime_error("inkling2: speculative decode needs at least one new token");
-    for (int i = 0; i < P; i += UBATCH) {
-        const int T = std::min(UBATCH, P - i);
+    for (int i = 0; i < P; ) {
+        const int T = chunk_len(P - i);
         no_keep_now = true;
         forward(prompt.data() + i, T, i + T == P);   // injects the draft features itself
         no_keep_now = false;
+        i += T;
     }
     kv_toks.insert(kv_toks.end(), prompt.begin(), prompt.end());
     if (ckpt_after_prefill) ckpt_snapshot();   // the next turn rewinds here
@@ -2361,7 +2380,7 @@ const std::vector<float> & InklingEngine::decode(const std::vector<int32_t> & to
     // INK_SPLIT_PREFILL=k: break the chunks at k too (checks chunking against a rewind)
     static const int split = getenv("INK_SPLIT_PREFILL") ? atoi(getenv("INK_SPLIT_PREFILL")) : 0;
     for (int i = 0; i < P; ) {
-        int T = std::min(UBATCH, P - i);
+        int T = m.chunk_len(P - i);
         if (split > i && split < i + T) T = split - i;
         m.forward(tokens.data() + i, T, i + T == P);
         if (m.progress_cb && P > UBATCH) m.progress_cb(i + T, P);
@@ -2387,10 +2406,11 @@ const std::vector<float> & InklingEngine::decode(const std::vector<int32_t> & to
 void InklingEngine::prefill(const std::vector<int32_t> & tokens) {
     Impl & m = *impl_;
     const int P = (int) tokens.size();
-    for (int i = 0; i < P; i += UBATCH) {
-        const int T = std::min(UBATCH, P - i);
+    for (int i = 0; i < P; ) {
+        const int T = m.chunk_len(P - i);
         m.forward(tokens.data() + i, T, false);
         if (m.progress_cb) m.progress_cb(i + T, P);
+        i += T;
     }
     m.kv_toks.insert(m.kv_toks.end(), tokens.begin(), tokens.end());
 }
