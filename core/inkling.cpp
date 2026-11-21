@@ -85,6 +85,16 @@ struct InklingEngine::Impl {
     ggml_context *        scr_ctx = nullptr;
     ggml_backend_buffer_t scr_buf = nullptr;
     std::vector<ggml_tensor *> scr[3];   // per physical layer: gate / up / down views of scr_buf
+    // Static placement never moves an expert, so a fully resident layer needs no
+    // host routing: its router picks are turned into slot ids inside the graph
+    // through this fixed map, and a run of such visits -- with "core" placement,
+    // every visit of the looped core, which are contiguous -- decodes as one
+    // graph. Only the other visits come back to the host (INK_FUSE=0: none fused).
+    std::vector<uint8_t> full_res;       // per physical layer
+    ggml_context *        map_ctx = nullptr;
+    ggml_backend_buffer_t map_buf = nullptr;
+    ggml_tensor *         p_slotmap = nullptr;   // i32 [n_exp, 3 * n_phys]: (role, layer) rows
+    bool fuse = false;
     int  refill   = 4;          // most-missed experts made resident after each token
     ggml_context *        car_ctx = nullptr;
     ggml_backend_buffer_t car_buf = nullptr;
@@ -197,7 +207,7 @@ struct InklingEngine::Impl {
     ggml_tensor * head(Gr & g, St & st, bool last_only);
 
     Gr   new_graph(int T, int n_kv_full);
-    Gr   seg_graph(int T, int n_kv_full);   // offload: inputs are views of the persistent p_* tensors
+    Gr   seg_graph(int T, int n_kv_full, int nodes = 8192);   // offload: inputs are views of the persistent p_* tensors
     void set_inputs(Gr & g, int T);
     // the whole stack for T tokens on the GPU (resident weights)
     void build_full(Gr & g, ggml_tensor * inp, bool want_logits, ggml_tensor ** out);
@@ -249,6 +259,8 @@ InklingEngine::Impl::~Impl() {
     if (car_buf) ggml_backend_buffer_free(car_buf);
     if (pin_buf) ggml_backend_buffer_free(pin_buf);
     if (scr_buf) ggml_backend_buffer_free(scr_buf);
+    if (map_buf) ggml_backend_buffer_free(map_buf);
+    if (map_ctx) ggml_free(map_ctx);
     if (scr_ctx) ggml_free(scr_ctx);
     if (car_ctx) ggml_free(car_ctx);
     if (hs_buf) ggml_backend_buffer_free(hs_buf);
@@ -950,8 +962,31 @@ void InklingEngine::Impl::init_offload(size_t budget, size_t st_bytes) {
                 n += r;
             }
             fprintf(stderr, " %d%s:%d", ip, ik.in_core((uint32_t) ip) ? "*" : "", n);
+            full_res.push_back(n == (int) hp.n_expert ? 1 : 0);
         }
         fprintf(stderr, "\n");
+
+        const char * fz = getenv("INK_FUSE");
+        fuse = !(fz && atoi(fz) == 0);
+        if (fuse) {
+            ggml_init_params mp{};
+            mp.mem_size = ggml_tensor_overhead() * 2;
+            mp.no_alloc = true;
+            map_ctx = ggml_init(mp);
+            p_slotmap = ggml_new_tensor_2d(map_ctx, GGML_TYPE_I32, hp.n_expert, 3 * n_phys);
+            map_buf = ggml_backend_alloc_ctx_tensors(map_ctx, gpu);
+            if (!map_buf) throw std::runtime_error("inkling2: cannot allocate the slot map");
+            std::vector<int32_t> mv((size_t) hp.n_expert * 3 * n_phys, 0);
+            for (int r = 0; r < 3; ++r)
+                for (int ip = 0; ip < n_phys; ++ip) {
+                    const int32_t * row = ec->slot_of_row((ExpertCache::Role) r, ip);
+                    std::copy(row, row + hp.n_expert, mv.begin() + ((size_t) r * n_phys + ip) * hp.n_expert);
+                }
+            ggml_backend_tensor_set(p_slotmap, mv.data(), 0, mv.size() * 4);
+            int nf = 0;
+            for (uint32_t iv = 0; iv < ik.n_visit; ++iv) nf += full_res[ik.phys(iv)];
+            fprintf(stderr, "inkling2: %d of %u visits fully resident -> decoded inside fused graphs\n", nf, ik.n_visit);
+        }
     }
 }
 
@@ -993,10 +1028,9 @@ void InklingEngine::Impl::upload_inputs(int T, int n_kv_full) {
     ggml_backend_tensor_set(p_vidx_swa,  vs.data(), 0, vs.size() * sizeof(int64_t));
 }
 
-InklingEngine::Impl::Gr InklingEngine::Impl::seg_graph(int T, int n_kv_full) {
+InklingEngine::Impl::Gr InklingEngine::Impl::seg_graph(int T, int n_kv_full, int nodes) {
     Gr g;
     ggml_init_params p{};
-    const int nodes = 8192;
     p.mem_size = ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false);
     p.no_alloc = true;
     g.ctx = ggml_init(p);
@@ -1048,8 +1082,9 @@ void InklingEngine::Impl::forward_offload(const int32_t * toks, int T, bool want
     std::vector<std::pair<int, int>> missed;   // (ip, e) computed on the CPU this token
 
     // Build graph A for visit iv (iv == NV: the head), starting from `in`.
-    auto build_A = [&](Seg & sg, int iv, const SSt & in, SSt & outs) {
-        Gr g = seg_graph(T, n_kv_full);
+    // Visits [iv_from, iv) are fully resident and run complete inside this graph.
+    auto build_A = [&](Seg & sg, int iv_from, int iv, const SSt & in, SSt & outs) {
+        Gr g = seg_graph(T, n_kv_full, 8192 + 640 * (iv - iv_from));
         sg.ctx = g.ctx; sg.gf = g.gf;
         ggml_context * c = g.ctx;
         std::vector<ggml_tensor *> id2v(slots.size(), nullptr);
@@ -1064,14 +1099,28 @@ void InklingEngine::Impl::forward_offload(const int32_t * toks, int T, bool want
         for (int b : in.bank)           st.bank.push_back(view(b));
         st.prelude_cur = view(in.prelude_cur);
         st.bank_last   = view(in.bank_last);
-        if (iv == 0) {
+        if (iv_from == 0) {
             ggml_tensor * tk = ggml_view_1d(c, p_tok, T, 0);
             st.cur = ggml_get_rows(c, model.tok_embd_rows(), tk);
             st.cur = ggml_mul(c, ggml_rms_norm(c, st.cur, hp.rms_eps), G("token_embd_norm.weight"));
         } else {
             ggml_tensor * moe = ggml_view_2d(c, p_gpu, E, T, (size_t) E * 4, 0);
             if (decode || place_static) moe = ggml_add(c, moe, ggml_view_2d(c, p_cpu, E, T, (size_t) E * 4, 0));
-            st.cur = visit_post(g, iv - 1, view(in.ffn_inp), moe);
+            st.cur = visit_post(g, iv_from - 1, view(in.ffn_inp), moe);
+        }
+        for (int v = iv_from; v < iv; ++v) {
+            const int vp = (int) ik.phys((uint32_t) v);
+            ggml_tensor * vx = nullptr, * vs = nullptr, * vw = nullptr;
+            ggml_tensor * vin = visit_pre(g, st, v, &vx);
+            route(g, vp, vx, &vs, &vw);
+            ggml_tensor * ids[3];
+            for (int r = 0; r < 3; ++r) {
+                ggml_tensor * row = ggml_view_2d(c, p_slotmap, 1, n_exp, 4,
+                                                 ((size_t) r * hp.n_layer + vp) * n_exp * 4);
+                ids[r] = ggml_reshape_2d(c, ggml_get_rows(c, row, vs), n_used, T);
+            }
+            ggml_tensor * moe = experts(g, vp, vx, vs, vw, ec->gate(vp), ec->up(vp), ec->down(vp), ids[0], ids[1], ids[2]);
+            st.cur = visit_post(g, v, vin, moe);
         }
         if (iv == NV) {
             sg.out = head(g, st, true);
@@ -1154,7 +1203,24 @@ void InklingEngine::Impl::forward_offload(const int32_t * toks, int T, bool want
         }
     };
 
-    for (int iv = 0; iv <= NV; ++iv) {
+    // the visits that come back to the host (+ NV, the head); all of them unless fusing
+    std::vector<int> routed;
+    const bool fused = keep && fuse && place_static;
+    for (int v = 0; v < NV; ++v)
+        if (!fused || !full_res[ik.phys((uint32_t) v)]) routed.push_back(v);
+    routed.push_back(NV);
+
+    for (size_t j = 0; j < routed.size(); ++j) {
+        const int iv = routed[j];
+        const int iv_from = j == 0 ? 0 : routed[j - 1] + 1;
+        if (iv > iv_from) {   // fused visits: every pick is on the GPU
+            stx.sel += (uint64_t) n_used * (iv - iv_from);
+            stx.gpu += (uint64_t) n_used * (iv - iv_from);
+            for (int v = iv_from; v < iv; ++v) {
+                l_sel[ik.phys((uint32_t) v)] += n_used;
+                l_gpu[ik.phys((uint32_t) v)] += n_used;
+            }
+        }
         // ---- graph A ----
         auto t0 = clk::now();
         Seg tmpA;
@@ -1163,13 +1229,13 @@ void InklingEngine::Impl::forward_offload(const int32_t * toks, int T, bool want
         if (keep) {
             A = &segA[(size_t) iv];
             if (!A->gf) {
-                build_A(*A, iv, sst, next);
+                build_A(*A, iv_from, iv, sst, next);
                 sst_after[(size_t) iv] = next;
                 alloc_run(*A, true, gpu);
             }
             next = sst_after[(size_t) iv];
         } else {
-            build_A(*A, iv, sst, next);
+            build_A(*A, iv_from, iv, sst, next);
             if (!ggml_gallocr_alloc_graph(galloc, A->gf)) throw std::runtime_error("inkling2: graph A alloc failed");
         }
         if (decode && iv < NV) {
