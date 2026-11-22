@@ -78,13 +78,13 @@ jobs:
             flags: -DBUILD_SHARED_LIBS=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
 
           - name: macos-metal-arm64
-            runner: macos-14
+            runner: macos-15
             backend: metal
-            flags: -DQW_METAL=ON -DBUILD_SHARED_LIBS=OFF
+            flags: -DQW_METAL=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
           - name: macos-cpu-arm64
-            runner: macos-14
+            runner: macos-15
             backend: cpu
-            flags: -DBUILD_SHARED_LIBS=OFF
+            flags: -DBUILD_SHARED_LIBS=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
 
     steps:
       - uses: actions/checkout@v6
@@ -118,7 +118,7 @@ jobs:
         with:
           cuda: ${{ env.CUDA_WIN_VERSION }}
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "nvml_dev", "visual_studio_integration"]'
 
       - name: Install Vulkan SDK (Windows)
         if: runner.os == 'Windows' && matrix.backend == 'vulkan'
@@ -137,11 +137,13 @@ jobs:
           curl -fsSLO "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${repo}/cuda-keyring_1.1-1_all.deb"
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          # ggml-cuda needs nvcc, the cudart headers and cuBLAS -- nothing else.
+          # ggml-cuda needs nvcc, the cudart headers, cuBLAS and nvml.h (it
+          # dlopens the driver's NVML at run time) -- nothing else.
           sudo apt-get install -y --no-install-recommends \
             "cuda-nvcc-${CUDA_APT_VERSION}" \
             "cuda-cudart-dev-${CUDA_APT_VERSION}" \
-            "libcublas-dev-${CUDA_APT_VERSION}"
+            "libcublas-dev-${CUDA_APT_VERSION}" \
+            "cuda-nvml-dev-${CUDA_APT_VERSION}"
           echo "CUDA_PATH=${CUDA_APT_DIR}" >> "$GITHUB_ENV"
           echo "${CUDA_APT_DIR}/bin"       >> "$GITHUB_PATH"
 
