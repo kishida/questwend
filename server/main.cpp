@@ -498,7 +498,7 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
   .msg.user .who { background:#2a3550; color:#bcd0ff; }
   .msg.assistant .who { background:#23314a; color:#9fd6c0; }
   .msg .body { white-space:pre-wrap; word-wrap:break-word; padding-top:3px; }
-  .msg .body.think { color:var(--muted); font-style:italic; }
+  .msg .body.think { display:block; margin-bottom:8px; color:var(--muted); font-style:italic; }
   .stats { color:var(--muted); font-size:12px; margin-top:8px; font-variant-numeric:tabular-nums; }
   footer { border-top:1px solid var(--line); padding:12px 0 18px; }
   .inrow { max-width:780px; margin:0 auto; padding:0 16px; display:flex; gap:10px; align-items:flex-end; }
@@ -649,12 +649,12 @@ function renderAssistant(el, txt, thinkExt){
   if(think === null && close >= 0){
     think  = txt.slice(0, close).replace(/^\s*<think>/, '');
     answer = txt.slice(close + 8);
-  } else if(/^\s*<think>/.test(txt)){
+  } else if(think === null && /^\s*<think>/.test(txt)){
     think = txt.replace(/^\s*<think>/, ''); answer = '';
   }
   if(think !== null && think.trim().length){
     const t = document.createElement('span'); t.className = 'body think';
-    t.textContent = think.replace(/^\n+/, ''); el.appendChild(t);
+    t.textContent = think.replace(/^\n+/, '').trimEnd(); el.appendChild(t);
   }
   if(answer.length){
     el.appendChild(document.createTextNode(answer.replace(/^\n+/, '')));
