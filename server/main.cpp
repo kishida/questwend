@@ -506,7 +506,7 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
          border-radius:10px; padding:10px 12px; font:inherit; max-height:200px; }
   .send { background:var(--accent); color:#fff; border:none; border-radius:10px; padding:10px 18px;
          font-size:15px; cursor:pointer; }
-  .send:disabled { opacity:.5; cursor:default; }
+  .send.stop { background:#b84a4a; }
   .attach { background:var(--panel); color:var(--txt); border:1px solid var(--line); border-radius:10px;
          padding:10px 12px; font-size:15px; cursor:pointer; }
   .hint { color:var(--muted); font-size:12px; text-align:center; margin-top:8px; }
@@ -539,7 +539,7 @@ const list = document.getElementById('list');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 let history = [];
-let busy = false;
+let running = null;   // the AbortController of the reply being generated
 
 fetch('/v1/models').then(r=>r.json()).then(j=>{
   const m = j.data && j.data[0];
@@ -581,19 +581,32 @@ function renderThumbs(){
 function autosize(){ input.style.height='auto'; input.style.height = Math.min(input.scrollHeight,200)+'px'; }
 input.addEventListener('input', autosize);
 input.addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); }});
-sendBtn.addEventListener('click', send);
-document.getElementById('clear').addEventListener('click', ()=>{ history=[]; list.innerHTML=''; });
+sendBtn.addEventListener('click', e=>{
+  if(!running) send();
+  else if(e.detail < 2) stop();   // the second click of a double click on Send is no Stop
+});
+document.addEventListener('keydown', e=>{ if(e.key==='Escape' && !e.isComposing) stop(); });
+document.getElementById('clear').addEventListener('click', ()=>{ stop(); history=[]; list.innerHTML=''; });
+function stop(){ if(running) running.abort(); }   // the server ends the generation when the stream closes
+function setRunning(ctrl){
+  running = ctrl;
+  sendBtn.textContent = ctrl ? 'Stop' : 'Send';
+  sendBtn.title = ctrl ? 'stop generating (Esc)' : '';
+  sendBtn.classList.toggle('stop', !!ctrl);
+}
 
 async function send(){
   const text = input.value.trim();
-  if((!text && !pendingImgs.length) || busy) return;
-  busy = true; sendBtn.disabled = true;
+  if((!text && !pendingImgs.length) || running) return;
+  const ctrl = new AbortController();
+  const msgs = history;   // Clear starts another array; this reply belongs to this one
+  setRunning(ctrl);
   let content = text;
   if(pendingImgs.length){
     content = pendingImgs.map(u=>({type:'image_url', image_url:{url:u}}));
     if(text) content.push({type:'text', text});
   }
-  history.push({role:'user', content});
+  msgs.push({role:'user', content});
   addMsg('user', text, pendingImgs);
   pendingImgs = []; renderThumbs();
   input.value=''; autosize();
@@ -602,9 +615,9 @@ async function send(){
   let timings = null;
   try {
     const resp = await fetch('/v1/chat/completions', {
-      method:'POST', headers:{'Content-Type':'application/json'},
+      method:'POST', headers:{'Content-Type':'application/json'}, signal: ctrl.signal,
       body: JSON.stringify({
-        messages: history, stream: true,
+        messages: msgs, stream: true,
         temperature: parseFloat(document.getElementById('temp').value)||0,
         // no max_tokens: the server generates until the context runs out
         reasoning: document.getElementById('think').checked
@@ -633,12 +646,18 @@ async function send(){
         } catch(e){}
       }
     }
-  } catch(e){ acc += '\n[error: '+e+']'; renderAssistant(body, acc, accR); }
+  } catch(e){
+    if(!ctrl.signal.aborted){ acc += '\n[error: '+e+']'; renderAssistant(body, acc, accR); }
+  }
+  const stopped = ctrl.signal.aborted;
   if(timings) showStats(body, timings);
-  const amsg = {role:'assistant', content:acc};
-  if(accR) amsg.reasoning_content = accR;   // echo reasoning -> prefix cache hit
-  history.push(amsg);
-  busy = false; sendBtn.disabled = false; input.focus();
+  else if(stopped) addNote(body, 'stopped');
+  if(!stopped || acc || accR){   // a stopped reply keeps what it had; none, if it had nothing
+    const amsg = {role:'assistant', content:acc};
+    if(accR) amsg.reasoning_content = accR;   // echo reasoning -> prefix cache hit
+    msgs.push(amsg);
+  }
+  setRunning(null); input.focus();
 }
 // dim the reasoning span. Reasoning arrives via reasoning_content deltas
 // (thinkExt); the inline </think> parsing is kept for non-streaming replies.
@@ -659,6 +678,10 @@ function renderAssistant(el, txt, thinkExt){
   if(answer.length){
     el.appendChild(document.createTextNode(answer.replace(/^\n+/, '')));
   }
+}
+function addNote(el, text){
+  const n = document.createElement('div'); n.className = 'stats'; n.textContent = text;
+  el.appendChild(n);
 }
 function showStats(el, t){
   const s = document.createElement('div'); s.className = 'stats';
@@ -1666,6 +1689,12 @@ int main(int argc, char ** argv) {
                         return false;
                     };
                     auto emit_piece = [&](int32_t t) -> bool {   // SSE chunk(s) for one token
+                        // asked every token: not every token has something to write
+                        if (!sink.is_writable()) {
+                            fprintf(stderr, "[%s] client gone, generation stopped at %d tok\n",
+                                    clock_hms().c_str(), st->generated);
+                            return false;
+                        }
                         if (st->generated == 0) {
                             st->t_first = clk::now();
                             st->gen_log = st->t_first;
