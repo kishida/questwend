@@ -498,6 +498,10 @@ void InklingEngine::Impl::init() {
     for (uint32_t iv = 0; iv < ik.n_visit; ++iv)
         st_bytes += 2ull * n_embd_kv * (ik.is_swa[iv] ? ring : n_ctx) * 2 + (size_t) (ik.n_conv - 1) * n_ch * 4;
 
+    if (ik.n_pass != ik.n_pass_file)
+        fprintf(stderr, "inkling2: --loops %u (the model's own is %u): core layers %u-%u, %u layer visits instead of %u\n",
+                ik.n_pass, ik.n_pass_file, ik.core_start, ik.core_end - 1, ik.n_visit,
+                hp.n_layer + (ik.n_pass_file - 1) * ik.n_core());
     model.set_embd_q8(cfg.embd_q8);
     const size_t wbytes = model.weight_bytes(gpu);
     const size_t reserve = 1200ull << 20;   // compute buffers (prefill attention bias dominates)
@@ -538,7 +542,11 @@ void InklingEngine::Impl::init() {
     if (offload) init_offload(budget, st_bytes);
 
     // --mtp: a DSpark draft next to the model (dspark-*.gguf), or INK_DSPARK=<file>
-    if (cfg.use_mtp) {
+    if (cfg.use_mtp && ik.n_pass != ik.n_pass_file) {
+        // the draft reads fixed visits of the trained loop
+        fprintf(stderr, "warning: DSpark only fits the model's own %u loops; ignored with --loops %u\n",
+                ik.n_pass_file, ik.n_pass);
+    } else if (cfg.use_mtp) {
         std::string dp = getenv("INK_DSPARK") ? getenv("INK_DSPARK") : "";
         if (dp.empty()) {
             namespace fs = std::filesystem;
@@ -753,7 +761,7 @@ ggml_tensor * InklingEngine::Impl::visit_pre(Gr & g, St & st, int iv, ggml_tenso
             // the bias rides in a per-head F16 mask, as llama.cpp does for this model
             // one copy: [n_head, n_kv, T] f32 -> [n_kv, T, n_head] f16. A cast, not a
             // cpy into a fresh tensor: gallocr keeps such a leaf for the whole graph,
-            // so all 48 visits' masks would be alive at once.
+            // so every visit's mask would be alive at once.
             ggml_tensor * m  = ggml_cast(ctx, ggml_permute(ctx, kq_b, 2, 0, 1, 3), GGML_TYPE_F16);
             ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k, v_att, m, 1.0f / sqrtf((float) n_hd), 0.0f, 0.0f);
             ggml_flash_attn_ext_add_sinks(fa, g.sink0);

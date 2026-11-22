@@ -844,6 +844,7 @@ void Model::load_inkling2_hparams(const std::string & arch) {
     ik.core_start = gguf_u32(gguf_, k("loop.core_start"), 0);
     ik.n_pass     = ik.core_end > 0 ? gguf_u32(gguf_, k("num_loops"), 1) : 1;
     ik.gate_rank  = gguf_u32(gguf_, k("loop.gate_rank"), 0);
+    ik.n_pass_file = ik.n_pass;
     const uint32_t extra = ik.looped() ? (ik.n_pass - 1) * ik.n_core() : 0;
     if (ik.looped() && (ik.core_start >= ik.core_end || ik.core_end + extra > ik.n_visit || ik.gate_rank == 0))
         throw std::runtime_error("inkling2: invalid loop layout");
@@ -874,6 +875,26 @@ void Model::load_inkling2_hparams(const std::string & arch) {
 
     hp_.expert_gating_func  = 2;      // sigmoid + selection bias
     hp_.expert_weights_norm = true;
+}
+
+// The core's weights are per physical layer and the loop's message controllers
+// do not know the pass they run in: the first pass gets no message, each later
+// one reads the pass before it. So the same file runs with any pass count, and
+// only what is kept per visit (KV, conv state, the SWA pattern) follows it.
+void Model::set_loop_passes(int n) {
+    const int MAX_PASSES = 8;
+    InklingParams & ik = hp_.ink;
+    if (hp_.arch != Arch::INKLING2 || ik.n_pass_file < 2)
+        throw std::runtime_error("--loops needs a model with a looped core (inkling2)");
+    if (n < 1 || n > MAX_PASSES)
+        throw std::runtime_error("--loops must be 1.." + std::to_string(MAX_PASSES));
+
+    std::vector<uint8_t> swa_phys(hp_.n_layer);
+    for (uint32_t iv = 0; iv < ik.n_visit; ++iv) swa_phys[ik.phys(iv)] = ik.is_swa[iv];
+    ik.n_pass  = (uint32_t) n;
+    ik.n_visit = hp_.n_layer + (ik.n_pass - 1) * ik.n_core();
+    ik.is_swa.resize(ik.n_visit);
+    for (uint32_t iv = 0; iv < ik.n_visit; ++iv) ik.is_swa[iv] = swa_phys[ik.phys(iv)];
 }
 
 // qwen4exp-only hyper-parameters: hyper-connections, QSA and the PLE n-gram table.

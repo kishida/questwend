@@ -27,6 +27,7 @@ struct CommonOptions {
     bool        reasoning = true;           // --reasoning on|off
     bool        use_mtp = false;            // --mtp
     int         n_draft = 1;                // --draft <N>
+    int         n_loops = 0;                // --loops <N> (0 = the model's own)
     bool        embd_q8 = false;            // --embd-q8
     float       repeat_penalty = 1.0f;      // --repeat-penalty <f>
 

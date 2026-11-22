@@ -6086,6 +6086,7 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
 
 // ---- public wrappers ----
 Runtime::Runtime(Model & model, const RuntimeConfig & cfg) {
+    if (cfg.n_loops > 0) model.set_loop_passes(cfg.n_loops);   // everything below is sized by the visits
     if (model.hparams().arch == Arch::INKLING2) {
         ink_ = std::make_unique<InklingEngine>(model, cfg);
         return;

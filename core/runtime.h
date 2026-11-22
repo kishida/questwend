@@ -66,6 +66,7 @@ struct RuntimeConfig {
     bool   cache_profile_save = true; // false: load/prefetch only, never overwrite the profile
     ExpertTier expert_tier = ExpertTier::Auto;  // tier used when the experts must leave VRAM
     bool   use_mtp        = false;   // MTP self-speculative decode (keeps nextn block VRAM-resident)
+    int    n_loops        = 0;       // passes over a looped core; 0 = the model's own
     bool   embd_q8        = false;   // use Q8_0 (not F16) for token embedding fallback (saves VRAM)
 
     // PLE n-gram embedding (qwen4exp). The table is 26.8 GiB in the IQ1_S quant

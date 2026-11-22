@@ -51,6 +51,7 @@ struct InklingParams {
     uint32_t n_visit      = 0;
     uint32_t core_start   = 0, core_end = 0;
     uint32_t n_pass       = 1;   // < 2: no loop
+    uint32_t n_pass_file  = 1;   // what the GGUF says; n_pass differs under --loops
     uint32_t gate_rank    = 0;   // loop message controllers' rank
     std::vector<uint8_t> is_swa; // per visit
     uint32_t n_swa        = 0;
@@ -356,6 +357,9 @@ public:
     // Use Q8_0 instead of F16 for the get_rows embedding fallback (saves ~45% VRAM
     // vs F16, but introduces additional quantization error). Set before load_weights_*.
     void set_embd_q8(bool v) { embd_q8_ = v; }
+    // Run the looped core n times instead of the file's count. Call it before
+    // anything is sized by the layer visits. Throws on a model without a loop.
+    void set_loop_passes(int n);
 
     std::string summary() const;
     std::string debug_dump() const;

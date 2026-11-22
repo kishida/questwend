@@ -31,6 +31,14 @@ ArgResult parse_common_arg(int argc, char ** argv, int & i, CommonOptions & o) {
     else if (a == "--ngram-cache" && has_val) o.ngram_cache_mb = (size_t) std::stoul(next());
     else if (a == "--mtp")                o.use_mtp = true;
     else if (a == "--draft"   && has_val) o.n_draft = std::stoi(next());
+    else if (a == "--loops"   && has_val) {
+        const std::string v = next();
+        o.n_loops = atoi(v.c_str());
+        if (o.n_loops < 1 || v != std::to_string(o.n_loops)) {
+            fprintf(stderr, "error: --loops takes a whole number >= 1 (got %s)\n", v.c_str());
+            return ArgResult::Error;
+        }
+    }
     else if (a == "--embd-q8")            o.embd_q8 = true;
     else if (a == "--repeat-penalty" && has_val) o.repeat_penalty = std::stof(next());
     else if (a == "--reasoning" && has_val) {
@@ -158,6 +166,7 @@ bool apply_common_options(const CommonOptions & o, RuntimeConfig & cfg) {
     cfg.ngram_cache_mb = o.ngram_cache_mb;
     cfg.use_mtp        = o.use_mtp;   // keeps the nextn block VRAM-resident
     cfg.embd_q8        = o.embd_q8;
+    cfg.n_loops        = o.n_loops;
     return true;
 }
 
@@ -171,6 +180,8 @@ void print_common_help(FILE * out) {
         "  --mmproj <gguf>     vision tower for image input (default: mmproj-*.gguf next to the model)\n"
         "  --mtp               MTP self-speculative decode (models with a nextn block)\n"
         "  --draft <N>         MTP draft length (default 1)\n"
+        "  --loops <N>         experiment: passes over a looped model's core layers (inkling2;\n"
+        "                      default: the model's own, 1 = no looping; DSpark needs the default)\n"
         "  --embd-q8           use Q8_0 (not F16) for the embedding fallback (saves ~45%% VRAM)\n"
         "  --cpu               force CPU backend\n"
         "GPU memory:\n"

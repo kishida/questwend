@@ -889,6 +889,7 @@ int main(int argc, char ** argv) {
         if (!hp.general_name.empty()) d = hp.general_name;
         if (ft && *ft) { if (!d.empty()) d += ' '; d += ft; }
         d += '('; d += arch_name(hp.arch); d += ')';
+        if (hp.ink.n_pass != hp.ink.n_pass_file) d += " loops=" + std::to_string(hp.ink.n_pass);
         return d;
     }();
     const int32_t eos    = model->vocab().eos_id;
