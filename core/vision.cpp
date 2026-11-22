@@ -1,4 +1,5 @@
 #include "vision.h"
+#include "vision_inkling.h"
 #include "gguf_util.h"
 
 #include "ggml.h"
@@ -25,6 +26,7 @@ namespace questwend {
 static const int VIS_GRAPH_SIZE = 4096;
 
 struct VisionEncoder::Impl {
+    std::unique_ptr<InklingVision> inkling;   // set = the other fields are unused
     // hyper-parameters (clip.* metadata)
     int   n_layer  = 0;     // ViT blocks
     int   dim      = 0;     // ViT embedding dim
@@ -349,7 +351,7 @@ std::vector<float> VisionEncoder::Impl::forward(const std::vector<float> & patch
 VisionEncoder::VisionEncoder() : impl_(new Impl()) {}
 VisionEncoder::~VisionEncoder() = default;
 int VisionEncoder::n_image_tokens() const { return impl_->n_tokens; }
-int VisionEncoder::n_embd() const         { return impl_->proj_dim; }
+int VisionEncoder::n_embd() const         { return impl_->inkling ? impl_->inkling->n_embd() : impl_->proj_dim; }
 size_t VisionEncoder::gpu_bytes() const {
     size_t n = 0;
     if (impl_->wbuf)   n += ggml_backend_buffer_get_size(impl_->wbuf);
@@ -361,6 +363,20 @@ std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string & path,
                                                    ggml_backend_t backend) {
     auto enc = std::unique_ptr<VisionEncoder>(new VisionEncoder());
     enc->impl_->backend = backend;
+    {
+        gguf_init_params ip{};
+        ip.no_alloc = true;
+        ip.ctx      = nullptr;
+        gguf_context * g = gguf_init_from_file(path.c_str(), ip);
+        if (!g) throw std::runtime_error("failed to open mmproj: " + path);
+        std::string type = gguf_str(g, "clip.vision.projector_type");
+        if (type.empty()) type = gguf_str(g, "clip.projector_type");
+        gguf_free(g);
+        if (type == InklingVision::PROJECTOR) {
+            enc->impl_->inkling = std::make_unique<InklingVision>(path, backend);
+            return enc;
+        }
+    }
     enc->impl_->load_weights(path);
     enc->impl_->build_graph();
     return enc;
@@ -368,6 +384,7 @@ std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string & path,
 
 std::vector<float> VisionEncoder::encode_rgb(const uint8_t * rgb, int w_px, int h_px) {
     Impl & im = *impl_;
+    if (im.inkling) return im.inkling->encode_rgb(rgb, w_px, h_px);
     const int IS = im.img_size, P = im.patch, N = im.n_side;
     const int K = P * P * 3;
 

@@ -49,10 +49,16 @@ public:
     // here -- the others are computed on another device and cached by that
     // device's ExpertCache. Layer indices stay global either way, so callers
     // index every cache with the same `il`; serves() says which one owns it.
+    // planned (n_layer * n_expert, optional): the exact set the caller will make
+    // resident. Each pool then gets one slot per planned expert of its
+    // signature instead of the uniform fraction, so no slot is left holding a
+    // role whose partners another pool could not fit (vram_avail_bytes is then
+    // only reported). For a placement that is decided up front.
     ExpertCache(ggml_backend_t gpu_backend, Model & model,
                 int n_layer, int n_expert, int n_used, size_t vram_avail_bytes,
                 bool ssd = false,
-                const std::vector<bool> * layer_mask = nullptr);
+                const std::vector<bool> * layer_mask = nullptr,
+                const std::vector<uint8_t> * planned = nullptr);
     ~ExpertCache();
 
     // Whether this cache holds `layer`'s expert pools.

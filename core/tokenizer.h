@@ -18,7 +18,7 @@ public:
     // subtly different ids for digits, CJK and punctuation runs.
     // LLAMA3 is the qwen2 split with digits grouped in threes (\p{N}{1,3});
     // llama.cpp uses it for lfm2, together with ignore_merges.
-    enum class Pre { QWEN, DEEPSEEK3, LLAMA3 };
+    enum class Pre { QWEN, DEEPSEEK3, LLAMA3, GPT4O };
 
     explicit Tokenizer(const Vocab & vocab);
 
@@ -53,6 +53,9 @@ private:
     std::unordered_map<uint32_t, uint8_t> uni_to_byte_;
 
     Pre     pre_ = Pre::QWEN;
+    // inkling2: how its structural specials read in generated text (Qwen-style
+    // <think>...</think> so the CLI / server split reasoning as for the others)
+    std::vector<std::pair<int32_t, std::string>> decode_alias_;
     // A pre-token that is itself a vocabulary entry is emitted whole, without
     // running the merges (llama.cpp's ignore_merges; lfm2 sets it).
     bool    ignore_merges_ = false;
@@ -69,6 +72,7 @@ private:
     std::vector<std::string> pretokenize(const std::string & text) const;
     std::vector<std::string> pretokenize_qwen(const std::string & text, int max_digits = 1) const;
     std::vector<std::string> pretokenize_deepseek3(const std::string & text) const;
+    std::vector<std::string> pretokenize_gpt4o(const std::string & text) const;
     std::vector<int32_t>     bpe_encode_piece(const std::string & piece) const;
 };
 

@@ -130,6 +130,22 @@ static std::vector<uint8_t> base64_decode(const std::string & in) {
     return out;
 }
 
+// Timings in llama.cpp's shape (prompt_n counts the tokens actually prefilled,
+// cache_n the reused prefix), merged with this server's own keys.
+static void add_llama_timings(nlohmann::json & t, int n_prompt, int n_cached, int n_gen,
+                              double prefill_ms, double gen_ms) {
+    const int n_pf = n_prompt - n_cached;
+    t["cache_n"]                = n_cached;
+    t["prompt_n"]               = n_pf;
+    t["prompt_ms"]              = prefill_ms;
+    t["prompt_per_token_ms"]    = n_pf > 0 ? prefill_ms / n_pf : 0.0;
+    t["prompt_per_second"]      = prefill_ms > 0 ? n_pf * 1000.0 / prefill_ms : 0.0;
+    t["predicted_n"]            = n_gen;
+    t["predicted_ms"]           = gen_ms;
+    t["predicted_per_token_ms"] = n_gen > 0 ? gen_ms / n_gen : 0.0;
+    t["predicted_per_second"]   = gen_ms > 0 ? n_gen * 1000.0 / gen_ms : 0.0;
+}
+
 // Split generated text at the first </think>: `reasoning` gets the text before
 // it (the generation prompt pre-opens <think>, so output starts mid-block),
 // the returned string is what follows. No </think> -> everything is content.
@@ -296,6 +312,58 @@ static std::string parse_tool_calls_lfm2(const std::string & text, std::vector<P
     return out;
 }
 
+// ---- inkling2 tool calls: one {"name":"NAME","args":{...}} per call block ----
+// Returns the bodies that are no such call (malformed or cut off).
+static std::string parse_tool_calls_inkling(const std::vector<std::string> & bodies,
+                                            std::vector<ParsedToolCall> & calls) {
+    std::string rest;
+    for (const auto & body : bodies) {
+        const auto j = nlohmann::ordered_json::parse(body, nullptr, false);
+        if (!j.is_discarded() && j.is_object()) {
+            const auto name = j.find("name"), args = j.find("args");
+            if (name != j.end() && name->is_string() && args != j.end() && args->is_object()) {
+                calls.push_back({ name->get<std::string>(), args->dump() });   // the model's key order
+                continue;
+            }
+        }
+        rest += body;
+    }
+    return rest;
+}
+
+// The declaration the inkling2 template renders: these four keys, sorted at every level.
+static std::string inkling_tool_spec(const json & t) {
+    const json & fn = t.contains("function") ? t["function"] : t;
+    if (!fn.is_object() || !fn.contains("name")) throw std::runtime_error("a tool needs function.name");
+    json spec = {{"name", fn["name"]}, {"description", ""}, {"parameters", json::object()}, {"type", "function"}};
+    if (fn.contains("description") && fn["description"].is_string()) spec["description"] = fn["description"];
+    if (fn.contains("parameters") && fn["parameters"].is_object())   spec["parameters"]  = fn["parameters"];
+    if (t.contains("type") && t["type"].is_string() && !t["type"].get<std::string>().empty()) spec["type"] = t["type"];
+    return spec.dump();
+}
+
+// A past call as the inkling2 template writes it: top-level argument keys
+// sorted, nested values in the client's order.
+static std::string inkling_call_body(const std::string & name, const json & fn) {
+    using ojson = nlohmann::ordered_json;
+    std::map<std::string, std::string> args;
+    if (fn.contains("arguments")) {
+        const auto & a = fn["arguments"];
+        const std::string src = a.is_string() ? a.get<std::string>() : a.dump();
+        const ojson o = ojson::parse(src, nullptr, false);
+        if (!o.is_discarded() && o.is_object())
+            for (auto it = o.begin(); it != o.end(); ++it) args[it.key()] = it.value().dump();
+    }
+    std::string s = "{\"name\":" + json(name).dump() + ",\"args\":{";
+    bool first = true;
+    for (const auto & kv : args) {
+        if (!first) s += ',';
+        first = false;
+        s += json(kv.first).dump() + ":" + kv.second;
+    }
+    return s + "}}";
+}
+
 static std::string parse_tool_calls(const std::string & text, std::vector<ParsedToolCall> & calls,
                                     const std::map<std::string, int> * param_kind = nullptr,
                                     bool lfm2 = false) {
@@ -430,7 +498,7 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
   .msg.user .who { background:#2a3550; color:#bcd0ff; }
   .msg.assistant .who { background:#23314a; color:#9fd6c0; }
   .msg .body { white-space:pre-wrap; word-wrap:break-word; padding-top:3px; }
-  .msg .body.think { color:var(--muted); font-style:italic; }
+  .msg .body.think { display:block; margin-bottom:8px; color:var(--muted); font-style:italic; }
   .stats { color:var(--muted); font-size:12px; margin-top:8px; font-variant-numeric:tabular-nums; }
   footer { border-top:1px solid var(--line); padding:12px 0 18px; }
   .inrow { max-width:780px; margin:0 auto; padding:0 16px; display:flex; gap:10px; align-items:flex-end; }
@@ -581,12 +649,12 @@ function renderAssistant(el, txt, thinkExt){
   if(think === null && close >= 0){
     think  = txt.slice(0, close).replace(/^\s*<think>/, '');
     answer = txt.slice(close + 8);
-  } else if(/^\s*<think>/.test(txt)){
+  } else if(think === null && /^\s*<think>/.test(txt)){
     think = txt.replace(/^\s*<think>/, ''); answer = '';
   }
   if(think !== null && think.trim().length){
     const t = document.createElement('span'); t.className = 'body think';
-    t.textContent = think.replace(/^\n+/, ''); el.appendChild(t);
+    t.textContent = think.replace(/^\n+/, '').trimEnd(); el.appendChild(t);
   }
   if(answer.length){
     el.appendChild(document.createTextNode(answer.replace(/^\n+/, '')));
@@ -751,8 +819,9 @@ int main(int argc, char ** argv) {
     const bool mtp = use_mtp && rt->has_mtp();
     if (use_mtp && !rt->has_mtp())
         fprintf(stderr, "warning: --mtp requested but model has no nextn block; using plain decode\n");
-    if (mtp) fprintf(stderr, "MTP self-speculative decode ON (draft=%d; greedy only -"
-                             " request sampling parameters are ignored)\n", n_draft);
+    if (mtp) fprintf(stderr, "MTP self-speculative decode ON (draft=%d%s)\n", n_draft,
+                     rt->set_mtp_sampler(nullptr) ? ""
+                                                  : "; greedy only - request sampling parameters are ignored");
 
     // /v1/models id: the model name (general.name) so clients identify the
     // actual model, not the architecture; fall back to "questwend:<arch>".
@@ -807,6 +876,11 @@ int main(int argc, char ** argv) {
     TicketLock tlock;          // runtime is single-threaded + stateful (FIFO queue)
     uint64_t live_owner = 0;   // request id owning the live state (0 = none); guarded by tlock
     std::atomic<uint64_t> sid_gen{1};
+    if (cache_slots > 0 && model->hparams().arch == Arch::INKLING2) {
+        fprintf(stderr, "warning: --cache-slots is not supported on inkling2 (its state cannot be saved); ignored\n");
+        cache_slots = 0;
+        cache_slots_dir.clear();
+    }
     if (time_slice > 0 && cache_slots <= 0)
         fprintf(stderr, "warning: --time-slice without --cache-slots: a preempted request"
                         " re-prefills its whole context on resume\n");
@@ -1179,13 +1253,20 @@ int main(int argc, char ** argv) {
     // Parse OpenAI-style messages: plain string content, multimodal content
     // arrays (text / image_url with base64 data URIs), assistant tool_calls,
     // reasoning_content, and tool-role messages. Image bytes go to `images`.
-    auto parse_messages = [](const json & body, std::vector<std::vector<uint8_t>> & images) {
+    auto parse_messages = [&cfmt](const json & body, std::vector<std::vector<uint8_t>> & images) {
         std::vector<ChatMessage> msgs;
         if (!body.contains("messages")) return msgs;
+        std::map<std::string, std::string> call_names;   // tool_call_id -> tool
         for (auto & m : body["messages"]) {
             ChatMessage cm;
             cm.role = m.value("role", "user");
+            if (m.contains("name") && m["name"].is_string()) cm.name = m["name"].get<std::string>();
             const auto & c = m.contains("content") ? m["content"] : json();
+            cm.no_content = !c.is_string() && !(c.is_array() && !c.empty());
+            if (cm.role == "tool" && cm.name.empty() && m.contains("tool_call_id") && m["tool_call_id"].is_string()) {
+                const auto it = call_names.find(m["tool_call_id"].get<std::string>());
+                if (it != call_names.end()) cm.name = it->second;
+            }
             if (c.is_string()) {
                 cm.content = c.get<std::string>();
             } else if (c.is_array()) {
@@ -1216,6 +1297,10 @@ int main(int argc, char ** argv) {
                     const auto & fn = tc.contains("function") ? tc["function"] : tc;
                     ToolCall call;
                     call.name = fn.value("name", "");
+                    if (cfmt.inkling) {
+                        call.json_body = inkling_call_body(call.name, fn);
+                        if (tc.contains("id") && tc["id"].is_string()) call_names[tc["id"].get<std::string>()] = call.name;
+                    }
                     json args = json::object();
                     if (fn.contains("arguments")) {
                         if (fn["arguments"].is_string()) {
@@ -1292,6 +1377,11 @@ int main(int argc, char ** argv) {
         int max_tokens = body.value("max_tokens", body.value("max_completion_tokens", 0));
         if (max_tokens <= 0) max_tokens = n_ctx;
         const bool stream      = body.value("stream", false);
+        // OpenAI: with stream_options.include_usage the stream ends with a chunk
+        // carrying only the usage (choices: [])
+        bool include_usage = false;
+        if (body.contains("stream_options") && body["stream_options"].is_object())
+            include_usage = body["stream_options"].value("include_usage", false);
         const SamplerConfig sc = make_sampler(body);
         const std::string id   = now_id("chatcmpl-");
         const long long created = (long long) std::time(nullptr);
@@ -1319,7 +1409,7 @@ int main(int argc, char ** argv) {
                 && body["tool_choice"].get<std::string>() == "none";
             if (!tools_off && body.contains("tools") && body["tools"].is_array()) {
                 for (auto & t : body["tools"]) {
-                    copts.tools_json.push_back(t.dump());
+                    copts.tools_json.push_back(cfmt.inkling ? inkling_tool_spec(t) : t.dump());
                     // record schema-declared string parameters for the output parser
                     if (!t.contains("function") || !t["function"].is_object()) continue;
                     const auto & fn = t["function"];
@@ -1337,16 +1427,16 @@ int main(int argc, char ** argv) {
                 if (!venc) throw std::runtime_error("image input not available (no mmproj loaded)");
                 copts.n_image_tokens = venc->n_image_tokens();
                 copts.add_vision_id  = images.size() > 1;
+                std::lock_guard<std::mutex> vl(vis_mtx);
+                for (const auto & ib : images) {
+                    vembs->push_back(venc->encode_bytes(ib.data(), ib.size()));
+                    copts.image_tokens.push_back((int) (vembs->back().size() / (size_t) venc->n_embd()));
+                }
             }
             cp = build_qwen_prompt(*tok, messages, copts);
             if (getenv("QWEN_LOG_RESPONSE"))
                 fprintf(stderr, "=== rendered prompt (%zu tok) ===\n%s\n",
                         cp.ids.size(), tok->decode(cp.ids).c_str());
-            if (!images.empty()) {
-                std::lock_guard<std::mutex> vl(vis_mtx);
-                for (const auto & ib : images)
-                    vembs->push_back(venc->encode_bytes(ib.data(), ib.size()));
-            }
             for (const auto & sp : cp.image_spans)
                 ovr.push_back({ sp.first, sp.count, (*vembs)[sp.image_index].data() });
         } catch (const std::exception & e) {
@@ -1393,6 +1483,7 @@ int main(int argc, char ** argv) {
             using clk = std::chrono::steady_clock;
             struct State {
                 Sampler smp;
+                ReplyDecoder dec;
                 TicketLock * tl = nullptr;
                 bool holding = false;             // we own the runtime lock
                 std::vector<int32_t> prompt;
@@ -1436,10 +1527,10 @@ int main(int argc, char ** argv) {
                 bool started = false, finished = false;
                 clk::time_point t0, t_prefill, t_first;
                 clk::time_point gen_log;          // last long-output progress line
-                State(const SamplerConfig & sc) : smp(sc) {}
+                State(const SamplerConfig & sc, const Tokenizer & t) : smp(sc), dec(t) {}
                 ~State() { if (holding && tl) tl->unlock(); }   // client disconnect mid-slice
             };
-            auto st = std::make_shared<State>(sc);
+            auto st = std::make_shared<State>(sc, *tok);
             st->tl = &tlock;
             st->sid = sid_gen.fetch_add(1);
             st->prompt = prompt;
@@ -1460,15 +1551,17 @@ int main(int argc, char ** argv) {
                     {{"index", 0}, {"delta", json::object()}, {"finish_reason", nullptr}}})}}) + "\n\n";
             // the generation prompt pre-opens <think> when reasoning is on, so
             // the stream starts inside the reasoning block
-            st->phase = (reasoning && !cfmt.lfm2 && tok->token_to_id("<think>") >= 0)
+            st->phase = (reasoning && !cfmt.lfm2 && !cfmt.inkling && tok->token_to_id("<think>") >= 0)
                 ? State::Phase::Reason : State::Phase::Content;
             // lfm2 has no pre-opened block (and reasons whether asked to or
             // not): watch the start of the reply instead
+            // inkling2 opens it with <|content_thinking|> (read as <think>), and
+            // a reply without one starts with <|content_text|> (read as </think>)
             st->await_think = cfmt.lfm2;
             st->smp.prime(prompt);   // repetition-penalty window (prompt tail)
 
             res.set_chunked_content_provider("text/event-stream",
-                [&, st, id, created, req_mtp, n_draft](size_t, httplib::DataSink & sink) -> bool {
+                [&, st, id, created, req_mtp, n_draft, include_usage](size_t, httplib::DataSink & sink) -> bool {
                     if (st->finished) return false;
                     auto finish = [&]() -> bool {
                         if (st->holding) { tlock.unlock(); st->holding = false; }
@@ -1487,12 +1580,18 @@ int main(int argc, char ** argv) {
                             {"prefill_tps", prefill_ms > 0 ? n_prefilled  * 1000.0 / prefill_ms : 0.0},
                             {"gen_tps",     gen_ms     > 0 ? st->generated * 1000.0 / gen_ms    : 0.0},
                         };
+                        add_llama_timings(timings, st->prompt_tokens, st->n_cached, st->generated, prefill_ms, gen_ms);
                         log_done(st->prompt_tokens, st->n_cached, st->generated,
                                  prefill_ms, gen_ms, st->cstat0);
                         // tool calls: parse the accumulated text; if any, emit them as a
                         // final delta and finish with "tool_calls"
                         std::vector<ParsedToolCall> calls;
-                        parse_tool_calls(st->text, calls, &st->pkind, cfmt.lfm2);
+                        if (cfmt.inkling) {
+                            st->hold = parse_tool_calls_inkling(st->dec.calls(), calls);
+                            st->phase = State::Phase::Content;   // what did not parse is shown
+                        } else {
+                            parse_tool_calls(st->text, calls, &st->pkind, cfmt.lfm2);
+                        }
                         if (getenv("QWEN_LOG_RESPONSE")) {
                             fprintf(stderr, "=== raw response ===\n%s\n=== parsed %zu tool call(s) ===\n",
                                     st->text.c_str(), calls.size());
@@ -1550,7 +1649,17 @@ int main(int argc, char ** argv) {
                                        {"total_tokens", st->prompt_tokens + st->generated}}},
                             {"choices", json::array({
                                 {{"index", 0}, {"delta", json::object()}, {"finish_reason", fr}}})}};
-                        ev += "data: " + dumpj(fin) + "\n\ndata: [DONE]\n\n";
+                        ev += "data: " + dumpj(fin) + "\n\n";
+                        if (include_usage) {
+                            json uchunk = {{"id", id}, {"object", "chat.completion.chunk"},
+                                {"created", created}, {"model", model_id}, {"choices", json::array()},
+                                {"usage", {{"prompt_tokens", st->prompt_tokens},
+                                           {"completion_tokens", st->generated},
+                                           {"total_tokens", st->prompt_tokens + st->generated}}},
+                                {"timings", timings}};
+                            ev += "data: " + dumpj(uchunk) + "\n\n";
+                        }
+                        ev += "data: [DONE]\n\n";
                         sink.write(ev.data(), ev.size());
                         st->finished = true;
                         sink.done();
@@ -1569,19 +1678,25 @@ int main(int argc, char ** argv) {
                         }
                         const std::string piece = tok->decode(t);
                         st->text += piece;
-                        st->hold += piece;
+                        if (!cfmt.inkling) st->hold += piece;
                         // phase filter: reasoning goes out as reasoning_content
                         // deltas, </think> switches to content, and everything
                         // from <tool_call> on is withheld (parsed at finish);
                         // partial markers at the buffer tail are held back
                         std::string rout, cout_;
+                        if (cfmt.inkling) st->dec.add(t, rout, cout_);   // needs no marker search: hold stays empty
                         if (st->await_think) {
                             const size_t lead = st->hold.find_first_not_of(" \n");
                             if (lead == std::string::npos) return true;          // only whitespace so far
                             const std::string head = st->hold.substr(lead);
-                            if (head.size() < 7 && std::string("<think>").compare(0, head.size(), head) == 0)
-                                return true;                                      // could still be <think>
+                            if (head.size() < 8 && (std::string("<think>").compare(0, std::min<size_t>(head.size(), 7), head) == 0 ||
+                                                    std::string("</think>").compare(0, head.size(), head) == 0))
+                                return true;                                      // could still be <think> / </think>
                             st->await_think = false;
+                            if (head.compare(0, 8, "</think>") == 0) {            // an empty reasoning block
+                                st->hold = head.substr(8);
+                                st->skip_lead = true;
+                            }
                             if (head.compare(0, 7, "<think>") == 0) {
                                 st->hold = head.substr(7);
                                 st->phase = State::Phase::Reason;
@@ -1798,6 +1913,11 @@ int main(int argc, char ** argv) {
                             // checkpoint once the prompt is fully in KV: the next
                             // request rewinds here if the client rewrites this turn
                             const bool ckpt = st->generated == 0;
+                            rt->set_mtp_sampler([&](const std::vector<float> & l) {
+                                const int32_t t = st->smp.sample(l);
+                                st->smp.accept(t);
+                                return t;
+                            });
                             rt->generate_mtp(rp, st->max_tokens - st->generated, n_draft,
                                              [&](int32_t t) -> bool {
                                 if (is_stop(t) || rt->n_past() + 1 >= n_ctx) { st->done = true; return false; }
@@ -1811,6 +1931,7 @@ int main(int argc, char ** argv) {
                                 st->generated++;
                                 return st->generated < st->max_tokens;
                             }, &pending, ckpt);
+                            rt->set_mtp_sampler(nullptr);
 
                             if (st->paused && !st->done) {              // yield the runtime
                                 st->pending = pending;
@@ -1908,6 +2029,12 @@ int main(int argc, char ** argv) {
 
         // non-streaming
         std::string text;
+        ReplyDecoder dec(*tok);
+        auto take = [&](int32_t t) {
+            text += tok->decode(t);
+            std::string r, c;
+            if (cfmt.inkling) dec.add(t, r, c);
+        };
         int generated = 0, n_cached = 0;
         Runtime::CacheStats cstat0;
         using clk = std::chrono::steady_clock;
@@ -1934,10 +2061,17 @@ int main(int argc, char ** argv) {
                 }
                 bool first = true;
                 clk::time_point glog = clk::now();
+                Sampler msmp(sc);
+                msmp.prime(prompt);
+                rt->set_mtp_sampler([&](const std::vector<float> & l) {
+                    const int32_t t = msmp.sample(l);
+                    msmp.accept(t);
+                    return t;
+                });
                 rt->generate_mtp(prompt, max_tokens, n_draft, [&](int32_t t) -> bool {
                     if (is_stop(t) || rt->n_past() + 1 >= n_ctx) return false;
                     if (first) { t_prefill = clk::now(); glog = t_prefill; first = false; }
-                    text += tok->decode(t);
+                    take(t);
                     ++generated;
                     if (clk::now() - glog >= std::chrono::seconds(10)) {   // long-output progress
                         const double el = std::chrono::duration<double>(clk::now() - t_prefill).count();
@@ -1947,6 +2081,7 @@ int main(int argc, char ** argv) {
                     }
                     return generated < max_tokens;
                 }, nullptr, /*ckpt_after_prefill=*/true);
+                rt->set_mtp_sampler(nullptr);
             } else {
                 Sampler smp(sc);
                 if (!ovr.empty()) rt->set_embd_overrides(ovr);   // vision
@@ -1964,7 +2099,7 @@ int main(int argc, char ** argv) {
                     int next = smp.sample(logits);
                     smp.accept(next);
                     if (is_stop(next) || rt->n_past() + 1 >= n_ctx) break;
-                    text += tok->decode(next);
+                    take(next);
                     ++generated;
                     if (clk::now() - glog >= std::chrono::seconds(10)) {   // long-output progress
                         const double el = std::chrono::duration<double>(clk::now() - t_prefill).count();
@@ -1989,9 +2124,16 @@ int main(int argc, char ** argv) {
         log_done(n_prompt_full, n_cached, generated, prefill_ms, gen_ms, cstat0);
         // split reasoning off, then parse tool calls out of the content
         std::string think;
-        const std::string rest = split_reasoning(text, think);
         std::vector<ParsedToolCall> calls;
-        const std::string content = parse_tool_calls(rest, calls, &pkind, cfmt.lfm2);
+        std::string content;
+        if (cfmt.inkling) {
+            think   = dec.reasoning();
+            content = dec.content();
+            const std::string unparsed = parse_tool_calls_inkling(dec.calls(), calls);
+            if (calls.empty()) content += unparsed;
+        } else {
+            content = parse_tool_calls(split_reasoning(text, think), calls, &pkind, cfmt.lfm2);
+        }
         if (getenv("QWEN_LOG_RESPONSE")) {
             fprintf(stderr, "=== raw response ===\n%s\n=== parsed %zu tool call(s) ===\n",
                     text.c_str(), calls.size());
@@ -2027,6 +2169,7 @@ int main(int argc, char ** argv) {
                          {"prefill_tps", prefill_ms > 0 ? (n_prompt_full - n_cached) * 1000.0 / prefill_ms : 0.0},
                          {"gen_tps", gen_ms > 0 ? generated * 1000.0 / gen_ms : 0.0}}}
         };
+        add_llama_timings(resp["timings"], n_prompt_full, n_cached, generated, prefill_ms, gen_ms);
         res.set_content(dumpj(resp), "application/json");
     });
 

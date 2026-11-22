@@ -51,11 +51,13 @@ add_library(questwend_core STATIC
     core/model.cpp
     core/tokenizer.cpp
     core/runtime.cpp
+    core/inkling.cpp
     core/expert_cache.cpp
     core/ngram_table.cpp
     core/sampler.cpp
     core/chat.cpp
     core/vision.cpp
+    core/vision_inkling.cpp
 )
 target_include_directories(questwend_core PUBLIC core)
 target_include_directories(questwend_core PRIVATE third_party/stb)

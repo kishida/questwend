@@ -46,6 +46,7 @@ const char * arch_name(Arch a) {
         case Arch::QWEN4EXP:  return "qwen4exp";
         case Arch::LFM2:      return "lfm2";
         case Arch::LFM2MOE:   return "lfm2moe";
+        case Arch::INKLING2:  return "inkling2";
         default:              return "unknown";
     }
 }
@@ -59,12 +60,18 @@ static Arch arch_from_string(const std::string & s) {
     if (s == "qwen4exp")  return Arch::QWEN4EXP;
     if (s == "lfm2")      return Arch::LFM2;
     if (s == "lfm2moe")   return Arch::LFM2MOE;
+    if (s == "inkling2")  return Arch::INKLING2;
     return Arch::UNKNOWN;
 }
 
 // Returns true for routed MoE expert weight tensors (gate/up/down _exps).
 // Shared expert (_shexp) tensors are kept on GPU — they run once per token.
 /*static*/ bool Model::is_expert_tensor(const std::string & name) {
+    // Only the weights themselves: Inkling's per-expert ".scale" vectors (128
+    // floats) are tiny and are read on the GPU every visit.
+    const std::string sfx = ".weight";
+    if (name.size() < sfx.size() || name.compare(name.size() - sfx.size(), sfx.size(), sfx) != 0)
+        return false;
     return name.find("ffn_gate_exps") != std::string::npos ||
            name.find("ffn_up_exps")   != std::string::npos ||
            name.find("ffn_down_exps") != std::string::npos;
@@ -452,6 +459,10 @@ void Model::load_weights_split(
 size_t Model::tensor_file_offset(const std::string & name) const {
     auto it = src_.find(name);
     if (it == src_.end()) throw std::runtime_error("no source for tensor: " + name);
+    // A split half is not one contiguous run in the file; the SSD tier's
+    // offset arithmetic (expert e at off + e * nb[2]) would read the wrong bytes.
+    if (it->second.half >= 0)
+        throw std::runtime_error("tensor " + name + " is half of a fused tensor and cannot be streamed from disk");
     return it->second.off;
 }
 
@@ -471,6 +482,22 @@ void Model::read_tensor_bytes(const std::string & name, void * dst, size_t nb,
         if (!fp) throw std::runtime_error("failed to open shard file: " + it->second.path);
     }
     FILE * f = (FILE *) fp;
+    if (it->second.half >= 0) {
+        const Src & s = it->second;
+        const size_t hb = s.stride / 2;
+        if (nb != hb * (size_t) s.n_exp) throw std::runtime_error("split tensor size mismatch: " + name);
+        for (int64_t e = 0; e < s.n_exp; ++e) {
+            const size_t o = s.off + (size_t) e * s.stride + (size_t) s.half * hb;
+#ifdef _WIN32
+            if (_fseeki64(f, (long long) o, SEEK_SET) != 0 ||
+#else
+            if (fseeko(f, (off_t) o, SEEK_SET) != 0 ||
+#endif
+                fread((uint8_t *) dst + (size_t) e * hb, 1, hb, f) != hb)
+                throw std::runtime_error("failed to read tensor data: " + name);
+        }
+        return;
+    }
 #ifdef _WIN32
     if (_fseeki64(f, (long long) it->second.off, SEEK_SET) != 0 ||
 #else
@@ -644,7 +671,7 @@ std::unique_ptr<Model> Model::load(const std::string & path) {
     // Build one unified metadata context holding every tensor, with a per-tensor
     // source map (shard file + absolute offset) for data loading / SSD streaming.
     ggml_init_params mp{};
-    mp.mem_size = ggml_tensor_overhead() * (total_tensors + 1) + 1024;
+    mp.mem_size = ggml_tensor_overhead() * (2 * total_tensors + 1) + 1024;   // fused tensors split in two
     mp.no_alloc = true;
     m->meta_ = ggml_init(mp);
 
@@ -663,6 +690,25 @@ std::unique_ptr<Model> Model::load(const std::string & path) {
         for (ggml_tensor * t = ggml_get_first_tensor(sh.meta); t; t = ggml_get_next_tensor(sh.meta, t)) {
             const char * nm = ggml_get_name(t);
             const bool is_ple = strcmp(nm, "per_layer_token_embd.weight") == 0;
+            const int64_t tid0 = gguf_find_tensor(sh.g, nm);
+            const size_t  off0 = sh.data_off + gguf_get_tensor_offset(sh.g, tid0);
+            // Inkling fuses each expert's gate and up rows into one tensor. Split
+            // it into the gate/up pair every expert path here already handles
+            // (the VRAM slot pools are per role), reading each half straight
+            // from its place inside the expert's slab.
+            const size_t nlen = strlen(nm);
+            const char * fused = ".ffn_gate_up_exps.weight";
+            if (nlen > strlen(fused) && strcmp(nm + nlen - strlen(fused), fused) == 0 && t->ne[1] % 2 == 0) {
+                const std::string pfx(nm, nlen - strlen(fused));
+                for (int half = 0; half < 2; ++half) {
+                    const std::string hn = pfx + (half ? ".ffn_up_exps.weight" : ".ffn_gate_exps.weight");
+                    ggml_tensor * ht = ggml_new_tensor_3d(m->meta_, t->type, t->ne[0], t->ne[1] / 2, t->ne[2]);
+                    ggml_set_name(ht, hn.c_str());
+                    m->tensors_[hn] = ht;
+                    m->src_[hn] = { sh.path, off0, half, t->nb[2], t->ne[2] };
+                }
+                continue;
+            }
             ggml_tensor * ut = ggml_new_tensor(is_ple ? m->ple_ctx_ : m->meta_,
                                                t->type, ggml_n_dims(t), t->ne);
             ggml_set_name(ut, nm);
@@ -671,8 +717,7 @@ std::unique_ptr<Model> Model::load(const std::string & path) {
             } else {
                 m->tensors_[nm] = ut;
             }
-            const int64_t tid = gguf_find_tensor(sh.g, nm);
-            m->src_[nm] = { sh.path, sh.data_off + gguf_get_tensor_offset(sh.g, tid) };
+            m->src_[nm] = { sh.path, off0 };
         }
     }
 
@@ -767,6 +812,7 @@ void Model::load_hparams() {
                   hp_.ssm_d_inner > 0;
 
     if (hp_.arch == Arch::QWEN4EXP) load_qwen4exp_hparams(arch);
+    if (hp_.arch == Arch::INKLING2) load_inkling2_hparams(arch);
 
     // lfm2 / lfm2moe: a layer with no kv heads is a gated short convolution
     // (in_proj -> B*x -> causal depthwise conv over l_cache taps -> C*() ->
@@ -785,6 +831,49 @@ void Model::load_hparams() {
     } else if (auto * t = tensor("token_embd.weight")) {
         hp_.n_vocab = (uint32_t) t->ne[1];
     }
+    // Inkling pads the embedding / head past the tokenizer; logits stop at the real vocab.
+    if (hp_.arch == Arch::INKLING2) hp_.n_vocab = hp_.ink.n_vocab;
+}
+
+void Model::load_inkling2_hparams(const std::string & arch) {
+    auto k = [&](const char * suffix) { return arch + "." + suffix; };
+    InklingParams & ik = hp_.ink;
+
+    ik.n_visit    = hp_.n_layer;
+    ik.core_end   = gguf_u32(gguf_, k("loop.core_end"), 0);
+    ik.core_start = gguf_u32(gguf_, k("loop.core_start"), 0);
+    ik.n_pass     = ik.core_end > 0 ? gguf_u32(gguf_, k("num_loops"), 1) : 1;
+    ik.gate_rank  = gguf_u32(gguf_, k("loop.gate_rank"), 0);
+    const uint32_t extra = ik.looped() ? (ik.n_pass - 1) * ik.n_core() : 0;
+    if (ik.looped() && (ik.core_start >= ik.core_end || ik.core_end + extra > ik.n_visit || ik.gate_rank == 0))
+        throw std::runtime_error("inkling2: invalid loop layout");
+    hp_.n_layer = ik.n_visit - extra;   // physical blocks in the file
+
+    for (bool b : gguf_bool_array(gguf_, k("attention.sliding_window_pattern"))) ik.is_swa.push_back(b ? 1 : 0);
+    ik.n_swa       = gguf_u32(gguf_, k("attention.sliding_window"));
+    ik.n_rel       = gguf_u32(gguf_, k("attention.relative_length"));
+    ik.rel_extent  = gguf_u32(gguf_, k("attention.relative_extent"));
+    ik.rel_clip    = gguf_f32(gguf_, k("attention.relative_clip"));
+    ik.qk_clip     = gguf_f32(gguf_, k("attention.qk_clip"));
+    ik.log_floor   = gguf_u32(gguf_, k("attention.log_scale_floor"));
+    ik.log_alpha   = gguf_f32(gguf_, k("attention.log_scale_alpha"));
+    ik.block_size  = gguf_u32(gguf_, k("attn_res.block_size"));
+    ik.n_conv      = gguf_u32(gguf_, k("shortconv.l_cache"));
+    ik.situ_beta   = gguf_f32(gguf_, k("activation.situ_beta"));
+    ik.situ_lin_beta = gguf_f32(gguf_, k("activation.situ_linear_beta"));
+    ik.logit_cap   = gguf_f32(gguf_, k("final_logit_softcapping"), 0.0f);
+    ik.n_vocab_pad = gguf_u32(gguf_, k("vocab_size"));
+    ik.n_vocab     = gguf_u32(gguf_, k("vocab_size_unpadded"));
+    if (ik.is_swa.size() != ik.n_visit || !ik.n_swa || !ik.n_rel || !ik.rel_extent || !ik.block_size ||
+        ik.n_conv < 2 || !ik.n_vocab || ik.n_vocab > ik.n_vocab_pad ||
+        (ik.looped() && (ik.core_start % ik.block_size || ik.n_core() % ik.block_size)))
+        throw std::runtime_error("inkling2: invalid dimensions, vocabulary or layer pattern");
+    for (uint32_t iv = 0; iv < ik.n_visit; ++iv)
+        if (ik.is_swa[iv] != ik.is_swa[ik.phys(iv) < ik.core_end ? ik.phys(iv) : ik.phys(iv) + extra])
+            throw std::runtime_error("inkling2: a layer visit differs from its first visit");
+
+    hp_.expert_gating_func  = 2;      // sigmoid + selection bias
+    hp_.expert_weights_norm = true;
 }
 
 // qwen4exp-only hyper-parameters: hyper-connections, QSA and the PLE n-gram table.

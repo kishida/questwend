@@ -91,7 +91,8 @@ static ggml_tensor * role_tensor(Model & m, ExpertCache::Role r, int layer) {
 
 ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
                          int n_layer, int n_expert, int n_used, size_t vram_avail_bytes,
-                         bool ssd, const std::vector<bool> * layer_mask)
+                         bool ssd, const std::vector<bool> * layer_mask,
+                         const std::vector<uint8_t> * planned)
     : model_(model), ssd_(ssd), n_layer_(n_layer), n_expert_(n_expert) {
     // Layers this cache is responsible for (all of them without a split).
     // A leading dense block (step35, lfm2moe) has no routed experts at all; it
@@ -179,10 +180,22 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
     p.no_alloc = true;
     ctx_ = ggml_init(p);
 
+    // planned set: slots per pool = planned experts whose (role, layer) maps here
+    std::vector<int> planned_slots(sigs.size(), 0);
+    if (planned) {
+        for (int r = 0; r < N_ROLE; ++r)
+            for (int il = 0; il < n_layer; ++il) {
+                const int sidx = layer_pool_[r][il];
+                if (sidx < 0) continue;
+                for (int e = 0; e < n_expert; ++e)
+                    planned_slots[(size_t) sidx] += (*planned)[(size_t) il * n_expert + e] ? 1 : 0;
+            }
+    }
+
     pools_.resize(sigs.size());
     for (int s = 0; s < (int) sigs.size(); ++s) {
         int cap = sigs[s].n_layers * n_expert;
-        int n_slots = (int) (frac * cap);
+        int n_slots = planned ? planned_slots[(size_t) s] : (int) (frac * cap);
         // Correctness floor: one ensure() needs n_used distinct slots in a pool.
         // Fewer would thrash within a single layer and corrupt the matmul.
         if (n_slots < n_used) n_slots = n_used;
