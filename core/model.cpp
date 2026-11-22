@@ -60,7 +60,7 @@ static Arch arch_from_string(const std::string & s) {
     if (s == "qwen4exp")  return Arch::QWEN4EXP;
     if (s == "lfm2")      return Arch::LFM2;
     if (s == "lfm2moe")   return Arch::LFM2MOE;
-    if (s == "inkling2")  return Arch::INKLING2;
+    if (s == "inkling2" || s == "inkling2_loop") return Arch::INKLING2;
     return Arch::UNKNOWN;
 }
 
@@ -741,6 +741,7 @@ void Model::load_hparams() {
 
     const std::string arch = gguf_str(gguf_, "general.architecture", "unknown");
     hp_.arch = arch_from_string(arch);
+    hp_.arch_file = arch;
     if (hp_.arch == Arch::UNKNOWN) {
         throw std::runtime_error("unsupported architecture: " + arch);
     }
@@ -839,11 +840,23 @@ void Model::load_inkling2_hparams(const std::string & arch) {
     auto k = [&](const char * suffix) { return arch + "." + suffix; };
     InklingParams & ik = hp_.ink;
 
-    ik.n_visit    = hp_.n_layer;
-    ik.core_end   = gguf_u32(gguf_, k("loop.core_end"), 0);
-    ik.core_start = gguf_u32(gguf_, k("loop.core_start"), 0);
-    ik.n_pass     = ik.core_end > 0 ? gguf_u32(gguf_, k("num_loops"), 1) : 1;
+    const bool phys_file = arch == "inkling2_loop";   // llama.cpp's dialect: counts physical layers
+    const uint32_t block_count = hp_.n_layer;
+    ik.core_end   = gguf_u32(gguf_, k(phys_file ? "loop.end"   : "loop.core_end"), 0);
+    ik.core_start = gguf_u32(gguf_, k(phys_file ? "loop.start" : "loop.core_start"), 0);
     ik.gate_rank  = gguf_u32(gguf_, k("loop.gate_rank"), 0);
+    if (phys_file) {
+        const int64_t vk = gguf_find_key(gguf_, k("loop.varying").c_str());
+        const bool varying = vk >= 0 && gguf_get_kv_type(gguf_, vk) == GGUF_TYPE_BOOL && gguf_get_val_bool(gguf_, vk);
+        ik.n_pass = gguf_u32(gguf_, k("loop.count"), 0);
+        // as llama.cpp: a fixed loop has at least 2 passes, a variable one at least 1
+        if (!ik.has_core() || ik.core_end > block_count || ik.n_pass < (varying ? 1u : 2u) || ik.n_pass > 64)
+            throw std::runtime_error("inkling2_loop: invalid loop layout");
+        ik.n_visit = block_count + (ik.n_pass - 1) * ik.n_core();
+    } else {
+        ik.n_visit = block_count;
+        ik.n_pass  = ik.core_end > 0 ? gguf_u32(gguf_, k("num_loops"), 1) : 1;
+    }
     ik.n_pass_file = ik.n_pass;
     const uint32_t extra = ik.looped() ? (ik.n_pass - 1) * ik.n_core() : 0;
     if (ik.looped() && (ik.core_start >= ik.core_end || ik.core_end + extra > ik.n_visit || ik.gate_rank == 0))
@@ -851,6 +864,14 @@ void Model::load_inkling2_hparams(const std::string & arch) {
     hp_.n_layer = ik.n_visit - extra;   // physical blocks in the file
 
     for (bool b : gguf_bool_array(gguf_, k("attention.sliding_window_pattern"))) ik.is_swa.push_back(b ? 1 : 0);
+    if (phys_file) {
+        // given per physical layer: one entry per visit from here on
+        const std::vector<uint8_t> per_layer = std::move(ik.is_swa);
+        if (per_layer.size() != block_count)
+            throw std::runtime_error("inkling2_loop: the layer pattern does not match block_count");
+        ik.is_swa.resize(ik.n_visit);
+        for (uint32_t iv = 0; iv < ik.n_visit; ++iv) ik.is_swa[iv] = per_layer[ik.phys(iv)];
+    }
     ik.n_swa       = gguf_u32(gguf_, k("attention.sliding_window"));
     ik.n_rel       = gguf_u32(gguf_, k("attention.relative_length"));
     ik.rel_extent  = gguf_u32(gguf_, k("attention.relative_extent"));
@@ -867,8 +888,11 @@ void Model::load_inkling2_hparams(const std::string & arch) {
     ik.n_vocab     = gguf_u32(gguf_, k("vocab_size_unpadded"));
     if (ik.is_swa.size() != ik.n_visit || !ik.n_swa || !ik.n_rel || !ik.rel_extent || !ik.block_size ||
         ik.n_conv < 2 || !ik.n_vocab || ik.n_vocab > ik.n_vocab_pad ||
-        (ik.looped() && (ik.core_start % ik.block_size || ik.n_core() % ik.block_size)))
+        (ik.has_core() && (!ik.core_start || ik.core_start % ik.block_size || ik.n_core() % ik.block_size)))
         throw std::runtime_error("inkling2: invalid dimensions, vocabulary or layer pattern");
+    // by the tensors, not by the arch: it is their naming that differs
+    if (ik.has_core())
+        ik.per_layer_msg = tensor("blk." + std::to_string(ik.core_start) + ".loop_msg_query.weight") != nullptr;
     for (uint32_t iv = 0; iv < ik.n_visit; ++iv)
         if (ik.is_swa[iv] != ik.is_swa[ik.phys(iv) < ik.core_end ? ik.phys(iv) : ik.phys(iv) + extra])
             throw std::runtime_error("inkling2: a layer visit differs from its first visit");
@@ -884,7 +908,7 @@ void Model::load_inkling2_hparams(const std::string & arch) {
 void Model::set_loop_passes(int n) {
     const int MAX_PASSES = 8;
     InklingParams & ik = hp_.ink;
-    if (hp_.arch != Arch::INKLING2 || ik.n_pass_file < 2)
+    if (hp_.arch != Arch::INKLING2 || !ik.has_core())
         throw std::runtime_error("--loops needs a model with a looped core (inkling2)");
     if (n < 1 || n > MAX_PASSES)
         throw std::runtime_error("--loops must be 1.." + std::to_string(MAX_PASSES));
@@ -968,7 +992,7 @@ ggml_tensor * Model::tensor(const std::string & name) const {
 
 std::string Model::debug_dump() const {
     std::ostringstream os;
-    const std::string arch = arch_name(hp_.arch);
+    const std::string & arch = hp_.arch_file;
     // rope-related metadata
     os << "rope.dimension_count = " << gguf_u32(gguf_, arch + ".rope.dimension_count", 0) << "\n";
     os << "attention.key_length = " << gguf_u32(gguf_, arch + ".attention.key_length", 0) << "\n";
@@ -998,7 +1022,7 @@ std::string Model::debug_dump() const {
 
 std::string Model::summary() const {
     std::ostringstream os;
-    os << "arch          = " << arch_name(hp_.arch) << "\n"
+    os << "arch          = " << hp_.arch_file << "\n"
        << "n_layer       = " << hp_.n_layer << "\n"
        << "n_embd        = " << hp_.n_embd << "\n"
        << "n_ff          = " << hp_.n_ff << "\n"

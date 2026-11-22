@@ -594,13 +594,17 @@ ggml_tensor * InklingEngine::Impl::mix(Gr & g, const std::vector<ggml_tensor *> 
 
 // loop message controller: (1 - tanh(F h))*cur + tanh(G h)*msg, h = D [rms(cur); rms(msg)]
 ggml_tensor * InklingEngine::Impl::control(Gr & g, ggml_tensor * cur, ggml_tensor * msg, int ip, int module) {
-    static const char * names[4] = { "attn", "k", "v", "mlp" };
+    static const char * names[2][4] = {
+        { "attn",   "k",      "v",      "mlp"      },   // unsloth
+        { "q_ctrl", "k_ctrl", "v_ctrl", "ffn_ctrl" },   // llama.cpp
+    };
+    const char * name = names[ik.per_layer_msg ? 1 : 0][module];
     ggml_context * ctx = g.ctx;
     const int64_t E = hp.n_embd, T = cur->ne[1];
     char fd[96], fg[96], ff[96];
-    snprintf(fd, sizeof(fd), "blk.%%d.loop_%s_down.weight",   names[module]);
-    snprintf(fg, sizeof(fg), "blk.%%d.loop_%s_gain.weight",   names[module]);
-    snprintf(ff, sizeof(ff), "blk.%%d.loop_%s_forget.weight", names[module]);
+    snprintf(fd, sizeof(fd), "blk.%%d.loop_%s_down.weight",   name);
+    snprintf(fg, sizeof(fg), "blk.%%d.loop_%s_gain.weight",   name);
+    snprintf(ff, sizeof(ff), "blk.%%d.loop_%s_forget.weight", name);
     ggml_tensor * h = ggml_concat(ctx, ggml_reshape_3d(ctx, cur, E, 1, T), ggml_reshape_3d(ctx, msg, E, 1, T), 1);
     h = ggml_reshape_2d(ctx, ggml_rms_norm(ctx, h, 1e-6f), 2 * E, T);
     h = ggml_mul_mat(ctx, W(fd, ip), h);
@@ -662,7 +666,13 @@ ggml_tensor * InklingEngine::Impl::visit_pre(Gr & g, St & st, int iv, ggml_tenso
                 st.cur       = st.prelude_cur;
             }
         }
-        if (pass > 0) {
+        if (pass > 0 && ik.per_layer_msg) {
+            // one query per module and layer: q, k, v, ffn
+            ggml_tensor * m = mix(g, st.bank, st.bank_last, W("blk.%d.loop_msg_query.weight", ip));
+            for (int j = 0; j < 4; ++j)
+                messages[j] = ggml_cont(ctx, ggml_view_2d(ctx, m, E, T, m->nb[2], (size_t) j * m->nb[1]));
+        } else if (pass > 0) {
+            // the same queries as two model-wide tables, rows (q, ffn) and (k, v) of each layer
             const size_t row = 2 * (size_t) (ip - (int) ik.core_start);
             ggml_tensor * lrq = G("loop_res_query.weight"), * lkq = G("loop_kv_res_query.weight");
             ggml_tensor * q_attn = ggml_view_2d(ctx, lrq, E, 2, lrq->nb[1], row * lrq->nb[1]);

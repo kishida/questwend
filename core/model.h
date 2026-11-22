@@ -38,7 +38,8 @@ enum class Arch {
     LFM2,         // LiquidAI LFM2 / LFM2.5: short-conv + GQA hybrid, dense
     LFM2MOE,      // LiquidAI LFM2-MoE: the same hybrid with sigmoid-routed experts
     INKLING2,     // Thinking Machines Inkling 2: depth-attention residuals, relative bias,
-                  // short convs on K/V/outputs, looped core (see core/inkling.cpp)
+                  // short convs on K/V/outputs, looped core (see core/inkling.cpp).
+                  // Both of its GGUF dialects: "inkling2" and "inkling2_loop".
 };
 
 // Inkling 2 hyper-parameters. Kept apart from HParams' shared fields because
@@ -47,12 +48,21 @@ enum class Arch {
 // blocks, the forward pass makes n_visit layer visits (the core
 // [core_start, core_end) runs n_pass times), and every visit has its own KV
 // cache and conv state while the weights stay per physical layer.
+//
+// A looped core comes in two GGUF dialects, read into the same fields:
+//   "inkling2" (unsloth)           block_count and the per-layer arrays count
+//                                  visits; num_loops, loop.core_start / _end
+//   "inkling2_loop" (llama.cpp)    they count physical layers; loop.count,
+//                                  loop.start / .end, loop.varying
+// The loop's tensors are named and grouped differently as well (per_layer_msg).
 struct InklingParams {
     uint32_t n_visit      = 0;
     uint32_t core_start   = 0, core_end = 0;
     uint32_t n_pass       = 1;   // < 2: no loop
     uint32_t n_pass_file  = 1;   // what the GGUF says; n_pass differs under --loops
     uint32_t gate_rank    = 0;   // loop message controllers' rank
+    bool     per_layer_msg = false;   // blk.N.loop_msg_query [q, k, v, ffn] and loop_*_ctrl_* (llama.cpp);
+                                      // else loop_res_query / loop_kv_res_query and loop_{attn,k,v,mlp}_*
     std::vector<uint8_t> is_swa; // per visit
     uint32_t n_swa        = 0;
     uint32_t n_rel        = 0;   // relative-position bias rank
@@ -69,6 +79,7 @@ struct InklingParams {
 
     bool     looped() const { return n_pass > 1; }
     uint32_t n_core() const { return core_end - core_start; }
+    bool     has_core() const { return core_end > core_start && gate_rank > 0; }   // loops, at any pass count
     // physical layer of visit `iv`
     uint32_t phys(uint32_t iv) const {
         if (!looped() || iv < core_start) return iv;
@@ -194,6 +205,7 @@ struct HParams {
 
     // GGUF metadata (display / identification)
     std::string  general_name;  // general.name
+    std::string  arch_file;     // general.architecture as written: the prefix of the file's keys
     // general.file_type. The value is a llama_ftype, not the ggml_ftype the
     // name suggests -- the two agree up to Q5_1 and diverge from there.
     uint32_t     file_type = 0;
