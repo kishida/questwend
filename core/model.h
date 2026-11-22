@@ -59,7 +59,8 @@ struct InklingParams {
     uint32_t n_visit      = 0;
     uint32_t core_start   = 0, core_end = 0;
     uint32_t n_pass       = 1;   // < 2: no loop
-    uint32_t n_pass_file  = 1;   // what the GGUF says; n_pass differs under --loops
+    uint32_t n_pass_file  = 1;   // what the GGUF says; n_pass differs under --loops or a request's "loops"
+    bool     varying      = false;    // loop.varying: trained for a varying pass count
     uint32_t gate_rank    = 0;   // loop message controllers' rank
     bool     per_layer_msg = false;   // blk.N.loop_msg_query [q, k, v, ffn] and loop_*_ctrl_* (llama.cpp);
                                       // else loop_res_query / loop_kv_res_query and loop_{attn,k,v,mlp}_*

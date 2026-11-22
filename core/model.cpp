@@ -848,6 +848,7 @@ void Model::load_inkling2_hparams(const std::string & arch) {
     if (phys_file) {
         const int64_t vk = gguf_find_key(gguf_, k("loop.varying").c_str());
         const bool varying = vk >= 0 && gguf_get_kv_type(gguf_, vk) == GGUF_TYPE_BOOL && gguf_get_val_bool(gguf_, vk);
+        ik.varying = varying;
         ik.n_pass = gguf_u32(gguf_, k("loop.count"), 0);
         // as llama.cpp: a fixed loop has at least 2 passes, a variable one at least 1
         if (!ik.has_core() || ik.core_end > block_count || ik.n_pass < (varying ? 1u : 2u) || ik.n_pass > 64)

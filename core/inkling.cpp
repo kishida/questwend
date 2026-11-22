@@ -54,7 +54,13 @@ struct InklingEngine::Impl {
     // ---- per-visit state: KV (F16 rows of n_embd_k_gqa) and conv history ----
     ggml_context *        st_ctx = nullptr;
     ggml_backend_buffer_t st_buf = nullptr;
-    std::vector<ggml_tensor *> k_l, v_l, conv_l;
+    std::vector<ggml_tensor *> k_l, v_l, conv_l;   // per visit at the current pass count
+    // The state there is room for, laid out by the visits of max_pass passes.
+    // Fewer passes use the first ones of the core and the same postlude.
+    std::vector<ggml_tensor *> st_k, st_v, st_conv;
+    int  max_pass = 1;
+    void map_state();
+    bool set_loops(int n);
     int n_ctx = 0, ring = 0;   // full-attention capacity, SWA ring capacity
     int n_embd_kv = 0, n_head = 0, n_head_kv = 0, n_hd = 0, n_ch = 0;
 
@@ -494,14 +500,22 @@ void InklingEngine::Impl::init() {
     // ---- state sizes ----
     n_ctx = cfg.n_ctx > 0 ? cfg.n_ctx : 4096;
     ring  = std::min<int>(n_ctx, (int) ik.n_swa + UBATCH);
-    size_t st_bytes = 0;
-    for (uint32_t iv = 0; iv < ik.n_visit; ++iv)
-        st_bytes += 2ull * n_embd_kv * (ik.is_swa[iv] ? ring : n_ctx) * 2 + (size_t) (ik.n_conv - 1) * n_ch * 4;
-
     if (ik.n_pass != ik.n_pass_file)
         fprintf(stderr, "inkling2: --loops %u (the model's own is %u): core layers %u-%u, %u layer visits instead of %u\n",
                 ik.n_pass, ik.n_pass_file, ik.core_start, ik.core_end - 1, ik.n_visit,
                 hp.n_layer + (ik.n_pass_file - 1) * ik.n_core());
+    const int start_pass = (int) ik.n_pass;
+    max_pass = start_pass;
+    if (ik.has_core() && cfg.max_loops > start_pass) {
+        max_pass = cfg.max_loops;
+        model.set_loop_passes(max_pass);   // the state is sized by the most visits; back below
+        fprintf(stderr, "inkling2: loops switchable 1..%d per request (default %d), state kept for %d\n",
+                max_pass, start_pass, max_pass);
+    }
+    size_t st_bytes = 0;
+    for (uint32_t iv = 0; iv < ik.n_visit; ++iv)
+        st_bytes += 2ull * n_embd_kv * (ik.is_swa[iv] ? ring : n_ctx) * 2 + (size_t) (ik.n_conv - 1) * n_ch * 4;
+
     model.set_embd_q8(cfg.embd_q8);
     const size_t wbytes = model.weight_bytes(gpu);
     const size_t reserve = 1200ull << 20;   // compute buffers (prefill attention bias dominates)
@@ -529,23 +543,25 @@ void InklingEngine::Impl::init() {
     st_ctx = ggml_init(p);
     for (uint32_t iv = 0; iv < ik.n_visit; ++iv) {
         const int cap = ik.is_swa[iv] ? ring : n_ctx;
-        k_l.push_back(ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_kv, cap));
-        v_l.push_back(flash ? ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_kv, cap)
-                            : ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, cap, n_embd_kv));   // manual path: transposed
-        conv_l.push_back(ggml_new_tensor_2d(st_ctx, GGML_TYPE_F32, ik.n_conv - 1, n_ch));
+        st_k.push_back(ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_kv, cap));
+        st_v.push_back(flash ? ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, n_embd_kv, cap)
+                             : ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, cap, n_embd_kv));   // manual path: transposed
+        st_conv.push_back(ggml_new_tensor_2d(st_ctx, GGML_TYPE_F32, ik.n_conv - 1, n_ch));
     }
     st_buf = ggml_backend_alloc_ctx_tensors(st_ctx, gpu);
     if (!st_buf) throw std::runtime_error("inkling2: cannot allocate KV / conv state");
     ggml_backend_buffer_clear(st_buf, 0);
+    if (max_pass != start_pass) model.set_loop_passes(start_pass);
+    map_state();
 
     galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu));
     if (offload) init_offload(budget, st_bytes);
 
     // --mtp: a DSpark draft next to the model (dspark-*.gguf), or INK_DSPARK=<file>
-    if (cfg.use_mtp && ik.n_pass != ik.n_pass_file) {
+    if (cfg.use_mtp && (ik.n_pass != ik.n_pass_file || max_pass != start_pass)) {
         // the draft reads fixed visits of the trained loop
-        fprintf(stderr, "warning: DSpark only fits the model's own %u loops; ignored with --loops %u\n",
-                ik.n_pass_file, ik.n_pass);
+        fprintf(stderr, "warning: DSpark only fits the model's own %u loops; ignored with --loops %u%s\n",
+                ik.n_pass_file, ik.n_pass, max_pass != start_pass ? " and switchable loops" : "");
     } else if (cfg.use_mtp) {
         std::string dp = getenv("INK_DSPARK") ? getenv("INK_DSPARK") : "";
         if (dp.empty()) {
@@ -2426,6 +2442,34 @@ void InklingEngine::Impl::generate_spec(const std::vector<int32_t> & prompt, int
                 100.0 * accepted / drafted, 1.0 + (double) accepted / steps);
 }
 
+// k_l / v_l / conv_l = the part of the state the current pass count's visits use
+void InklingEngine::Impl::map_state() {
+    const uint32_t core_last = ik.core_start + ik.n_pass * ik.n_core();   // first postlude visit
+    const uint32_t shift = ((uint32_t) max_pass - ik.n_pass) * ik.n_core();
+    k_l.clear(); v_l.clear(); conv_l.clear();
+    for (uint32_t iv = 0; iv < ik.n_visit; ++iv) {
+        const size_t s = iv < core_last ? iv : iv + shift;
+        k_l.push_back(st_k[s]);
+        v_l.push_back(st_v[s]);
+        conv_l.push_back(st_conv[s]);
+    }
+}
+
+bool InklingEngine::Impl::set_loops(int n) {
+    if (n == (int) ik.n_pass) return true;
+    if (n < 1 || n > max_pass || ds.on) return false;   // (the draft's state follows fixed visits)
+    // every kept graph is wired to the old visits; the weights and the expert pool stay
+    free_kept();
+    for (auto * v : { &segA, &segB, &segC }) {
+        for (auto & sg : *v) free_seg(sg);
+        v->clear();
+    }
+    seg_bucket = 0;
+    model.set_loop_passes(n);
+    map_state();
+    return true;
+}
+
 InklingEngine::InklingEngine(Model & model, const RuntimeConfig & cfg)
     : impl_(std::make_unique<Impl>(model, cfg)) { impl_->init(); }
 InklingEngine::~InklingEngine() {
@@ -2498,6 +2542,14 @@ void InklingEngine::reset() {
 int InklingEngine::n_past() const { return impl_->n_past_; }
 const std::vector<int32_t> & InklingEngine::kv_tokens() const { return impl_->kv_toks; }
 bool InklingEngine::has_expert_cache() const { return impl_->ec != nullptr; }
+int  InklingEngine::loops() const     { return impl_->ik.has_core() ? (int) impl_->ik.n_pass : 0; }
+int  InklingEngine::max_loops() const { return impl_->ik.has_core() && !impl_->ds.on ? impl_->max_pass : 0; }
+bool InklingEngine::set_loops(int n) {
+    if (n == loops()) return true;
+    if (!impl_->set_loops(n)) return false;
+    reset();
+    return true;
+}
 Runtime::CacheStats InklingEngine::cache_stats() const {
     Runtime::CacheStats c;
     if (impl_->ec) {

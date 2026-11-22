@@ -39,6 +39,13 @@ public:
 
     bool has_expert_cache() const;
 
+    // Passes over the looped core: the current count, the most there is state
+    // for, and the switch between requests. A switch resets the engine: every
+    // layer after the core sees another input. False = out of range.
+    int  loops() const;
+    int  max_loops() const;
+    bool set_loops(int n);
+
     // DSpark speculative greedy decode (--mtp with a dspark-*.gguf draft)
     bool has_draft() const;
     // sampler for generate_spec (null = greedy); it sees each emitted token's logits once

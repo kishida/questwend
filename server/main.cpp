@@ -488,6 +488,7 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
   header button, .ctl { background:var(--panel); color:var(--txt); border:1px solid var(--line);
          border-radius:8px; padding:6px 10px; font-size:13px; cursor:pointer; }
   header label { color:var(--muted); font-size:12px; display:flex; align-items:center; gap:6px; }
+  header select { background:var(--bg); color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:3px 6px; }
   header input[type=number] { width:64px; background:var(--bg); color:var(--txt); border:1px solid var(--line);
          border-radius:6px; padding:4px 6px; }
   #chat { flex:1; overflow-y:auto; padding:20px 0; }
@@ -519,6 +520,7 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
 <header>
   <b>QuestWend</b><span class="model" id="model">…</span>
   <span class="spacer"></span>
+  <label id="loopsLabel" style="display:none">loops <select id="loops"></select></label>
   <label>temp <input type="number" id="temp" value="0.7" step="0.1" min="0" max="2"></label>
   <label><input type="checkbox" id="think" checked> think</label>
   <button id="clear">Clear</button>
@@ -544,6 +546,11 @@ let running = null;   // the AbortController of the reply being generated
 fetch('/v1/models').then(r=>r.json()).then(j=>{
   const m = j.data && j.data[0];
   document.getElementById('model').textContent = (m && (m.display || m.id)) || '';
+  if(m && m.loops && m.loops.max > 1){   // a looped model that can switch
+    const sel = document.getElementById('loops');
+    for(let i=1; i<=m.loops.max; i++) sel.add(new Option(i, i, i===m.loops.default, i===m.loops.default));
+    document.getElementById('loopsLabel').style.display = '';
+  }
 }).catch(()=>{});
 
 function addMsg(role, text, imgs){
@@ -620,6 +627,7 @@ async function send(){
         messages: msgs, stream: true,
         temperature: parseFloat(document.getElementById('temp').value)||0,
         // no max_tokens: the server generates until the context runs out
+        loops: parseInt(document.getElementById('loops').value) || undefined,
         reasoning: document.getElementById('think').checked
       })
     });
@@ -687,7 +695,7 @@ function showStats(el, t){
   const s = document.createElement('div'); s.className = 'stats';
   const f = (x)=> (x||0).toFixed(1);
   const cached = t.cached_tokens ? `, ${t.cached_tokens} cached` : '';
-  s.textContent = `TTFT ${Math.round(t.ttft_ms||0)} ms · prefill ${f(t.prefill_tps)} tok/s `
+  s.textContent = (t.loops ? `${t.loops} loops · ` : '') + `TTFT ${Math.round(t.ttft_ms||0)} ms · prefill ${f(t.prefill_tps)} tok/s `
     + `(${t.prompt_tokens} in${cached}) · gen ${f(t.gen_tps)} tok/s · ${t.completion_tokens} out`;
   el.appendChild(s);
   document.getElementById('chat').scrollTop = 1e9;
@@ -705,6 +713,7 @@ int main(int argc, char ** argv) {
     int  cache_slots = 0;
     std::string cache_slots_dir;
     int  time_slice = 64;   // generation tokens per turn when requests contend
+    int  max_loops = -1;    // loops a request may ask for (-1 = auto: 5 for a varying-loop model)
                             // (needs --cache-slots to park state; 0 = back-to-back)
     bool want_help = false;
 
@@ -716,6 +725,10 @@ int main(int argc, char ** argv) {
         else if (a == "--cache-slots" && i + 1 < argc) cache_slots = std::stoi(argv[++i]);
         else if (a == "--cache-slots-dir" && i + 1 < argc) cache_slots_dir = argv[++i];
         else if (a == "--time-slice" && i + 1 < argc) time_slice = std::stoi(argv[++i]);
+        else if (a == "--max-loops" && i + 1 < argc) {
+            max_loops = atoi(argv[++i]);
+            if (max_loops < 1 || max_loops > 8) { fprintf(stderr, "error: --max-loops takes 1..8\n"); return 1; }
+        }
         else if (a == "--heartbeat" && i + 1 < argc) set_knob("QWEN_HEARTBEAT", argv[++i]);
         else if (a == "--pf-chunk" && i + 1 < argc)  set_knob("QWEN_PF_CHUNK", argv[++i]);
         else if (a == "-h" || a == "--help") want_help = true;
@@ -753,6 +766,8 @@ int main(int argc, char ** argv) {
             "  --port <N>          listen port (default 8080)\n"
             "  --host <addr>       bind address (default 127.0.0.1)\n"
             "  --no-mmproj         disable image input even if an mmproj file is present\n"
+            "  --max-loops <N>     looped models: the most a request's \"loops\" may ask for; KV room is\n"
+            "                      kept for it (default: 5 if trained for varying loops, else --loops)\n"
             "  --cache-slots <N>   extra prompt-cache slots for interleaved conversations (default 0)\n"
             "  --cache-slots-dir <dir>  store the slots on disk instead of RAM (persists across restarts)\n"
             "  --time-slice <N>    interleave concurrent streaming requests every N generated tokens\n"
@@ -831,6 +846,8 @@ int main(int argc, char ** argv) {
         RuntimeConfig cfg;
         if (!apply_common_options(opt, cfg)) return 1;
         cfg.cache_profile_save = false;   // server only reads the profile, never overwrites it
+        if (max_loops < 0) max_loops = model->hparams().ink.varying && !use_mtp ? 5 : 0;   // DSpark wants a fixed count
+        cfg.max_loops = max_loops;
         rt = std::make_unique<Runtime>(*model, cfg);
     } catch (const std::exception & e) {
         fprintf(stderr, "load error: %s\n", e.what());
@@ -882,6 +899,10 @@ int main(int argc, char ** argv) {
             default: return "";
         }
     };
+    // read here once: requests switch the count while other threads serve /v1/models
+    const int  loops_default = rt->loops();
+    const int  loops_max     = rt->max_loops();
+    const bool loops_switch  = loops_max > 1;
     const std::string model_display = [&]() {
         const auto & hp = model->hparams();
         const char * ft = ftype_label(hp.file_type);
@@ -889,7 +910,7 @@ int main(int argc, char ** argv) {
         if (!hp.general_name.empty()) d = hp.general_name;
         if (ft && *ft) { if (!d.empty()) d += ' '; d += ft; }
         d += '('; d += hp.arch_file; d += ')';
-        if (hp.ink.n_pass != hp.ink.n_pass_file) d += " loops=" + std::to_string(hp.ink.n_pass);
+        if (!loops_switch && hp.ink.n_pass != hp.ink.n_pass_file) d += " loops=" + std::to_string(hp.ink.n_pass);
         return d;
     }();
     const int32_t eos    = model->vocab().eos_id;
@@ -1132,13 +1153,21 @@ int main(int argc, char ** argv) {
         return true;
     };
 
-    auto prepare_prompt = [&](std::vector<int32_t> & prompt,
+    auto prepare_prompt = [&](int loops, std::vector<int32_t> & prompt,
                               std::vector<Runtime::EmbdOverride> & ovr,
                               std::vector<ImgSpan> spans, uint64_t owner,
                               const std::shared_ptr<Prog> & prog,
                               lclk::time_point t_recv) -> int {
         const int n_full = (int) prompt.size();
         const bool has_img = !spans.empty();
+        if (loops > 0 && loops != rt->loops()) {
+            // under the lock, before anything is matched: the switch empties the KV
+            const int was = rt->loops();
+            if (!rt->set_loops(loops)) throw std::runtime_error("cannot switch to " + std::to_string(loops) + " loops");
+            kv_imgs->clear();
+            live_origin = -1;
+            fprintf(stderr, "[%s] loops %d -> %d\n", clock_hms().c_str(), was, loops);
+        }
         int n = match_cov(rt->kv_tokens(), *kv_imgs, prompt, spans, "live");
         const char * src = "live";
         // mid-prompt divergence (e.g. the client rewrote the previous turn,
@@ -1378,10 +1407,10 @@ int main(int argc, char ** argv) {
     });
 
     srv.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
-        json j = {{"object", "list"}, {"data", json::array({
-            {{"id", model_id}, {"object", "model"}, {"owned_by", "questwend"},
-             {"display", model_display}}
-        })}};
+        json m = {{"id", model_id}, {"object", "model"}, {"owned_by", "questwend"},
+                  {"display", model_display}};
+        if (loops_default > 0) m["loops"] = {{"default", loops_default}, {"max", loops_max}};
+        json j = {{"object", "list"}, {"data", json::array({ m })}};
         res.set_content(j.dump(), "application/json");
     });
 
@@ -1409,6 +1438,24 @@ int main(int argc, char ** argv) {
         const SamplerConfig sc = make_sampler(body);
         const std::string id   = now_id("chatcmpl-");
         const long long created = (long long) std::time(nullptr);
+
+        // per-request pass count of a looped model; omitted = the server's, not the last one used
+        int loops = loops_default;
+        if (body.contains("loops") && !body["loops"].is_null()) {
+            const auto & l = body["loops"];
+            const int most = std::max(loops_max, 1);
+            const bool in_range = l.is_number_integer() && l.get<long long>() >= 1 && l.get<long long>() <= most;
+            if (!in_range || (!loops_switch && l.get<int>() != loops_default)) {
+                const std::string why = loops_switch ? "loops must be a whole number 1.." + std::to_string(most)
+                    : loops_default > 0 ? "loops is fixed at " + std::to_string(loops_default)
+                                          + " (start the server with --max-loops to switch)"
+                    : "this model has no loops";
+                res.status = 400;
+                res.set_content(json{{"error", why}}.dump(), "application/json");
+                return;
+            }
+            loops = l.get<int>();
+        }
 
         // per-request thinking control: body "reasoning" overrides the server default
         bool reasoning = reasoning_default;
@@ -1547,6 +1594,7 @@ int main(int argc, char ** argv) {
                 bool pf_done = false;
                 bool paused = false, done = false;
                 int n_cached = 0;                 // prompt tokens reused from the cache
+                int loops = 0;                    // looped model: this request's pass count
                 int generated = 0, max_tokens = 0, prompt_tokens = 0;
                 bool started = false, finished = false;
                 clk::time_point t0, t_prefill, t_first;
@@ -1557,6 +1605,7 @@ int main(int argc, char ** argv) {
             auto st = std::make_shared<State>(sc, *tok);
             st->tl = &tlock;
             st->sid = sid_gen.fetch_add(1);
+            st->loops = loops;
             st->prompt = prompt;
             st->max_tokens = max_tokens;
             st->prompt_tokens = (int) prompt.size();
@@ -1605,6 +1654,7 @@ int main(int argc, char ** argv) {
                             {"gen_tps",     gen_ms     > 0 ? st->generated * 1000.0 / gen_ms    : 0.0},
                         };
                         add_llama_timings(timings, st->prompt_tokens, st->n_cached, st->generated, prefill_ms, gen_ms);
+                        if (st->loops > 0) timings["loops"] = st->loops;
                         log_done(st->prompt_tokens, st->n_cached, st->generated,
                                  prefill_ms, gen_ms, st->cstat0);
                         // tool calls: parse the accumulated text; if any, emit them as a
@@ -1854,7 +1904,7 @@ int main(int argc, char ** argv) {
                                 st->started = true;
                                 st->t0 = clk::now();
                                 st->had_images = !st->ovr.empty();
-                                st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog, st->t_recv);
+                                st->n_cached = prepare_prompt(st->loops, st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog, st->t_recv);
                                 st->cstat0 = rt->cache_stats();
                                 st->my_imgs = *kv_imgs;
                                 st->resp_base = rt->kv_tokens().size() + st->prompt.size();
@@ -1982,7 +2032,7 @@ int main(int argc, char ** argv) {
                             st->started = true;
                             st->t0 = clk::now();
                             st->had_images = !st->ovr.empty();
-                            st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog, st->t_recv);
+                            st->n_cached = prepare_prompt(st->loops, st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog, st->t_recv);
                             st->cstat0 = rt->cache_stats();
                             st->my_imgs = *kv_imgs;
                         } else if (!was_holding) {
@@ -2076,7 +2126,7 @@ int main(int argc, char ** argv) {
                 ~Guard() { t.unlock(); }
             } lk(tlock);
             auto prog = std::make_shared<Prog>();
-            n_cached = prepare_prompt(prompt, ovr, std::move(spans), 0, prog, t_recv);
+            n_cached = prepare_prompt(loops, prompt, ovr, std::move(spans), 0, prog, t_recv);
             cstat0 = rt->cache_stats();
             t0 = clk::now();
             // checkpoint at the generation-prompt boundary (see streaming path)
@@ -2200,6 +2250,7 @@ int main(int argc, char ** argv) {
                          {"gen_tps", gen_ms > 0 ? generated * 1000.0 / gen_ms : 0.0}}}
         };
         add_llama_timings(resp["timings"], n_prompt_full, n_cached, generated, prefill_ms, gen_ms);
+        if (loops > 0) resp["timings"]["loops"] = loops;
         res.set_content(dumpj(resp), "application/json");
     });
 

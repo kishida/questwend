@@ -67,6 +67,7 @@ struct RuntimeConfig {
     ExpertTier expert_tier = ExpertTier::Auto;  // tier used when the experts must leave VRAM
     bool   use_mtp        = false;   // MTP self-speculative decode (keeps nextn block VRAM-resident)
     int    n_loops        = 0;       // passes over a looped core; 0 = the model's own
+    int    max_loops      = 0;       // passes to keep room for, so set_loops can switch (<= n_loops: none)
     bool   embd_q8        = false;   // use Q8_0 (not F16) for token embedding fallback (saves VRAM)
 
     // PLE n-gram embedding (qwen4exp). The table is 26.8 GiB in the IQ1_S quant
@@ -150,6 +151,11 @@ public:
     // Only valid when has_mtp(). Returns draft logits for the next-next token.
     const std::vector<float> & mtp_draft(int32_t token);
     bool has_mtp() const;
+    // Looped core (inkling2): the pass count in use, the most it can be switched
+    // to, and the switch, which empties the KV. 0 / 0 / false without a loop.
+    int  loops() const;
+    int  max_loops() const;
+    bool set_loops(int n);
 
     // Advance the KV cache (and, when mtp_kv, the nextn KV + draft context)
     // over `tokens` without sampling: one chunk of a preemptible prefill.
