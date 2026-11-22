@@ -713,7 +713,7 @@ int main(int argc, char ** argv) {
     int  cache_slots = 0;
     std::string cache_slots_dir;
     int  time_slice = 64;   // generation tokens per turn when requests contend
-    int  max_loops = -1;    // loops a request may ask for (-1 = auto: 5 for a varying-loop model)
+    int  max_loops = -1;    // loops a request may ask for (-1 = auto: 6 for a varying-loop model)
                             // (needs --cache-slots to park state; 0 = back-to-back)
     bool want_help = false;
 
@@ -767,7 +767,7 @@ int main(int argc, char ** argv) {
             "  --host <addr>       bind address (default 127.0.0.1)\n"
             "  --no-mmproj         disable image input even if an mmproj file is present\n"
             "  --max-loops <N>     looped models: the most a request's \"loops\" may ask for; KV room is\n"
-            "                      kept for it (default: 5 if trained for varying loops, else --loops)\n"
+            "                      kept for it (default: 6 if trained for varying loops, else --loops)\n"
             "  --cache-slots <N>   extra prompt-cache slots for interleaved conversations (default 0)\n"
             "  --cache-slots-dir <dir>  store the slots on disk instead of RAM (persists across restarts)\n"
             "  --time-slice <N>    interleave concurrent streaming requests every N generated tokens\n"
@@ -846,7 +846,7 @@ int main(int argc, char ** argv) {
         RuntimeConfig cfg;
         if (!apply_common_options(opt, cfg)) return 1;
         cfg.cache_profile_save = false;   // server only reads the profile, never overwrites it
-        if (max_loops < 0) max_loops = model->hparams().ink.varying && !use_mtp ? 5 : 0;   // DSpark wants a fixed count
+        if (max_loops < 0) max_loops = model->hparams().ink.varying && !use_mtp ? 6 : 0;   // DSpark wants a fixed count
         cfg.max_loops = max_loops;
         rt = std::make_unique<Runtime>(*model, cfg);
     } catch (const std::exception & e) {
