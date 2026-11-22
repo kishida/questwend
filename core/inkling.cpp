@@ -158,6 +158,7 @@ struct InklingEngine::Impl {
     struct Seg {
         ggml_context * ctx = nullptr; ggml_cgraph * gf = nullptr; ggml_gallocr_t ga = nullptr;
         ggml_tensor * out = nullptr;   // logits (head graph)
+        ggml_tensor * embd = nullptr;  // graph A of visit 0: image embeddings input
         ggml_tensor * sel = nullptr, * w = nullptr, * x = nullptr;   // graph A outputs (slot views)
         ggml_tensor * xin = nullptr, * ids = nullptr, * win = nullptr;  // CPU expert graph inputs
         int key = -1;
@@ -245,6 +246,31 @@ struct InklingEngine::Impl {
     // the whole stack for T tokens on the GPU (resident weights)
     void build_full(Gr & g, ggml_tensor * inp, bool want_logits, ggml_tensor ** out);
     void forward(const int32_t * toks, int T, bool want_logits);
+    // Images: a chunk is either all token ids or all image embeddings, the
+    // latter handed to forward() in cur_embd ([n_embd, T], null = token ids).
+    std::vector<Runtime::EmbdOverride> embd_ovr;
+    const float * cur_embd = nullptr;
+    // Sets cur_embd for the chunk at i of a P-token call and returns its length.
+    int next_chunk(int i, int P) {
+        cur_embd = nullptr;
+        int end = P;
+        for (const auto & o : embd_ovr) {
+            if (i >= o.first && i < o.first + o.count) {
+                cur_embd = o.data + (size_t) (i - o.first) * hp.n_embd;
+                end = std::min(P, o.first + o.count);
+                break;
+            }
+            if (o.first > i) end = std::min(end, o.first);
+        }
+        int T = chunk_len(end - i);
+        if (cur_embd && T > 2 && end - i - T == 1) --T;   // T == 1 is the decode path
+        return T;
+    }
+    // The overrides belong to one call, also when it throws.
+    struct OvrScope {
+        Impl & m;
+        ~OvrScope() { m.embd_ovr.clear(); m.cur_embd = nullptr; }
+    };
     // Prefill chunk: UBATCH, halved while the per-head attention mask of the
     // full-attention visits ([n_kv, T, n_head], gathered in F32 then copied to
     // F16) would pass INK_ATTN_MB (default 400). Its size grows with the KV, so
@@ -937,8 +963,12 @@ void InklingEngine::Impl::set_inputs(Gr & g, int T) {
 void InklingEngine::Impl::build_full(Gr & g, ggml_tensor * inp, bool want_logits, ggml_tensor ** out_p) {
     ggml_context * ctx = g.ctx;
     St st;
-    st.cur = ggml_get_rows(ctx, model.tok_embd_rows(), inp);
-    st.cur = ggml_mul(ctx, ggml_rms_norm(ctx, st.cur, hp.rms_eps), G("token_embd_norm.weight"));
+    if (inp->type == GGML_TYPE_F32) {   // image embeddings: not normalised
+        st.cur = inp;
+    } else {
+        st.cur = ggml_get_rows(ctx, model.tok_embd_rows(), inp);
+        st.cur = ggml_mul(ctx, ggml_rms_norm(ctx, st.cur, hp.rms_eps), G("token_embd_norm.weight"));
+    }
 
     for (int iv = 0; iv < (int) ik.n_visit; ++iv) {
         const int ip = (int) ik.phys((uint32_t) iv);
@@ -970,7 +1000,7 @@ void InklingEngine::Impl::forward(const int32_t * toks, int T, bool want_logits)
     auto t0 = clk::now();
     // small batches (a speculative verify) keep their graph too, one per T
     static const bool keep_small = getenv("INK_VERIFY_BENCH") != nullptr;
-    const bool use_kept = (T == 1 || (keep_small && T <= 8)) && want_logits && !no_keep && !no_keep_now;
+    const bool use_kept = (T == 1 || (keep_small && T <= 8)) && want_logits && !no_keep && !no_keep_now && !cur_embd;
     Gr g; ggml_tensor * inp = nullptr, * out = nullptr;
     if (use_kept) {
         const int bucket = std::min(n_ctx, (n_past_ + T + 255) / 256 * 256);
@@ -990,14 +1020,16 @@ void InklingEngine::Impl::forward(const int32_t * toks, int T, bool want_logits)
         g = kept.g; inp = kept.inp; out = kept.out;
     } else {
         g = new_graph(T, n_past_ + T);
-        inp = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, T);
+        inp = cur_embd ? ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, hp.n_embd, T)
+                       : ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, T);
         ggml_set_input(inp); ggml_set_name(inp, "ink_tokens");
         build_full(g, inp, want_logits, &out);
     }
     auto t1 = clk::now();
     if (!use_kept && !ggml_gallocr_alloc_graph(galloc, g.gf)) throw std::runtime_error("inkling2: graph alloc failed");
     auto t2 = clk::now();
-    ggml_backend_tensor_set(inp, toks, 0, (size_t) T * sizeof(int32_t));
+    if (cur_embd) ggml_backend_tensor_set(inp, cur_embd, 0, (size_t) T * hp.n_embd * sizeof(float));
+    else          ggml_backend_tensor_set(inp, toks, 0, (size_t) T * sizeof(int32_t));
     set_inputs(g, T);
     auto t3 = clk::now();
     if (ggml_backend_graph_compute(gpu, g.gf) != GGML_STATUS_SUCCESS)
@@ -1303,7 +1335,7 @@ void InklingEngine::Impl::forward_offload(const int32_t * toks, int T, bool want
     const int NV = (int) ik.n_visit;
     static const bool no_keep = getenv("INK_NO_KEEP") != nullptr;
     const bool decode = T == 1;
-    const bool keep   = decode && want_logits && !no_keep;
+    const bool keep   = decode && want_logits && !no_keep && !cur_embd;
     const int  n_kv_full = keep ? std::min(n_ctx, (n_past_ + 1 + 255) / 256 * 256) : n_past_ + T;
 
     if (decode && replace_pending) {
@@ -1354,7 +1386,11 @@ void InklingEngine::Impl::forward_offload(const int32_t * toks, int T, bool want
         for (int b : in.bank)           st.bank.push_back(view(b));
         st.prelude_cur = view(in.prelude_cur);
         st.bank_last   = view(in.bank_last);
-        if (iv_from == 0) {
+        if (iv_from == 0 && cur_embd) {
+            sg.embd = ggml_new_tensor_2d(c, GGML_TYPE_F32, E, T);
+            ggml_set_input(sg.embd);
+            st.cur = sg.embd;
+        } else if (iv_from == 0) {
             ggml_tensor * tk = ggml_view_1d(c, p_tok, T, 0);
             st.cur = ggml_get_rows(c, model.tok_embd_rows(), tk);
             st.cur = ggml_mul(c, ggml_rms_norm(c, st.cur, hp.rms_eps), G("token_embd_norm.weight"));
@@ -1503,6 +1539,7 @@ void InklingEngine::Impl::forward_offload(const int32_t * toks, int T, bool want
         } else {
             build_A(*A, iv_from, iv, sst, next);
             if (!ggml_gallocr_alloc_graph(galloc, A->gf)) throw std::runtime_error("inkling2: graph A alloc failed");
+            if (A->embd) ggml_backend_tensor_set(A->embd, cur_embd, 0, (size_t) T * E * sizeof(float));
         }
         if (decode && iv < NV) {
             if (ggml_backend_graph_compute_async(gpu, A->gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("inkling2: graph A failed");
@@ -2285,12 +2322,15 @@ void InklingEngine::Impl::generate_spec(const std::vector<int32_t> & prompt, int
     // prompt: forward with the features captured, every chunk injected
     const int P = (int) prompt.size();
     if (P == 0) throw std::runtime_error("inkling2: speculative decode needs at least one new token");
-    for (int i = 0; i < P; ) {
-        const int T = chunk_len(P - i);
-        no_keep_now = true;
-        forward(prompt.data() + i, T, i + T == P);   // injects the draft features itself
-        no_keep_now = false;
-        i += T;
+    {
+        OvrScope scope{ *this };
+        for (int i = 0; i < P; ) {
+            const int T = next_chunk(i, P);
+            no_keep_now = true;
+            forward(prompt.data() + i, T, i + T == P);   // injects the draft features itself
+            no_keep_now = false;
+            i += T;
+        }
     }
     kv_toks.insert(kv_toks.end(), prompt.begin(), prompt.end());
     if (ckpt_after_prefill) ckpt_snapshot();   // the next turn rewinds here
@@ -2379,12 +2419,15 @@ const std::vector<float> & InklingEngine::decode(const std::vector<int32_t> & to
     const int P = (int) tokens.size();
     // INK_SPLIT_PREFILL=k: break the chunks at k too (checks chunking against a rewind)
     static const int split = getenv("INK_SPLIT_PREFILL") ? atoi(getenv("INK_SPLIT_PREFILL")) : 0;
-    for (int i = 0; i < P; ) {
-        int T = m.chunk_len(P - i);
-        if (split > i && split < i + T) T = split - i;
-        m.forward(tokens.data() + i, T, i + T == P);
-        if (m.progress_cb && P > UBATCH) m.progress_cb(i + T, P);
-        i += T;
+    {
+        Impl::OvrScope scope{ m };
+        for (int i = 0; i < P; ) {
+            int T = m.next_chunk(i, P);
+            if (split > i && split < i + T) T = split - i;
+            m.forward(tokens.data() + i, T, i + T == P);
+            if (m.progress_cb && P > UBATCH) m.progress_cb(i + T, P);
+            i += T;
+        }
     }
     m.kv_toks.insert(m.kv_toks.end(), tokens.begin(), tokens.end());
     // INK_VERIFY_BENCH=1: after the prompt, time forwards of 1..8 tokens (what a
@@ -2406,8 +2449,9 @@ const std::vector<float> & InklingEngine::decode(const std::vector<int32_t> & to
 void InklingEngine::prefill(const std::vector<int32_t> & tokens) {
     Impl & m = *impl_;
     const int P = (int) tokens.size();
+    Impl::OvrScope scope{ m };
     for (int i = 0; i < P; ) {
-        const int T = m.chunk_len(P - i);
+        const int T = m.next_chunk(i, P);
         m.forward(tokens.data() + i, T, false);
         if (m.progress_cb) m.progress_cb(i + T, P);
         i += T;
@@ -2421,6 +2465,7 @@ void InklingEngine::generate_spec(const std::vector<int32_t> & prompt, int max_n
                                   bool ckpt_after_prefill) {
     impl_->generate_spec(prompt, max_new, n_draft, on_token, out_pending, ckpt_after_prefill);
 }
+void InklingEngine::set_embd_overrides(std::vector<Runtime::EmbdOverride> ovr) { impl_->embd_ovr = std::move(ovr); }
 void InklingEngine::snapshot_ckpt() { impl_->ckpt_snapshot(); }
 int  InklingEngine::best_ckpt(int n) const { return impl_->ckpt_best(n); }
 int  InklingEngine::rewind_to(int n) { return impl_->ckpt_rewind(n); }
@@ -2428,6 +2473,7 @@ void InklingEngine::reset() {
     impl_->ckpts.clear();
     impl_->free_kept();
     impl_->n_past_ = 0;
+    impl_->embd_ovr.clear();
     impl_->kv_toks.clear();
     ggml_backend_buffer_clear(impl_->st_buf, 0);
 }

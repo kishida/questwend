@@ -57,6 +57,7 @@ add_library(questwend_core STATIC
     core/sampler.cpp
     core/chat.cpp
     core/vision.cpp
+    core/vision_inkling.cpp
 )
 target_include_directories(questwend_core PUBLIC core)
 target_include_directories(questwend_core PRIVATE third_party/stb)

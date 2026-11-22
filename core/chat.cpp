@@ -164,11 +164,16 @@ ChatPrompt build_lfm2_prompt(const Tokenizer & tok,
 
 } // namespace
 
-// Inkling 2 chat template (hand-coded from the GGUF's jinja, text only):
+// Inkling 2 chat template (hand-coded from the GGUF's jinja):
+//   [<|message_system|>tool_declare<|content_xml|>[{spec},...]<|end_message|>]
 //   [<|message_system|><|content_text|>{system}<|end_message|>]
 //   <|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>   (before the first non-system turn)
 //   <|message_user|><|content_text|>{content}<|end_message|>
 //   <|message_model|>[<|content_thinking|>{reasoning}<|end_message|><|message_model|>]<|content_text|>{content}<|end_message|><|content_model_end_sampling|>
+// Every content part is a block of its own, under the message's header:
+//   <|message_user|><|content_image|><|unused_200054|>xN<|end_message|>
+//   <|message_model|>{tool}<|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>
+//   <|message_tool|>{tool}<|content_text|>{result}<|end_message|>
 // There is no generation prompt: the model opens its own <|message_model|>.
 // Reasoning off is "Thinking effort level: 0".
 ChatPrompt build_inkling_prompt(const Tokenizer & tok,
@@ -193,6 +198,16 @@ ChatPrompt build_inkling_prompt(const Tokenizer & tok,
         if (r == "tool")      return "<|message_tool|>";
         throw std::runtime_error("chat: unknown role " + r);
     };
+    if (!opts.tools_json.empty()) {
+        std::string list = "[";
+        for (size_t i = 0; i < opts.tools_json.size(); ++i) {
+            if (i) list += ',';
+            list += opts.tools_json[i];
+        }
+        sp("<|message_system|>"); text("tool_declare"); sp("<|content_xml|>");
+        text(list + "]");
+        sp("<|end_message|>");
+    }
     bool effort_done = false;
     auto effort = [&]() {
         sp("<|message_system|>"); sp("<|content_text|>");
@@ -201,25 +216,59 @@ ChatPrompt build_inkling_prompt(const Tokenizer & tok,
         effort_done = true;
     };
     for (const auto & m : messages) {
-        if (has_image(m)) throw std::runtime_error("chat: image input is not supported for inkling2 yet");
         if (!effort_done && m.role != "system") effort();
-        std::string content = flat_text(m), reasoning = m.reasoning_content;
+        const char * role = role_tok(m.role);
+        const bool named = m.role == "tool" || m.role == "assistant";
+        auto header = [&]() { sp(role); if (named) text(m.name); };
+        std::string content = m.content, reasoning = m.reasoning_content;
+        bool by_part = !m.parts.empty();
         if (m.role == "assistant") {
-            // a reply stored with its <think> block inline
-            const size_t c = content.find("</think>");
-            if (c != std::string::npos) {
-                std::string r = content.substr(0, c);
-                const size_t o = r.find("<think>");
-                if (o != std::string::npos) r = r.substr(o + 7);
-                if (reasoning.empty()) reasoning = r;
-                content = content.substr(c + 8);
+            // A reply stored with its <think> block inline. Only a leading block
+            // without a reasoning_content is one: "</think>" can be plain text.
+            const std::string flat = flat_text(m);
+            const size_t c = flat.find("</think>");
+            if (reasoning.empty() && !has_image(m) && flat.compare(0, 7, "<think>") == 0 && c != std::string::npos) {
+                reasoning = flat.substr(7, c - 7);
+                content   = flat.substr(c + 8);
+                by_part   = false;
             }
             if (opts.preserve_thinking && !reasoning.empty()) {
-                sp(role_tok(m.role)); sp("<|content_thinking|>"); text(reasoning); sp("<|end_message|>");
+                header(); sp("<|content_thinking|>"); text(reasoning); sp("<|end_message|>");
             }
         }
-        sp(role_tok(m.role)); sp("<|content_text|>"); text(content); sp("<|end_message|>");
-        if (m.role == "assistant") sp("<|content_model_end_sampling|>");
+        auto text_block = [&](const std::string & s) {
+            header(); sp("<|content_text|>"); text(s); sp("<|end_message|>");
+        };
+        if (by_part) {
+            for (const auto & part : m.parts) {
+                if (part.kind == ContentPart::Kind::Text) { text_block(part.text); continue; }
+                if (m.role != "user" && m.role != "tool")
+                    throw std::runtime_error("chat: image content is only supported for user and tool messages");
+                const int i = part.image_index;
+                if (i < 0 || i >= (int) opts.image_tokens.size())
+                    throw std::runtime_error("chat: inkling2 needs the token count of every image");
+                const int32_t pad = tok.token_to_id("<|unused_200054|>");
+                if (pad < 0) throw std::runtime_error("chat: inkling2 vocabulary lacks <|unused_200054|>");
+                header(); sp("<|content_image|>");
+                const int n = opts.image_tokens[(size_t) i];
+                out.image_spans.push_back({ (int) ids.size(), n, i });
+                ids.insert(ids.end(), (size_t) n, pad);
+                sp("<|end_message|>");
+            }
+        } else if (!m.no_content) {
+            // an empty reply next to a call or a reasoning block has no text block
+            const bool other_blocks = m.role == "assistant" && (!m.tool_calls.empty() || !reasoning.empty());
+            if (!content.empty() || !other_blocks) text_block(content);
+        }
+        if (m.role == "assistant") {
+            for (const auto & call : m.tool_calls) {
+                if (call.json_body.empty()) throw std::runtime_error("chat: inkling2 needs tool calls as JSON");
+                sp(role); text(call.name); sp("<|content_invoke_tool_json|>");
+                text(call.json_body);
+                sp("<|end_message|>");
+            }
+            sp("<|content_model_end_sampling|>");
+        }
     }
     if (!effort_done) effort();
     if (opts.add_generation_prompt) out.gen_prompt_begin = (int) ids.size();
@@ -238,6 +287,30 @@ ChatFormat chat_format(const Tokenizer & tok) {
         f.tool_close = "<|tool_call_end|>";
     }
     return f;
+}
+
+ReplyDecoder::ReplyDecoder(const Tokenizer & tok) : tok_(tok) {
+    model_ = tok.token_to_id("<|message_model|>");
+    think_ = tok.token_to_id("<|content_thinking|>");
+    text_  = tok.token_to_id("<|content_text|>");
+    tool_  = tok.token_to_id("<|content_invoke_tool_json|>");
+    end_   = tok.token_to_id("<|end_message|>");
+}
+
+void ReplyDecoder::add(int32_t t, std::string & reasoning_out, std::string & content_out) {
+    if (t == model_) { block_ = Block::Header;   return; }
+    if (t == think_) { block_ = Block::Thinking; return; }
+    if (t == text_)  { block_ = Block::Text;     return; }
+    if (t == tool_)  { block_ = Block::Call; calls_.emplace_back(); return; }
+    if (t == end_)   { block_ = Block::Text;     return; }
+    if (block_ == Block::Header) return;   // the tool's name, repeated in the JSON
+    const std::string s = tok_.decode(t);
+    switch (block_) {
+        case Block::Thinking: reasoning_ += s; reasoning_out += s; break;
+        case Block::Text:     content_   += s; content_out   += s; break;
+        case Block::Call:     calls_.back() += s; break;
+        case Block::Header:   break;
+    }
 }
 
 ChatPrompt build_qwen_prompt(const Tokenizer & tok,

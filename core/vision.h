@@ -8,6 +8,9 @@
 // (LayerNorm+bias, biased QKV, vision M-RoPE, GELU 2-layer FFN) -> post-LN ->
 // 2x2 spatial merge -> 2-layer GELU MLP projector -> n_image_tokens (576)
 // embeddings of size projection_dim (= LLM n_embd).
+//
+// An inkling2v mmproj gets the tower in vision_inkling.h behind the same
+// interface; there the token count depends on the image.
 
 #include <memory>
 #include <string>
@@ -25,11 +28,12 @@ public:
                                                ggml_backend_t backend);
     ~VisionEncoder();
 
-    int n_image_tokens() const;   // tokens per image after spatial merge (e.g. 576)
+    int n_image_tokens() const;   // tokens per image after spatial merge (e.g. 576);
+                                  // 0 = varies, read it off the embeddings (size / n_embd)
     int n_embd() const;           // output embedding dim (= LLM n_embd)
 
     // Total backend memory held by the tower (weights + persistent compute
-    // buffer). Callers running a maxed-out --vram-budget should subtract this
+    // buffer; 0 for inkling2v, which holds VRAM only while encoding). Callers running a maxed-out --vram-budget should subtract this
     // from the budget before sizing the expert cache.
     size_t gpu_bytes() const;
 

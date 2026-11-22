@@ -159,10 +159,11 @@ int main(int argc, char ** argv) {
             if (!be) be = ggml_backend_cpu_init();
             {
                 auto enc = VisionEncoder::load(opt.mmproj_path, be);
-                const int D = enc->n_embd(), T = enc->n_image_tokens();
+                const int D = enc->n_embd();
                 for (const auto & ip : image_paths) {
                     auto t0 = std::chrono::steady_clock::now();
                     auto emb = enc->encode_image(ip);
+                    const int T = (int) (emb.size() / (size_t) D);
                     const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0).count();
                     double sum = 0, sq = 0;
@@ -239,7 +240,7 @@ int main(int argc, char ** argv) {
                 auto t0 = std::chrono::steady_clock::now();
                 vembs.push_back(venc->encode_image(ip));
                 fprintf(stderr, "image: %s encoded to %d tokens in %.0f ms\n", ip.c_str(),
-                        venc->n_image_tokens(),
+                        (int) (vembs.back().size() / (size_t) venc->n_embd()),
                         std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t0).count());
             }
@@ -429,6 +430,7 @@ int main(int argc, char ** argv) {
                 o.reasoning      = opt.reasoning;
                 o.n_image_tokens = venc->n_image_tokens();
                 o.add_vision_id  = image_paths.size() > 1;
+                for (const auto & e : vembs) o.image_tokens.push_back((int) (e.size() / (size_t) venc->n_embd()));
                 auto cp = build_qwen_prompt(tok, { m }, o);
                 std::vector<Runtime::EmbdOverride> ovr;
                 for (const auto & sp : cp.image_spans)

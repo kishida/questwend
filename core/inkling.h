@@ -26,6 +26,9 @@ public:
     const std::vector<float> & decode(const std::vector<int32_t> & tokens);
     void prefill(const std::vector<int32_t> & tokens);
     void reset();
+    // Image spans of the next decode / prefill / generate_spec, indices relative
+    // to its tokens. The embeddings go in as they are, without the token norm.
+    void set_embd_overrides(std::vector<Runtime::EmbdOverride> ovr);
     // prompt checkpoints: copy the state that cannot be truncated (conv states,
     // SWA rings) at the current position; rewind to the newest one at or before n
     void snapshot_ckpt();

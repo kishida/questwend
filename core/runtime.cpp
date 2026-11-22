@@ -6107,7 +6107,7 @@ const std::vector<float> & Runtime::decode(const std::vector<int32_t> & tokens) 
     return l;
 }
 void Runtime::set_embd_overrides(std::vector<EmbdOverride> ovr) {
-    if (ink_) { if (!ovr.empty()) ink_unsupported("image input"); return; }
+    if (ink_) { ink_->set_embd_overrides(std::move(ovr)); return; }
     impl_->embd_ovr = std::move(ovr);
 }
 const std::vector<float> & Runtime::mtp_draft(int32_t token) {
