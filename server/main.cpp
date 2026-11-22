@@ -876,6 +876,11 @@ int main(int argc, char ** argv) {
     TicketLock tlock;          // runtime is single-threaded + stateful (FIFO queue)
     uint64_t live_owner = 0;   // request id owning the live state (0 = none); guarded by tlock
     std::atomic<uint64_t> sid_gen{1};
+    if (cache_slots > 0 && model->hparams().arch == Arch::INKLING2) {
+        fprintf(stderr, "warning: --cache-slots is not supported on inkling2 (its state cannot be saved); ignored\n");
+        cache_slots = 0;
+        cache_slots_dir.clear();
+    }
     if (time_slice > 0 && cache_slots <= 0)
         fprintf(stderr, "warning: --time-slice without --cache-slots: a preempted request"
                         " re-prefills its whole context on resume\n");
