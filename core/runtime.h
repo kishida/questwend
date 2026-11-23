@@ -156,6 +156,7 @@ public:
     int  loops() const;
     int  max_loops() const;
     bool set_loops(int n);
+    bool set_loops_keep(int n);   // no reset: see InklingEngine::set_loops_keep
 
     // Advance the KV cache (and, when mtp_kv, the nextn KV + draft context)
     // over `tokens` without sampling: one chunk of a preemptible prefill.

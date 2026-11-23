@@ -6123,6 +6123,7 @@ bool Runtime::set_mtp_sampler(std::function<int32_t(const std::vector<float> &)>
 int  Runtime::loops() const     { return ink_ ? ink_->loops() : 0; }
 int  Runtime::max_loops() const { return ink_ ? ink_->max_loops() : 0; }
 bool Runtime::set_loops(int n)  { return ink_ && ink_->set_loops(n); }
+bool Runtime::set_loops_keep(int n) { return ink_ && ink_->set_loops_keep(n); }
 bool Runtime::has_mtp() const { return ink_ ? ink_->has_draft() : impl_->model.hparams().has_mtp(); }
 void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int n_draft,
                            const std::function<bool(int32_t)> & on_token,

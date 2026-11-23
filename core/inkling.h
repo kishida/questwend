@@ -45,6 +45,9 @@ public:
     int  loops() const;
     int  max_loops() const;
     bool set_loops(int n);
+    // Switch mid-sequence and keep the KV. The tokens after it lack the KV of
+    // the passes they skip; a later switch back reads those slots as they are.
+    bool set_loops_keep(int n);
 
     // DSpark speculative greedy decode (--mtp with a dspark-*.gguf draft)
     bool has_draft() const;

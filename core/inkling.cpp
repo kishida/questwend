@@ -343,7 +343,7 @@ struct InklingEngine::Impl {
     // Full-attention KV and the draft KV are indexed by position, so a rewind
     // only lowers n_past for them. The conv states and the SWA rings are
     // overwritten as the sequence moves on, so those are copied to host RAM.
-    struct Ckpt { int pos = 0; std::vector<uint8_t> data; };
+    struct Ckpt { int pos = 0; uint32_t passes = 0; std::vector<uint8_t> data; };   // passes: its tensor list
     std::vector<Ckpt> ckpts;   // oldest first
     std::vector<ggml_tensor *> ckpt_tensors() const {
         std::vector<ggml_tensor *> v(conv_l.begin(), conv_l.end());
@@ -358,6 +358,7 @@ struct InklingEngine::Impl {
         if (max_n == 0) return;
         Ckpt c;
         c.pos = n_past_;
+        c.passes = ik.n_pass;
         size_t total = 0;
         for (ggml_tensor * t : ckpt_tensors()) total += ggml_nbytes(t);
         c.data.resize(total);
@@ -373,13 +374,15 @@ struct InklingEngine::Impl {
     }
     int ckpt_best(int n) const {
         if (n >= n_past_) return n_past_;
-        for (auto it = ckpts.rbegin(); it != ckpts.rend(); ++it) if (it->pos <= n) return it->pos;
+        for (auto it = ckpts.rbegin(); it != ckpts.rend(); ++it)
+            if (it->pos <= n && it->passes == ik.n_pass) return it->pos;
         return -1;
     }
     int ckpt_rewind(int n) {
         if (n >= n_past_) return n_past_;
         int k = -1;
-        for (int i = (int) ckpts.size() - 1; i >= 0; --i) if (ckpts[(size_t) i].pos <= n) { k = i; break; }
+        for (int i = (int) ckpts.size() - 1; i >= 0; --i)
+            if (ckpts[(size_t) i].pos <= n && ckpts[(size_t) i].passes == ik.n_pass) { k = i; break; }
         if (k < 0) return -1;
         const Ckpt & c = ckpts[(size_t) k];
         size_t off = 0;
@@ -2550,6 +2553,7 @@ bool InklingEngine::set_loops(int n) {
     reset();
     return true;
 }
+bool InklingEngine::set_loops_keep(int n) { return impl_->set_loops(n); }
 Runtime::CacheStats InklingEngine::cache_stats() const {
     Runtime::CacheStats c;
     if (impl_->ec) {

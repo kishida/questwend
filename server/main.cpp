@@ -548,6 +548,7 @@ fetch('/v1/models').then(r=>r.json()).then(j=>{
   document.getElementById('model').textContent = (m && (m.display || m.id)) || '';
   if(m && m.loops && m.loops.max > 1){   // a looped model that can switch
     const sel = document.getElementById('loops');
+    if(m.loops.auto) sel.add(new Option(`auto (think ${m.loops.default}, text 1)`, 0));
     for(let i=1; i<=m.loops.max; i++) sel.add(new Option(i, i, i===m.loops.default, i===m.loops.default));
     document.getElementById('loopsLabel').style.display = '';
   }
@@ -627,7 +628,7 @@ async function send(){
         messages: msgs, stream: true,
         temperature: parseFloat(document.getElementById('temp').value)||0,
         // no max_tokens: the server generates until the context runs out
-        loops: parseInt(document.getElementById('loops').value) || undefined,
+        loops: document.getElementById('loops').value === '' ? undefined : parseInt(document.getElementById('loops').value),
         reasoning: document.getElementById('think').checked
       })
     });
@@ -695,7 +696,7 @@ function showStats(el, t){
   const s = document.createElement('div'); s.className = 'stats';
   const f = (x)=> (x||0).toFixed(1);
   const cached = t.cached_tokens ? `, ${t.cached_tokens} cached` : '';
-  s.textContent = (t.loops ? `${t.loops} loops · ` : '') + `TTFT ${Math.round(t.ttft_ms||0)} ms · prefill ${f(t.prefill_tps)} tok/s `
+  s.textContent = (t.loops ? (t.answer_loops ? `${t.loops}→${t.answer_loops} loops · ` : `${t.loops} loops · `) : '') + `TTFT ${Math.round(t.ttft_ms||0)} ms · prefill ${f(t.prefill_tps)} tok/s `
     + `(${t.prompt_tokens} in${cached}) · gen ${f(t.gen_tps)} tok/s · ${t.completion_tokens} out`;
   el.appendChild(s);
   document.getElementById('chat').scrollTop = 1e9;
@@ -903,6 +904,14 @@ int main(int argc, char ** argv) {
     const int  loops_default = rt->loops();
     const int  loops_max     = rt->max_loops();
     const bool loops_switch  = loops_max > 1;
+    const bool loops_auto_ok = loops_switch && loops_default > 1;
+    // After an auto reply the live state runs at fewer passes than it thought
+    // at (mixed_think). The next request at that count switches back and keeps
+    // the KV: the reply's tokens then lack the skipped passes' KV, which did
+    // not change the next turn's answers (6/6 two-turn chats on varloop
+    // IQ4_NL matched a clean 3-pass prefill of the same history).
+    int mixed_think = 0;
+    const int32_t content_tok = tok->token_to_id("<|content_text|>");
     const std::string model_display = [&]() {
         const auto & hp = model->hparams();
         const char * ft = ftype_label(hp.file_type);
@@ -1153,6 +1162,12 @@ int main(int argc, char ** argv) {
         return true;
     };
 
+    // auto: from the reply's text on, fewer passes (the lock is held)
+    auto switch_answer = [&](int n) {
+        mixed_think = rt->loops();
+        if (!rt->set_loops_keep(n)) throw std::runtime_error("cannot switch to " + std::to_string(n) + " loops");
+    };
+
     auto prepare_prompt = [&](int loops, std::vector<int32_t> & prompt,
                               std::vector<Runtime::EmbdOverride> & ovr,
                               std::vector<ImgSpan> spans, uint64_t owner,
@@ -1160,6 +1175,13 @@ int main(int argc, char ** argv) {
                               lclk::time_point t_recv) -> int {
         const int n_full = (int) prompt.size();
         const bool has_img = !spans.empty();
+        if (mixed_think > 0) {
+            const int think = mixed_think;
+            mixed_think = 0;
+            if (loops != think || !rt->set_loops_keep(think)) {   // another count: start clean
+                rt->reset(); kv_imgs->clear(); live_origin = -1;
+            }
+        }
         if (loops > 0 && loops != rt->loops()) {
             // under the lock, before anything is matched: the switch empties the KV
             const int was = rt->loops();
@@ -1409,7 +1431,7 @@ int main(int argc, char ** argv) {
     srv.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
         json m = {{"id", model_id}, {"object", "model"}, {"owned_by", "questwend"},
                   {"display", model_display}};
-        if (loops_default > 0) m["loops"] = {{"default", loops_default}, {"max", loops_max}};
+        if (loops_default > 0) m["loops"] = {{"default", loops_default}, {"max", loops_max}, {"auto", loops_auto_ok}};
         json j = {{"object", "list"}, {"data", json::array({ m })}};
         res.set_content(j.dump(), "application/json");
     });
@@ -1444,9 +1466,12 @@ int main(int argc, char ** argv) {
         if (body.contains("loops") && !body["loops"].is_null()) {
             const auto & l = body["loops"];
             const int most = std::max(loops_max, 1);
-            const bool in_range = l.is_number_integer() && l.get<long long>() >= 1 && l.get<long long>() <= most;
+            // 0 = auto: think at the default count, answer at 1
+            const bool in_range = l.is_number_integer() && l.get<long long>() >= (loops_auto_ok ? 0 : 1)
+                                  && l.get<long long>() <= most;
             if (!in_range || (!loops_switch && l.get<int>() != loops_default)) {
-                const std::string why = loops_switch ? "loops must be a whole number 1.." + std::to_string(most)
+                const std::string why = loops_switch ? "loops must be a whole number "
+                                                       + std::string(loops_auto_ok ? "0 (auto).." : "1..") + std::to_string(most)
                     : loops_default > 0 ? "loops is fixed at " + std::to_string(loops_default)
                                           + " (start the server with --max-loops to switch)"
                     : "this model has no loops";
@@ -1456,6 +1481,10 @@ int main(int argc, char ** argv) {
             }
             loops = l.get<int>();
         }
+        // auto: the reply's text (from <|content_text|> on) runs at 1 pass
+        const bool loops_auto = loops == 0;
+        if (loops_auto) loops = loops_default;
+        const int answer_loops = loops_auto ? 1 : 0;
 
         // per-request thinking control: body "reasoning" overrides the server default
         bool reasoning = reasoning_default;
@@ -1595,6 +1624,7 @@ int main(int argc, char ** argv) {
                 bool paused = false, done = false;
                 int n_cached = 0;                 // prompt tokens reused from the cache
                 int loops = 0;                    // looped model: this request's pass count
+                int answer_loops = 0, switch_at = -1;   // auto: the reply's text at answer_loops
                 int generated = 0, max_tokens = 0, prompt_tokens = 0;
                 bool started = false, finished = false;
                 clk::time_point t0, t_prefill, t_first;
@@ -1606,6 +1636,7 @@ int main(int argc, char ** argv) {
             st->tl = &tlock;
             st->sid = sid_gen.fetch_add(1);
             st->loops = loops;
+            st->answer_loops = answer_loops;
             st->prompt = prompt;
             st->max_tokens = max_tokens;
             st->prompt_tokens = (int) prompt.size();
@@ -1655,6 +1686,7 @@ int main(int argc, char ** argv) {
                         };
                         add_llama_timings(timings, st->prompt_tokens, st->n_cached, st->generated, prefill_ms, gen_ms);
                         if (st->loops > 0) timings["loops"] = st->loops;
+                        if (st->switch_at >= 0) { timings["answer_loops"] = st->answer_loops; timings["switch_at"] = st->switch_at; }
                         log_done(st->prompt_tokens, st->n_cached, st->generated,
                                  prefill_ms, gen_ms, st->cstat0);
                         // tool calls: parse the accumulated text; if any, emit them as a
@@ -2088,6 +2120,10 @@ int main(int argc, char ** argv) {
                             return finish();
                         if (!emit_piece(next)) { st->finished = true; tlock.unlock(); st->holding = false; return false; }
                         st->generated++;
+                        if (st->answer_loops > 0 && st->switch_at < 0 && next == content_tok && st->answer_loops != rt->loops()) {
+                            st->switch_at = st->generated;
+                            switch_answer(st->answer_loops);
+                        }
                         st->logits = rt->decode({ next });
                         if (time_slice > 0 && ++st->slice_used >= time_slice && yieldable()) {
                             st->my_toks = rt->kv_tokens();   // yield the runtime
@@ -2116,6 +2152,8 @@ int main(int argc, char ** argv) {
             if (cfmt.inkling) dec.add(t, r, c);
         };
         int generated = 0, n_cached = 0;
+        bool switched = false;
+        int switch_at = -1;
         Runtime::CacheStats cstat0;
         using clk = std::chrono::steady_clock;
         clk::time_point t0, t_prefill = {}, t_end = {};
@@ -2181,6 +2219,11 @@ int main(int argc, char ** argv) {
                     if (is_stop(next) || rt->n_past() + 1 >= n_ctx) break;
                     take(next);
                     ++generated;
+                    if (answer_loops > 0 && !switched && next == content_tok && answer_loops != rt->loops()) {
+                        switched = true;
+                        switch_at = generated;
+                        switch_answer(answer_loops);
+                    }
                     if (clk::now() - glog >= std::chrono::seconds(10)) {   // long-output progress
                         const double el = std::chrono::duration<double>(clk::now() - t_prefill).count();
                         fprintf(stderr, "  [%s] gen %d tok, %.1f tok/s\n",
@@ -2251,6 +2294,10 @@ int main(int argc, char ** argv) {
         };
         add_llama_timings(resp["timings"], n_prompt_full, n_cached, generated, prefill_ms, gen_ms);
         if (loops > 0) resp["timings"]["loops"] = loops;
+        if (switched) {
+            resp["timings"]["answer_loops"] = answer_loops;
+            resp["timings"]["switch_at"] = switch_at;
+        }
         res.set_content(dumpj(resp), "application/json");
     });
 
