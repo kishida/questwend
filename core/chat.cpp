@@ -298,13 +298,29 @@ ReplyDecoder::ReplyDecoder(const Tokenizer & tok) : tok_(tok) {
 }
 
 void ReplyDecoder::add(int32_t t, std::string & reasoning_out, std::string & content_out) {
-    if (t == model_) { block_ = Block::Header;   return; }
+    auto header_is_text = [&]() {
+        block_ = Block::Text;
+        content_    += header_;
+        content_out += header_;
+        header_.clear();
+    };
+    if (t == model_) { block_ = Block::Header; header_.clear(); return; }
     if (t == think_) { block_ = Block::Thinking; return; }
     if (t == text_)  { block_ = Block::Text;     return; }
     if (t == tool_)  { block_ = Block::Call; calls_.emplace_back(); return; }
-    if (t == end_)   { block_ = Block::Text;     return; }
-    if (block_ == Block::Header) return;   // the tool's name, repeated in the JSON
+    if (t == end_) {
+        if (block_ == Block::Header) header_is_text();
+        block_ = Block::Text;
+        return;
+    }
     const std::string s = tok_.decode(t);
+    if (block_ == Block::Header) {         // the tool's name, repeated in the JSON
+        const size_t MAX_TOOL_NAME = 128;  // bytes
+        header_ += s;
+        if (header_.size() > MAX_TOOL_NAME || header_.find_first_of(" \t\r\n") != std::string::npos)
+            header_is_text();
+        return;
+    }
     switch (block_) {
         case Block::Thinking: reasoning_ += s; reasoning_out += s; break;
         case Block::Text:     content_   += s; content_out   += s; break;

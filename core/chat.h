@@ -91,7 +91,9 @@ ChatFormat chat_format(const Tokenizer & tok);
 //   <|message_model|><|content_text|>C<|end_message|>
 //   <|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>
 // and only the tokens tell a block's kind: the text of any of them may spell
-// "</think>" or a marker.
+// "</think>" or a marker. A reply may also leave the content token out; what
+// follows its header and cannot be a tool's name (it has whitespace, or is too
+// long) is then content, not a name to drop.
 class ReplyDecoder {
 public:
     explicit ReplyDecoder(const Tokenizer & tok);
@@ -105,6 +107,7 @@ private:
     const Tokenizer & tok_;
     int32_t model_ = -1, think_ = -1, text_ = -1, tool_ = -1, end_ = -1;
     Block block_ = Block::Text;
+    std::string header_;                // the header's text so far
     std::string reasoning_, content_;
     std::vector<std::string> calls_;
 };

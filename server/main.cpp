@@ -488,6 +488,7 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
   header button, .ctl { background:var(--panel); color:var(--txt); border:1px solid var(--line);
          border-radius:8px; padding:6px 10px; font-size:13px; cursor:pointer; }
   header label { color:var(--muted); font-size:12px; display:flex; align-items:center; gap:6px; }
+  header select { background:var(--bg); color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:3px 6px; }
   header input[type=number] { width:64px; background:var(--bg); color:var(--txt); border:1px solid var(--line);
          border-radius:6px; padding:4px 6px; }
   #chat { flex:1; overflow-y:auto; padding:20px 0; }
@@ -506,7 +507,7 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
          border-radius:10px; padding:10px 12px; font:inherit; max-height:200px; }
   .send { background:var(--accent); color:#fff; border:none; border-radius:10px; padding:10px 18px;
          font-size:15px; cursor:pointer; }
-  .send:disabled { opacity:.5; cursor:default; }
+  .send.stop { background:#b84a4a; }
   .attach { background:var(--panel); color:var(--txt); border:1px solid var(--line); border-radius:10px;
          padding:10px 12px; font-size:15px; cursor:pointer; }
   .hint { color:var(--muted); font-size:12px; text-align:center; margin-top:8px; }
@@ -519,6 +520,7 @@ static const char * CHAT_HTML = R"HTML(<!doctype html>
 <header>
   <b>QuestWend</b><span class="model" id="model">…</span>
   <span class="spacer"></span>
+  <label id="loopsLabel" style="display:none">loops <select id="loops"></select></label>
   <label>temp <input type="number" id="temp" value="0.7" step="0.1" min="0" max="2"></label>
   <label><input type="checkbox" id="think" checked> think</label>
   <button id="clear">Clear</button>
@@ -539,11 +541,17 @@ const list = document.getElementById('list');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 let history = [];
-let busy = false;
+let running = null;   // the AbortController of the reply being generated
 
 fetch('/v1/models').then(r=>r.json()).then(j=>{
   const m = j.data && j.data[0];
   document.getElementById('model').textContent = (m && (m.display || m.id)) || '';
+  if(m && m.loops && m.loops.max > 1){   // a looped model that can switch
+    const sel = document.getElementById('loops');
+    if(m.loops.auto) sel.add(new Option(`auto (think ${m.loops.default}, text 1)`, 0));
+    for(let i=1; i<=m.loops.max; i++) sel.add(new Option(i, i, i===m.loops.default, i===m.loops.default));
+    document.getElementById('loopsLabel').style.display = '';
+  }
 }).catch(()=>{});
 
 function addMsg(role, text, imgs){
@@ -581,19 +589,32 @@ function renderThumbs(){
 function autosize(){ input.style.height='auto'; input.style.height = Math.min(input.scrollHeight,200)+'px'; }
 input.addEventListener('input', autosize);
 input.addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); }});
-sendBtn.addEventListener('click', send);
-document.getElementById('clear').addEventListener('click', ()=>{ history=[]; list.innerHTML=''; });
+sendBtn.addEventListener('click', e=>{
+  if(!running) send();
+  else if(e.detail < 2) stop();   // the second click of a double click on Send is no Stop
+});
+document.addEventListener('keydown', e=>{ if(e.key==='Escape' && !e.isComposing) stop(); });
+document.getElementById('clear').addEventListener('click', ()=>{ stop(); history=[]; list.innerHTML=''; });
+function stop(){ if(running) running.abort(); }   // the server ends the generation when the stream closes
+function setRunning(ctrl){
+  running = ctrl;
+  sendBtn.textContent = ctrl ? 'Stop' : 'Send';
+  sendBtn.title = ctrl ? 'stop generating (Esc)' : '';
+  sendBtn.classList.toggle('stop', !!ctrl);
+}
 
 async function send(){
   const text = input.value.trim();
-  if((!text && !pendingImgs.length) || busy) return;
-  busy = true; sendBtn.disabled = true;
+  if((!text && !pendingImgs.length) || running) return;
+  const ctrl = new AbortController();
+  const msgs = history;   // Clear starts another array; this reply belongs to this one
+  setRunning(ctrl);
   let content = text;
   if(pendingImgs.length){
     content = pendingImgs.map(u=>({type:'image_url', image_url:{url:u}}));
     if(text) content.push({type:'text', text});
   }
-  history.push({role:'user', content});
+  msgs.push({role:'user', content});
   addMsg('user', text, pendingImgs);
   pendingImgs = []; renderThumbs();
   input.value=''; autosize();
@@ -602,11 +623,12 @@ async function send(){
   let timings = null;
   try {
     const resp = await fetch('/v1/chat/completions', {
-      method:'POST', headers:{'Content-Type':'application/json'},
+      method:'POST', headers:{'Content-Type':'application/json'}, signal: ctrl.signal,
       body: JSON.stringify({
-        messages: history, stream: true,
+        messages: msgs, stream: true,
         temperature: parseFloat(document.getElementById('temp').value)||0,
         // no max_tokens: the server generates until the context runs out
+        loops: document.getElementById('loops').value === '' ? undefined : parseInt(document.getElementById('loops').value),
         reasoning: document.getElementById('think').checked
       })
     });
@@ -633,12 +655,18 @@ async function send(){
         } catch(e){}
       }
     }
-  } catch(e){ acc += '\n[error: '+e+']'; renderAssistant(body, acc, accR); }
+  } catch(e){
+    if(!ctrl.signal.aborted){ acc += '\n[error: '+e+']'; renderAssistant(body, acc, accR); }
+  }
+  const stopped = ctrl.signal.aborted;
   if(timings) showStats(body, timings);
-  const amsg = {role:'assistant', content:acc};
-  if(accR) amsg.reasoning_content = accR;   // echo reasoning -> prefix cache hit
-  history.push(amsg);
-  busy = false; sendBtn.disabled = false; input.focus();
+  else if(stopped) addNote(body, 'stopped');
+  if(!stopped || acc || accR){   // a stopped reply keeps what it had; none, if it had nothing
+    const amsg = {role:'assistant', content:acc};
+    if(accR) amsg.reasoning_content = accR;   // echo reasoning -> prefix cache hit
+    msgs.push(amsg);
+  }
+  setRunning(null); input.focus();
 }
 // dim the reasoning span. Reasoning arrives via reasoning_content deltas
 // (thinkExt); the inline </think> parsing is kept for non-streaming replies.
@@ -660,11 +688,15 @@ function renderAssistant(el, txt, thinkExt){
     el.appendChild(document.createTextNode(answer.replace(/^\n+/, '')));
   }
 }
+function addNote(el, text){
+  const n = document.createElement('div'); n.className = 'stats'; n.textContent = text;
+  el.appendChild(n);
+}
 function showStats(el, t){
   const s = document.createElement('div'); s.className = 'stats';
   const f = (x)=> (x||0).toFixed(1);
   const cached = t.cached_tokens ? `, ${t.cached_tokens} cached` : '';
-  s.textContent = `TTFT ${Math.round(t.ttft_ms||0)} ms · prefill ${f(t.prefill_tps)} tok/s `
+  s.textContent = (t.loops ? (t.answer_loops && t.answer_loops !== t.loops ? `${t.loops}→${t.answer_loops} loops · ` : `${t.loops} loops · `) : '') + `TTFT ${Math.round(t.ttft_ms||0)} ms · prefill ${f(t.prefill_tps)} tok/s `
     + `(${t.prompt_tokens} in${cached}) · gen ${f(t.gen_tps)} tok/s · ${t.completion_tokens} out`;
   el.appendChild(s);
   document.getElementById('chat').scrollTop = 1e9;
@@ -682,6 +714,7 @@ int main(int argc, char ** argv) {
     int  cache_slots = 0;
     std::string cache_slots_dir;
     int  time_slice = 64;   // generation tokens per turn when requests contend
+    int  max_loops = -1;    // loops a request may ask for (-1 = auto: 6 for a varying-loop model)
                             // (needs --cache-slots to park state; 0 = back-to-back)
     bool want_help = false;
 
@@ -693,6 +726,10 @@ int main(int argc, char ** argv) {
         else if (a == "--cache-slots" && i + 1 < argc) cache_slots = std::stoi(argv[++i]);
         else if (a == "--cache-slots-dir" && i + 1 < argc) cache_slots_dir = argv[++i];
         else if (a == "--time-slice" && i + 1 < argc) time_slice = std::stoi(argv[++i]);
+        else if (a == "--max-loops" && i + 1 < argc) {
+            max_loops = atoi(argv[++i]);
+            if (max_loops < 1 || max_loops > 8) { fprintf(stderr, "error: --max-loops takes 1..8\n"); return 1; }
+        }
         else if (a == "--heartbeat" && i + 1 < argc) set_knob("QWEN_HEARTBEAT", argv[++i]);
         else if (a == "--pf-chunk" && i + 1 < argc)  set_knob("QWEN_PF_CHUNK", argv[++i]);
         else if (a == "-h" || a == "--help") want_help = true;
@@ -730,6 +767,8 @@ int main(int argc, char ** argv) {
             "  --port <N>          listen port (default 8080)\n"
             "  --host <addr>       bind address (default 127.0.0.1)\n"
             "  --no-mmproj         disable image input even if an mmproj file is present\n"
+            "  --max-loops <N>     looped models: the most a request's \"loops\" may ask for; KV room is\n"
+            "                      kept for it (default: 6 if trained for varying loops, else --loops)\n"
             "  --cache-slots <N>   extra prompt-cache slots for interleaved conversations (default 0)\n"
             "  --cache-slots-dir <dir>  store the slots on disk instead of RAM (persists across restarts)\n"
             "  --time-slice <N>    interleave concurrent streaming requests every N generated tokens\n"
@@ -808,6 +847,8 @@ int main(int argc, char ** argv) {
         RuntimeConfig cfg;
         if (!apply_common_options(opt, cfg)) return 1;
         cfg.cache_profile_save = false;   // server only reads the profile, never overwrites it
+        if (max_loops < 0) max_loops = model->hparams().ink.varying && !use_mtp ? 6 : 0;   // DSpark wants a fixed count
+        cfg.max_loops = max_loops;
         rt = std::make_unique<Runtime>(*model, cfg);
     } catch (const std::exception & e) {
         fprintf(stderr, "load error: %s\n", e.what());
@@ -859,13 +900,26 @@ int main(int argc, char ** argv) {
             default: return "";
         }
     };
+    // read here once: requests switch the count while other threads serve /v1/models
+    const int  loops_default = rt->loops();
+    const int  loops_max     = rt->max_loops();
+    const bool loops_switch  = loops_max > 1;
+    const bool loops_auto_ok = loops_switch && loops_default > 1;
+    // After an auto reply the live state runs at fewer passes than it thought
+    // at (mixed_think). The next request at that count switches back and keeps
+    // the KV: the reply's tokens then lack the skipped passes' KV, which did
+    // not change the next turn's answers (6/6 two-turn chats on varloop
+    // IQ4_NL matched a clean 3-pass prefill of the same history).
+    int mixed_think = 0;
+    const int32_t content_tok = tok->token_to_id("<|content_text|>");
     const std::string model_display = [&]() {
         const auto & hp = model->hparams();
         const char * ft = ftype_label(hp.file_type);
         std::string d;
         if (!hp.general_name.empty()) d = hp.general_name;
         if (ft && *ft) { if (!d.empty()) d += ' '; d += ft; }
-        d += '('; d += arch_name(hp.arch); d += ')';
+        d += '('; d += hp.arch_file; d += ')';
+        if (!loops_switch && hp.ink.n_pass != hp.ink.n_pass_file) d += " loops=" + std::to_string(hp.ink.n_pass);
         return d;
     }();
     const int32_t eos    = model->vocab().eos_id;
@@ -1108,13 +1162,34 @@ int main(int argc, char ** argv) {
         return true;
     };
 
-    auto prepare_prompt = [&](std::vector<int32_t> & prompt,
+    // auto: from the reply's text on, fewer passes (the lock is held)
+    auto switch_answer = [&](int n) {
+        mixed_think = rt->loops();
+        if (!rt->set_loops_keep(n)) throw std::runtime_error("cannot switch to " + std::to_string(n) + " loops");
+    };
+
+    auto prepare_prompt = [&](int loops, std::vector<int32_t> & prompt,
                               std::vector<Runtime::EmbdOverride> & ovr,
                               std::vector<ImgSpan> spans, uint64_t owner,
                               const std::shared_ptr<Prog> & prog,
                               lclk::time_point t_recv) -> int {
         const int n_full = (int) prompt.size();
         const bool has_img = !spans.empty();
+        if (mixed_think > 0) {
+            const int think = mixed_think;
+            mixed_think = 0;
+            if (loops != think || !rt->set_loops_keep(think)) {   // another count: start clean
+                rt->reset(); kv_imgs->clear(); live_origin = -1;
+            }
+        }
+        if (loops > 0 && loops != rt->loops()) {
+            // under the lock, before anything is matched: the switch empties the KV
+            const int was = rt->loops();
+            if (!rt->set_loops(loops)) throw std::runtime_error("cannot switch to " + std::to_string(loops) + " loops");
+            kv_imgs->clear();
+            live_origin = -1;
+            fprintf(stderr, "[%s] loops %d -> %d\n", clock_hms().c_str(), was, loops);
+        }
         int n = match_cov(rt->kv_tokens(), *kv_imgs, prompt, spans, "live");
         const char * src = "live";
         // mid-prompt divergence (e.g. the client rewrote the previous turn,
@@ -1354,10 +1429,10 @@ int main(int argc, char ** argv) {
     });
 
     srv.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
-        json j = {{"object", "list"}, {"data", json::array({
-            {{"id", model_id}, {"object", "model"}, {"owned_by", "questwend"},
-             {"display", model_display}}
-        })}};
+        json m = {{"id", model_id}, {"object", "model"}, {"owned_by", "questwend"},
+                  {"display", model_display}};
+        if (loops_default > 0) m["loops"] = {{"default", loops_default}, {"max", loops_max}, {"auto", loops_auto_ok}};
+        json j = {{"object", "list"}, {"data", json::array({ m })}};
         res.set_content(j.dump(), "application/json");
     });
 
@@ -1385,6 +1460,31 @@ int main(int argc, char ** argv) {
         const SamplerConfig sc = make_sampler(body);
         const std::string id   = now_id("chatcmpl-");
         const long long created = (long long) std::time(nullptr);
+
+        // per-request pass count of a looped model; omitted = the server's, not the last one used
+        int loops = loops_default;
+        if (body.contains("loops") && !body["loops"].is_null()) {
+            const auto & l = body["loops"];
+            const int most = std::max(loops_max, 1);
+            // 0 = auto: think at the default count, answer at 1
+            const bool in_range = l.is_number_integer() && l.get<long long>() >= (loops_auto_ok ? 0 : 1)
+                                  && l.get<long long>() <= most;
+            if (!in_range || (!loops_switch && l.get<int>() != loops_default)) {
+                const std::string why = loops_switch ? "loops must be a whole number "
+                                                       + std::string(loops_auto_ok ? "0 (auto).." : "1..") + std::to_string(most)
+                    : loops_default > 0 ? "loops is fixed at " + std::to_string(loops_default)
+                                          + " (start the server with --max-loops to switch)"
+                    : "this model has no loops";
+                res.status = 400;
+                res.set_content(json{{"error", why}}.dump(), "application/json");
+                return;
+            }
+            loops = l.get<int>();
+        }
+        // auto: the reply's text (from <|content_text|> on) runs at 1 pass
+        const bool loops_auto = loops == 0;
+        if (loops_auto) loops = loops_default;
+        const int answer_loops = loops_auto ? 1 : 0;
 
         // per-request thinking control: body "reasoning" overrides the server default
         bool reasoning = reasoning_default;
@@ -1523,6 +1623,8 @@ int main(int argc, char ** argv) {
                 bool pf_done = false;
                 bool paused = false, done = false;
                 int n_cached = 0;                 // prompt tokens reused from the cache
+                int loops = 0;                    // looped model: this request's pass count
+                int answer_loops = 0, switch_at = -1;   // auto: the reply's text at answer_loops
                 int generated = 0, max_tokens = 0, prompt_tokens = 0;
                 bool started = false, finished = false;
                 clk::time_point t0, t_prefill, t_first;
@@ -1533,6 +1635,8 @@ int main(int argc, char ** argv) {
             auto st = std::make_shared<State>(sc, *tok);
             st->tl = &tlock;
             st->sid = sid_gen.fetch_add(1);
+            st->loops = loops;
+            st->answer_loops = answer_loops;
             st->prompt = prompt;
             st->max_tokens = max_tokens;
             st->prompt_tokens = (int) prompt.size();
@@ -1581,6 +1685,11 @@ int main(int argc, char ** argv) {
                             {"gen_tps",     gen_ms     > 0 ? st->generated * 1000.0 / gen_ms    : 0.0},
                         };
                         add_llama_timings(timings, st->prompt_tokens, st->n_cached, st->generated, prefill_ms, gen_ms);
+                        if (st->loops > 0) {   // answer_loops: the passes the reply's text ran at
+                            timings["loops"] = st->loops;
+                            timings["answer_loops"] = st->switch_at >= 0 ? st->answer_loops : st->loops;
+                            if (st->switch_at >= 0) timings["switch_at"] = st->switch_at;
+                        }
                         log_done(st->prompt_tokens, st->n_cached, st->generated,
                                  prefill_ms, gen_ms, st->cstat0);
                         // tool calls: parse the accumulated text; if any, emit them as a
@@ -1666,6 +1775,12 @@ int main(int argc, char ** argv) {
                         return false;
                     };
                     auto emit_piece = [&](int32_t t) -> bool {   // SSE chunk(s) for one token
+                        // asked every token: not every token has something to write
+                        if (!sink.is_writable()) {
+                            fprintf(stderr, "[%s] client gone, generation stopped at %d tok\n",
+                                    clock_hms().c_str(), st->generated);
+                            return false;
+                        }
                         if (st->generated == 0) {
                             st->t_first = clk::now();
                             st->gen_log = st->t_first;
@@ -1824,7 +1939,7 @@ int main(int argc, char ** argv) {
                                 st->started = true;
                                 st->t0 = clk::now();
                                 st->had_images = !st->ovr.empty();
-                                st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog, st->t_recv);
+                                st->n_cached = prepare_prompt(st->loops, st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog, st->t_recv);
                                 st->cstat0 = rt->cache_stats();
                                 st->my_imgs = *kv_imgs;
                                 st->resp_base = rt->kv_tokens().size() + st->prompt.size();
@@ -1952,7 +2067,7 @@ int main(int argc, char ** argv) {
                             st->started = true;
                             st->t0 = clk::now();
                             st->had_images = !st->ovr.empty();
-                            st->n_cached = prepare_prompt(st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog, st->t_recv);
+                            st->n_cached = prepare_prompt(st->loops, st->prompt, st->ovr, std::move(st->spans), st->sid, st->prog, st->t_recv);
                             st->cstat0 = rt->cache_stats();
                             st->my_imgs = *kv_imgs;
                         } else if (!was_holding) {
@@ -2008,6 +2123,10 @@ int main(int argc, char ** argv) {
                             return finish();
                         if (!emit_piece(next)) { st->finished = true; tlock.unlock(); st->holding = false; return false; }
                         st->generated++;
+                        if (st->answer_loops > 0 && st->switch_at < 0 && next == content_tok && st->answer_loops != rt->loops()) {
+                            st->switch_at = st->generated;
+                            switch_answer(st->answer_loops);
+                        }
                         st->logits = rt->decode({ next });
                         if (time_slice > 0 && ++st->slice_used >= time_slice && yieldable()) {
                             st->my_toks = rt->kv_tokens();   // yield the runtime
@@ -2036,6 +2155,8 @@ int main(int argc, char ** argv) {
             if (cfmt.inkling) dec.add(t, r, c);
         };
         int generated = 0, n_cached = 0;
+        bool switched = false;
+        int switch_at = -1;
         Runtime::CacheStats cstat0;
         using clk = std::chrono::steady_clock;
         clk::time_point t0, t_prefill = {}, t_end = {};
@@ -2046,7 +2167,7 @@ int main(int argc, char ** argv) {
                 ~Guard() { t.unlock(); }
             } lk(tlock);
             auto prog = std::make_shared<Prog>();
-            n_cached = prepare_prompt(prompt, ovr, std::move(spans), 0, prog, t_recv);
+            n_cached = prepare_prompt(loops, prompt, ovr, std::move(spans), 0, prog, t_recv);
             cstat0 = rt->cache_stats();
             t0 = clk::now();
             // checkpoint at the generation-prompt boundary (see streaming path)
@@ -2101,6 +2222,11 @@ int main(int argc, char ** argv) {
                     if (is_stop(next) || rt->n_past() + 1 >= n_ctx) break;
                     take(next);
                     ++generated;
+                    if (answer_loops > 0 && !switched && next == content_tok && answer_loops != rt->loops()) {
+                        switched = true;
+                        switch_at = generated;
+                        switch_answer(answer_loops);
+                    }
                     if (clk::now() - glog >= std::chrono::seconds(10)) {   // long-output progress
                         const double el = std::chrono::duration<double>(clk::now() - t_prefill).count();
                         fprintf(stderr, "  [%s] gen %d tok, %.1f tok/s\n",
@@ -2170,6 +2296,11 @@ int main(int argc, char ** argv) {
                          {"gen_tps", gen_ms > 0 ? generated * 1000.0 / gen_ms : 0.0}}}
         };
         add_llama_timings(resp["timings"], n_prompt_full, n_cached, generated, prefill_ms, gen_ms);
+        if (loops > 0) {   // answer_loops: the passes the reply's text ran at
+            resp["timings"]["loops"] = loops;
+            resp["timings"]["answer_loops"] = switched ? answer_loops : loops;
+            if (switched) resp["timings"]["switch_at"] = switch_at;
+        }
         res.set_content(dumpj(resp), "application/json");
     });
 
