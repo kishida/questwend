@@ -696,7 +696,7 @@ function showStats(el, t){
   const s = document.createElement('div'); s.className = 'stats';
   const f = (x)=> (x||0).toFixed(1);
   const cached = t.cached_tokens ? `, ${t.cached_tokens} cached` : '';
-  s.textContent = (t.loops ? (t.answer_loops ? `${t.loops}→${t.answer_loops} loops · ` : `${t.loops} loops · `) : '') + `TTFT ${Math.round(t.ttft_ms||0)} ms · prefill ${f(t.prefill_tps)} tok/s `
+  s.textContent = (t.loops ? (t.answer_loops && t.answer_loops !== t.loops ? `${t.loops}→${t.answer_loops} loops · ` : `${t.loops} loops · `) : '') + `TTFT ${Math.round(t.ttft_ms||0)} ms · prefill ${f(t.prefill_tps)} tok/s `
     + `(${t.prompt_tokens} in${cached}) · gen ${f(t.gen_tps)} tok/s · ${t.completion_tokens} out`;
   el.appendChild(s);
   document.getElementById('chat').scrollTop = 1e9;
@@ -1685,8 +1685,11 @@ int main(int argc, char ** argv) {
                             {"gen_tps",     gen_ms     > 0 ? st->generated * 1000.0 / gen_ms    : 0.0},
                         };
                         add_llama_timings(timings, st->prompt_tokens, st->n_cached, st->generated, prefill_ms, gen_ms);
-                        if (st->loops > 0) timings["loops"] = st->loops;
-                        if (st->switch_at >= 0) { timings["answer_loops"] = st->answer_loops; timings["switch_at"] = st->switch_at; }
+                        if (st->loops > 0) {   // answer_loops: the passes the reply's text ran at
+                            timings["loops"] = st->loops;
+                            timings["answer_loops"] = st->switch_at >= 0 ? st->answer_loops : st->loops;
+                            if (st->switch_at >= 0) timings["switch_at"] = st->switch_at;
+                        }
                         log_done(st->prompt_tokens, st->n_cached, st->generated,
                                  prefill_ms, gen_ms, st->cstat0);
                         // tool calls: parse the accumulated text; if any, emit them as a
@@ -2293,10 +2296,10 @@ int main(int argc, char ** argv) {
                          {"gen_tps", gen_ms > 0 ? generated * 1000.0 / gen_ms : 0.0}}}
         };
         add_llama_timings(resp["timings"], n_prompt_full, n_cached, generated, prefill_ms, gen_ms);
-        if (loops > 0) resp["timings"]["loops"] = loops;
-        if (switched) {
-            resp["timings"]["answer_loops"] = answer_loops;
-            resp["timings"]["switch_at"] = switch_at;
+        if (loops > 0) {   // answer_loops: the passes the reply's text ran at
+            resp["timings"]["loops"] = loops;
+            resp["timings"]["answer_loops"] = switched ? answer_loops : loops;
+            if (switched) resp["timings"]["switch_at"] = switch_at;
         }
         res.set_content(dumpj(resp), "application/json");
     });
